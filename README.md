@@ -31,6 +31,10 @@ cargo run -- --admin -d tutorial
 cargo test
 ```
 
+This repository is set up for `direnv` + Nix development. After cloning, run
+`direnv allow` once and then prefer commands like `direnv exec . bash -lc 'cargo test'`
+so the pinned toolchain and shell environment are always active.
+
 Tests
 =====
 

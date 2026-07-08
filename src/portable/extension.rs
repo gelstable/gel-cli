@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 use anyhow::Context;
+use fn_error_context::context;
 use gel_cli_derive::IntoArgs;
 use gel_tokio::InstanceName;
 use log::{debug, trace};
@@ -12,8 +13,7 @@ use crate::hint::HintExt;
 use crate::options::{InstanceOptions, InstanceOptionsGlobal, Options};
 use crate::portable::local::InstanceInfo;
 use crate::portable::platform::get_server;
-use crate::portable::repository::{Channel, get_platform_extension_packages};
-use crate::portable::server::install::download_package;
+use crate::portable::registry::{self, Channel, ExtensionPackage, PackageHash, download_verified};
 use crate::portable::windows;
 use crate::print::Highlight;
 use crate::{print, table};
@@ -184,11 +184,10 @@ async fn install(cmd: &ExtensionInstall, _options: &Options) -> Result<(), anyho
     let channel = cmd.channel.unwrap_or(Channel::Stable);
     let slot = cmd.slot.clone().unwrap_or(version.extension_server_slot());
     debug!("Instance: {version} {channel:?} {slot}");
-    let packages = get_platform_extension_packages(channel, &slot, get_server()?).await?;
+    let catalog = registry::load_default_or_empty(channel, get_server()?).await?;
+    let packages = catalog.extension_packages(&slot);
 
-    let package = packages
-        .iter()
-        .find(|pkg| pkg.tags.get("extension").cloned().unwrap_or_default() == cmd.extension);
+    let package = select_extension_package(&packages, &cmd.extension);
 
     match package {
         Some(pkg) => {
@@ -226,6 +225,35 @@ async fn install(cmd: &ExtensionInstall, _options: &Options) -> Result<(), anyho
     }
 
     Ok(())
+}
+
+#[context("failed to download extension package")]
+async fn download_package(
+    pkg: &crate::portable::registry::ExtensionPackage,
+) -> anyhow::Result<std::path::PathBuf> {
+    let cache_dir = crate::platform::cache_dir()?;
+    let download_dir = cache_dir.join("downloads");
+    fs_err::create_dir_all(&download_dir)?;
+    let cache_path = download_dir.join(format!("{}_{}.zip", pkg.name, pkg.version));
+    match &pkg.hash {
+        PackageHash::Blake2b(hex) => {
+            download_verified(&cache_path, &pkg.url, hex, false).await?;
+        }
+        PackageHash::Unknown(val) => {
+            anyhow::bail!("cannot verify hash, unknown hash format {val:?}");
+        }
+    }
+    Ok(cache_path)
+}
+
+fn select_extension_package<'a>(
+    packages: &'a [ExtensionPackage],
+    extension: &str,
+) -> Option<&'a ExtensionPackage> {
+    packages
+        .iter()
+        .filter(|pkg| pkg.tags.get("extension").map(|s| s.as_str()) == Some(extension))
+        .max_by_key(|pkg| pkg.version.clone())
 }
 
 fn run_extension_loader(
@@ -275,7 +303,8 @@ async fn list_available(
     let channel = cmd.channel.unwrap_or(Channel::Stable);
     let slot = cmd.slot.clone().unwrap_or(version.extension_server_slot());
     debug!("Instance: {version} {channel:?} {slot}");
-    let packages = get_platform_extension_packages(channel, &slot, get_server()?).await?;
+    let catalog = registry::load_default_or_empty(channel, get_server()?).await?;
+    let packages = catalog.extension_packages(&slot);
 
     let mut table = Table::new();
     table.set_format(*table::FORMAT);
@@ -286,4 +315,45 @@ async fn list_available(
     }
     table.printstd();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::portable::registry::{ExtensionPackage, PackageHash, PackageType};
+    use crate::portable::ver;
+
+    use super::select_extension_package;
+
+    fn extension_package(name: &str, version: &str) -> ExtensionPackage {
+        let mut tags = HashMap::new();
+        tags.insert("extension".to_string(), name.to_string());
+        ExtensionPackage {
+            name: name.to_string(),
+            version: version.parse::<ver::Build>().unwrap(),
+            url: "https://example.com/ext.zip".parse().unwrap(),
+            size: 10,
+            hash: PackageHash::Blake2b(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+            ),
+            kind: PackageType::Zip,
+            slot: "7".to_string(),
+            tags,
+        }
+    }
+
+    #[test]
+    fn selects_latest_matching_extension_package() {
+        let packages = vec![
+            extension_package("pgvector", "7.0+aaaaaaa"),
+            extension_package("auth", "7.1+aaaaaaa"),
+            extension_package("pgvector", "7.2+aaaaaaa"),
+        ];
+
+        let selected = select_extension_package(&packages, "pgvector").unwrap();
+
+        assert_eq!(selected.version.to_string(), "7.2+aaaaaaa");
+    }
 }

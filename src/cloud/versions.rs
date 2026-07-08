@@ -1,7 +1,7 @@
 use crate::branding::{BRANDING, BRANDING_CLOUD};
 use crate::cloud::client::CloudClient;
 use crate::cloud::ops::get_versions;
-use crate::portable::repository::{Channel, Query};
+use crate::portable::registry::{Channel, Query};
 use crate::portable::ver;
 
 pub fn get_version(query: &Query, client: &CloudClient) -> anyhow::Result<ver::Specific> {

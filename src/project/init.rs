@@ -29,7 +29,7 @@ use crate::portable::exit_codes;
 use crate::portable::local::{InstanceInfo, Paths, allocate_port};
 use crate::portable::options::{CloudInstanceBillables, CloudInstanceParams};
 use crate::portable::platform::optional_docker_check;
-use crate::portable::repository::{self, Channel, PackageInfo, Query};
+use crate::portable::registry::{self, Channel, Query, ServerPackage};
 use crate::portable::server::install;
 use crate::portable::ver;
 use crate::portable::ver::Specific;
@@ -286,7 +286,7 @@ pub fn init_existing(
         InstanceName::Local(name) => {
             msg!("Checking {BRANDING} versions...");
 
-            let pkg = repository::get_server_package(&ver_query)?.with_context(|| {
+            let pkg = registry::get_server_package(&ver_query)?.with_context(|| {
                 format!(
                     "cannot find package matching {}. \
                     (Use `{BRANDING_CLI_CMD} server list-versions` to see all available)",
@@ -351,7 +351,7 @@ pub fn init_existing(
 
 fn do_init(
     name: &str,
-    pkg: &PackageInfo,
+    pkg: &ServerPackage,
     stash_dir: &Path,
     project: &project::Context,
     database: DatabaseBranch,
@@ -363,7 +363,7 @@ fn do_init(
     let inst_name = InstanceName::Local(name.to_owned());
 
     let instance = if cfg!(windows) {
-        let q = repository::Query::from_version(&pkg.version.specific())?;
+        let q = registry::Query::from_version(&pkg.version.specific())?;
         windows::create_instance(
             &create::Command {
                 name: Some(inst_name.clone()),
@@ -949,10 +949,10 @@ fn ask_branch() -> anyhow::Result<DatabaseBranch> {
     }
 }
 
-fn ask_local_version(options: &Command) -> anyhow::Result<(Query, PackageInfo)> {
+fn ask_local_version(options: &Command) -> anyhow::Result<(Query, ServerPackage)> {
     let ver_query = options.server_version.clone().unwrap_or(Query::stable());
     if !options.interactive || options.server_version.is_some() {
-        let pkg = repository::get_server_package(&ver_query)?
+        let pkg = registry::get_server_package(&ver_query)?
             .with_context(|| format!("no package matching {} found", ver_query.display()))?;
         if options.server_version.is_some() {
             return Ok((ver_query, pkg));
@@ -960,7 +960,7 @@ fn ask_local_version(options: &Command) -> anyhow::Result<(Query, PackageInfo)> 
             return Ok((Query::from_version(&pkg.version.specific())?, pkg));
         }
     }
-    let default = repository::get_server_package(&ver_query)?;
+    let default = registry::get_server_package(&ver_query)?;
     let default_ver = if let Some(pkg) = &default {
         Query::from_version(&pkg.version.specific())?.as_config_value()
     } else {
@@ -976,7 +976,7 @@ fn ask_local_version(options: &Command) -> anyhow::Result<(Query, PackageInfo)> 
         let value = q.ask()?;
         let value = value.trim();
         if value == "nightly" {
-            match repository::get_server_package(&Query::nightly()) {
+            match registry::get_server_package(&Query::nightly()) {
                 Ok(Some(pkg)) => return Ok((Query::nightly(), pkg)),
                 Ok(None) => {
                     print::error!("No nightly versions found");
@@ -988,7 +988,7 @@ fn ask_local_version(options: &Command) -> anyhow::Result<(Query, PackageInfo)> 
                 }
             }
         } else if value == "testing" {
-            match repository::get_server_package(&Query::testing()) {
+            match registry::get_server_package(&Query::testing()) {
                 Ok(Some(pkg)) => return Ok((Query::testing(), pkg)),
                 Ok(None) => {
                     print::error!("No testing versions found");
@@ -1055,10 +1055,10 @@ fn ask_existing_instance_name(cloud_client: &mut CloudClient) -> anyhow::Result<
     }
 }
 
-fn parse_ver_and_find(value: &str) -> anyhow::Result<Option<(Query, PackageInfo)>> {
+fn parse_ver_and_find(value: &str) -> anyhow::Result<Option<(Query, ServerPackage)>> {
     let filter = value.parse()?;
     let query = Query::from_filter(&filter)?;
-    if let Some(pkg) = repository::get_server_package(&query)? {
+    if let Some(pkg) = registry::get_server_package(&query)? {
         Ok(Some((query, pkg)))
     } else {
         Ok(None)
@@ -1067,7 +1067,11 @@ fn parse_ver_and_find(value: &str) -> anyhow::Result<Option<(Query, PackageInfo)
 
 #[tokio::main(flavor = "current_thread")]
 async fn print_versions(title: &str) -> anyhow::Result<()> {
-    let mut avail = repository::get_server_packages(Channel::Stable).await?;
+    let mut avail = registry::load_platform_server_packages(
+        Channel::Stable,
+        crate::portable::platform::get_server()?,
+    )
+    .await?;
     avail.sort_by(|a, b| b.version.cmp(&a.version));
     println!(
         "{}: {}{}",

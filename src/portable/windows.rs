@@ -39,7 +39,8 @@ use crate::platform::{cache_dir, config_dir, tmp_file_path, wsl_dir};
 use crate::portable::exit_codes;
 use crate::portable::local::{InstanceInfo, NonLocalInstance, Paths, write_json};
 use crate::portable::options;
-use crate::portable::repository::{self, PackageHash, PackageInfo, download, download_sync};
+use crate::portable::registry::download_sync;
+use crate::portable::registry::{PackageHash, ServerPackage};
 use crate::portable::server;
 use crate::portable::ver;
 use crate::print::{self, Highlight, msg};
@@ -419,37 +420,36 @@ fn download_binary(dest: &Path) -> anyhow::Result<()> {
         .unwrap();
     let platform = format!("{arch}-unknown-linux-musl");
 
-    let pkgs = repository::get_platform_cli_packages(
-        upgrade::channel(),
-        &platform,
-        repository::DEFAULT_TIMEOUT,
-    )?;
-    let pkg = pkgs.iter().find(|pkg| pkg.version == my_ver);
-    let pkg = if let Some(pkg) = pkg {
-        pkg.clone()
-    } else {
-        let pkg = repository::get_platform_cli_packages(
-            upgrade::channel(),
-            &platform,
-            repository::DEFAULT_TIMEOUT,
-        )?
-        .into_iter()
-        .max_by(|a, b| a.version.cmp(&b.version))
-        .context("cannot find new version")?;
-        if pkg.version < my_ver {
-            return Err(bug::error(format!(
-                "latest version of linux CLI {} \
+    let pkgs = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let catalog = registry::load_default_or_empty(upgrade::channel(), &platform).await?;
+            Ok::<_, anyhow::Error>(catalog.cli_packages())
+        })?;
+    let pkg = pkgs.iter().find(|pkg| pkg.version == my_ver).cloned();
+    let pkg = match pkg {
+        Some(pkg) => pkg,
+        None => {
+            let pkg = pkgs
+                .into_iter()
+                .max_by(|a, b| a.version.cmp(&b.version))
+                .context("cannot find new version")?;
+            if pkg.version < my_ver {
+                return Err(bug::error(format!(
+                    "latest version of linux CLI {} \
                  is older that current windows CLI {}",
-                pkg.version, my_ver
-            )));
-        }
-        log::warn!(
-            "No package matching version {} found. \
+                    pkg.version, my_ver
+                )));
+            }
+            log::warn!(
+                "No package matching version {} found. \
                     Using latest version {}.",
-            my_ver,
-            pkg.version
-        );
-        pkg
+                my_ver,
+                pkg.version
+            );
+            pkg
+        }
     };
 
     let down_path = dest.with_extension("download");

@@ -21,7 +21,7 @@ use crate::instance::create;
 use crate::locking::LockManager;
 use crate::options::{CloudOptions, InstanceOptionsLegacy};
 use crate::portable::local::{InstallInfo, InstanceInfo, Paths, UpgradeState, write_json};
-use crate::portable::repository::{self, Channel, PackageInfo, Query, QueryOptions};
+use crate::portable::registry::{self, Channel, Query, QuerySelector, ServerPackage};
 use crate::portable::server::install;
 use crate::portable::ver;
 use crate::portable::windows;
@@ -107,6 +107,22 @@ pub struct Command {
     /// Do not ask questions. Assume user wants to upgrade instance.
     #[arg(long)]
     pub non_interactive: bool,
+}
+
+fn upgrade_selector(cmd: &Command) -> Option<QuerySelector<'_>> {
+    if let Some(version) = cmd.to_version.as_ref() {
+        Some(QuerySelector::Version(version))
+    } else if let Some(channel) = cmd.to_channel {
+        Some(QuerySelector::Channel(channel))
+    } else if cmd.to_nightly {
+        Some(QuerySelector::Channel(Channel::Nightly))
+    } else if cmd.to_testing {
+        Some(QuerySelector::Channel(Channel::Testing))
+    } else if cmd.to_latest {
+        Some(QuerySelector::Channel(Channel::Stable))
+    } else {
+        None
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -213,23 +229,15 @@ fn upgrade_local_cmd(
 ) -> anyhow::Result<()> {
     let inst = InstanceInfo::read(name)?;
     let inst_ver = inst.get_version()?.specific();
-    let (ver_query, ver_option) = Query::from_options(
-        repository::QueryOptions {
-            stable: cmd.to_latest,
-            nightly: cmd.to_nightly,
-            testing: cmd.to_testing,
-            channel: cmd.to_channel,
-            version: cmd.to_version.as_ref(),
-        },
-        || Query::from_version(&inst_ver),
-    )?;
+    let (ver_query, ver_option) =
+        Query::from_selector(upgrade_selector(cmd), || Query::from_version(&inst_ver))?;
     check_project(name, cmd.force, &ver_query)?;
 
     if cfg!(windows) {
         return windows::upgrade(cmd, name);
     }
 
-    let pkg = repository::get_server_package(&ver_query)?
+    let pkg = registry::get_server_package(&ver_query)?
         .context("no package found according to your criteria")?;
     let pkg_ver = pkg.version.specific();
 
@@ -276,16 +284,7 @@ fn upgrade_cloud_cmd(
     name: &CloudName,
     opts: &crate::options::Options,
 ) -> anyhow::Result<()> {
-    let (query, _) = Query::from_options(
-        QueryOptions {
-            nightly: cmd.to_nightly,
-            testing: cmd.to_testing,
-            channel: cmd.to_channel,
-            version: cmd.to_version.as_ref(),
-            stable: cmd.to_latest,
-        },
-        || anyhow::Ok(Query::stable()),
-    )?;
+    let (query, _) = Query::from_selector(upgrade_selector(cmd), || anyhow::Ok(Query::stable()))?;
 
     let client = cloud::client::CloudClient::new(&opts.cloud_options)?;
     client.ensure_authenticated()?;
@@ -381,7 +380,7 @@ pub fn upgrade_cloud(
     }
 }
 
-pub fn upgrade_compatible(mut inst: InstanceInfo, pkg: PackageInfo) -> anyhow::Result<()> {
+pub fn upgrade_compatible(mut inst: InstanceInfo, pkg: ServerPackage) -> anyhow::Result<()> {
     msg!(
         "Upgrading to a minor version {}",
         pkg.version.to_string().emphasized()
@@ -409,7 +408,7 @@ pub fn upgrade_compatible(mut inst: InstanceInfo, pkg: PackageInfo) -> anyhow::R
 pub fn upgrade_incompatible(
     mut inst: InstanceInfo,
     version: ver::Specific,
-    pkg: PackageInfo,
+    pkg: ServerPackage,
     non_interactive: bool,
     skip_hooks: bool,
 ) -> anyhow::Result<()> {
@@ -661,7 +660,7 @@ async fn restore_instance(
 pub fn upgrade_in_place(
     mut inst: InstanceInfo,
     version: ver::Specific,
-    pkg: PackageInfo,
+    pkg: ServerPackage,
 ) -> anyhow::Result<()> {
     msg!(
         "Upgrading from {} to version {}, in-place",

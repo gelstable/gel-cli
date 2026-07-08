@@ -6,7 +6,7 @@ use gel_cli_derive::IntoArgs;
 
 use crate::branding::BRANDING;
 use crate::portable::local::{self, InstallInfo};
-use crate::portable::repository::{Channel, PackageInfo, get_server_packages};
+use crate::portable::registry::{self, Channel, ServerPackage};
 use crate::portable::ver::{self};
 use crate::table::{self, Cell, Row, Table};
 
@@ -66,16 +66,17 @@ pub fn run(cmd: &Command) -> Result<(), anyhow::Error> {
             channel == Channel::Stable
         })
         .max_by_key(|p| p.version.specific())
-        .map(|p| p.version.specific())
-        .expect("No stable version found");
+        .map(|p| p.version.specific());
 
     let mut version = cmd.version.clone();
     if version.is_none() && !cmd.installed_only {
-        version = Some(ver::Filter {
-            major: latest_stable.major,
-            minor: None,
-            exact: false,
-        })
+        if let Some(latest_stable) = latest_stable {
+            version = Some(ver::Filter {
+                major: latest_stable.major,
+                minor: None,
+                exact: false,
+            })
+        }
     }
 
     log::debug!(
@@ -222,7 +223,7 @@ pub struct DebugInstall {
 #[derive(serde::Serialize)]
 pub struct DebugInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
-    package: Option<PackageInfo>,
+    package: Option<ServerPackage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     install: Option<DebugInstall>,
 }
@@ -237,21 +238,26 @@ pub struct JsonVersionInfo {
 }
 
 #[tokio::main(flavor = "current_thread")]
-pub async fn all_packages() -> Vec<PackageInfo> {
+pub async fn all_packages() -> Vec<ServerPackage> {
     let mut pkgs = Vec::with_capacity(16);
-    match get_server_packages(Channel::Stable).await {
+    match load_packages(Channel::Stable).await {
         Ok(stable) => pkgs.extend(stable),
         Err(e) => log::warn!("Unable to fetch stable packages: {e:#}"),
     };
-    match get_server_packages(Channel::Testing).await {
+    match load_packages(Channel::Testing).await {
         Ok(testing) => pkgs.extend(testing),
         Err(e) => log::warn!("Unable to fetch testing packages: {e:#}"),
     };
-    match get_server_packages(Channel::Nightly).await {
+    match load_packages(Channel::Nightly).await {
         Ok(nightly) => pkgs.extend(nightly),
         Err(e) => log::warn!("Unable to fetch nightly packages: {e:#}"),
     }
     pkgs
+}
+
+async fn load_packages(channel: Channel) -> anyhow::Result<Vec<ServerPackage>> {
+    let catalog = registry::load_default(channel, crate::portable::platform::get_server()?).await?;
+    Ok(catalog.server_packages())
 }
 
 fn print_table(items: impl Iterator<Item = (ver::Build, bool)>) {

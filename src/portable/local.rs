@@ -17,7 +17,7 @@ use crate::branding::BRANDING;
 use crate::bug;
 use crate::hint::HintExt;
 use crate::platform::{cache_dir, config_dir, data_dir, portable_dir};
-use crate::portable::repository::PackageHash;
+use crate::portable::registry::PackageHash;
 use crate::portable::ver;
 use crate::portable::{linux, macos, windows};
 

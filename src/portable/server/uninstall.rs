@@ -8,7 +8,7 @@ use crate::platform::{data_dir, portable_dir, tmp_file_path};
 use crate::portable::exit_codes;
 use crate::portable::local;
 use crate::portable::local::InstanceInfo;
-use crate::portable::repository::{Channel, Query};
+use crate::portable::registry::{Channel, Query};
 use crate::portable::ver;
 use crate::print::{self, Highlight, msg};
 

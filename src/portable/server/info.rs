@@ -2,27 +2,29 @@ use anyhow::Context;
 use gel_cli_derive::IntoArgs;
 
 use crate::portable::local;
-use crate::portable::repository::{Channel, Query, QueryOptions};
+use crate::portable::registry::{Channel, Query, QuerySelector};
 use crate::portable::ver;
 use crate::table;
 
 pub fn run(cmd: &Command) -> anyhow::Result<()> {
     // note this assumes that latest is set if no nightly and version
-    let (query, _) = Query::from_options(
-        QueryOptions {
-            stable: cmd.latest,
-            nightly: cmd.nightly,
-            testing: false,
-            channel: cmd.channel,
-            version: cmd.version.as_ref(),
-        },
-        || {
-            anyhow::bail!(
-                "One of `--latest`, `--channel=`, \
+    let selector = if let Some(version) = cmd.version.as_ref() {
+        Some(QuerySelector::Version(version))
+    } else if let Some(channel) = cmd.channel {
+        Some(QuerySelector::Channel(channel))
+    } else if cmd.nightly {
+        Some(QuerySelector::Channel(Channel::Nightly))
+    } else if cmd.latest {
+        Some(QuerySelector::Channel(Channel::Stable))
+    } else {
+        None
+    };
+    let (query, _) = Query::from_selector(selector, || {
+        anyhow::bail!(
+            "One of `--latest`, `--channel=`, \
                          `--version=` required"
-            )
-        },
-    )?;
+        )
+    })?;
     let all = local::get_installed()?;
     let inst = all
         .into_iter()

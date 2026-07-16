@@ -14,15 +14,16 @@ pub(crate) mod manifest;
 pub(crate) mod source;
 pub(crate) mod types;
 
-pub(crate) use catalog::{Catalog, load_default_async};
-pub(crate) use config::{Config, RegistrySource};
+pub(crate) use catalog::{Catalog, CatalogLoad, load_default_async};
+pub(crate) use config::Config;
 pub(crate) use download::{
-    USER_AGENT, download_package_verified, download_package_verified_sync, download_sync,
+    USER_AGENT, download_cli_package_verified_sync, download_extension_package_verified,
+    download_server_package_verified, download_sync,
 };
 pub(crate) use source::{Source, SourceLoader};
 pub(crate) use types::{
-    Channel, CliPackage, Compression, ExtensionPackage, PackageHash, PackageType, Query,
-    QuerySelector, ServerPackage,
+    Channel, CliPackage, Compression, ExtensionPackage, PackageHash, Query, QuerySelector,
+    ServerPackage,
 };
 
 fn server_platform_for_host(
@@ -84,45 +85,12 @@ async fn get_platform_cli_packages_async(
     Ok(catalog.cli_packages())
 }
 
-#[tokio::main(flavor = "current_thread")]
-pub async fn get_server_packages(channel: Channel) -> anyhow::Result<Vec<ServerPackage>> {
-    let plat = platform::get_server()?;
-    load_platform_server_packages_async(channel, plat).await
-}
-
-#[tokio::main(flavor = "current_thread")]
-pub async fn get_platform_server_packages(
-    channel: Channel,
-    platform: &str,
-) -> anyhow::Result<Vec<ServerPackage>> {
-    load_platform_server_packages_async(channel, platform).await
-}
-
 pub(crate) async fn load_platform_server_packages_async(
     channel: Channel,
     platform: &str,
 ) -> anyhow::Result<Vec<ServerPackage>> {
     let catalog = load_default_async(channel, platform).await?;
     Ok(catalog.server_packages())
-}
-
-#[allow(dead_code)]
-#[tokio::main(flavor = "current_thread")]
-pub async fn get_platform_extension_packages(
-    channel: Channel,
-    slot: &str,
-    platform: &str,
-) -> anyhow::Result<Vec<ExtensionPackage>> {
-    get_platform_extension_packages_async(channel, slot, platform).await
-}
-
-async fn get_platform_extension_packages_async(
-    channel: Channel,
-    slot: &str,
-    platform: &str,
-) -> anyhow::Result<Vec<ExtensionPackage>> {
-    let catalog = load_default_async(channel, platform).await?;
-    Ok(catalog.extension_packages(slot))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -176,7 +144,10 @@ fn select_specific_server_package_from_packages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::portable::registry::types::PackageType;
     use std::str::FromStr;
+
+    const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn server_platform_falls_back_to_x86_for_aarch64_macos_v1() {
@@ -248,7 +219,7 @@ mod tests {
             version: ver::Build::from_str(version).unwrap(),
             url: url::Url::parse("https://example.com/server.tar.zst").unwrap(),
             size: 1,
-            hash: PackageHash::Unknown("sha256:fixture".into()),
+            hash: HASH.parse().unwrap(),
             kind: PackageType::TarZst,
             slot: "default".into(),
             tags: Default::default(),

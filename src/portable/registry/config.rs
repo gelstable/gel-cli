@@ -15,11 +15,11 @@ pub enum RegistrySource {
     LegacyPackageRoot(Url),
 }
 
-impl RegistrySource {
-    pub fn display(&self) -> String {
+impl std::fmt::Display for RegistrySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RegistrySource::Manifest(source) => source.display(),
-            RegistrySource::LegacyPackageRoot(root) => root.to_string(),
+            RegistrySource::Manifest(source) => formatter.write_str(&source.display()),
+            RegistrySource::LegacyPackageRoot(root) => root.fmt(formatter),
         }
     }
 }
@@ -73,24 +73,6 @@ impl Config {
                 default_package_root,
             )?)],
         })
-    }
-
-    pub fn from_toml_str(
-        input: &str,
-        config_path: &Path,
-        default_package_root: &str,
-    ) -> anyhow::Result<Config> {
-        let global: crate::config::Config = if input.trim().is_empty() {
-            Default::default()
-        } else {
-            toml::from_str(input).context("failed to parse registry config TOML")?
-        };
-        Self::from_inputs(
-            None,
-            &global.registry.sources,
-            config_path,
-            default_package_root,
-        )
     }
 }
 
@@ -160,8 +142,10 @@ mod tests {
     const DEFAULT_SOURCE: &str = "https://packages.geldata.com";
 
     fn parse(input: &str) -> anyhow::Result<Config> {
-        Config::from_toml_str(
-            input,
+        let global: crate::config::Config = toml::from_str(input)?;
+        Config::from_inputs(
+            None,
+            &global.registry.sources,
             Path::new("/home/me/.config/gel/cli.toml"),
             DEFAULT_SOURCE,
         )
@@ -203,12 +187,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            cfg.sources[0].display(),
+            cfg.sources[0].to_string(),
             "https://example.com/registry.json"
         );
-        assert_eq!(cfg.sources[1].display(), "/tmp/registry.json");
+        assert_eq!(cfg.sources[1].to_string(), "/tmp/registry.json");
         assert_eq!(
-            cfg.sources[2].display(),
+            cfg.sources[2].to_string(),
             "/home/me/.config/gel/fixtures/registry.json"
         );
     }
@@ -357,7 +341,7 @@ mod tests {
 
         assert_eq!(config.sources.len(), 1);
         assert_eq!(
-            config.sources[0].display(),
+            config.sources[0].to_string(),
             config_dir.join("from-cli.json").display().to_string()
         );
     }
@@ -370,7 +354,6 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(cfg.sources.len(), 1);
-        assert_eq!(cfg.sources[0].display(), r"C:\gel-registry\registry.json");
+        assert_eq!(cfg.sources[0].to_string(), r"C:\gel-registry\registry.json");
     }
 }

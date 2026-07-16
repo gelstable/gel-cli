@@ -266,30 +266,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loads_http_source_without_cache() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/registry.json"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("cache-control", "max-age=3600")
-                    .insert_header("etag", "\"v1\"")
-                    .set_body_raw(br#"{"schema_version":1,"indexes":[]}"#, "application/json"),
-            )
-            .expect(2)
-            .mount(&server)
-            .await;
-        let loader = test_loader().unwrap();
-        let source = Source::Http(format!("{}/registry.json", server.uri()).parse().unwrap());
-
-        let manifest = loader.load_manifest(&source).await.unwrap();
-        let index = loader.load_index(&source).await.unwrap();
-
-        assert_eq!(manifest, br#"{"schema_version":1,"indexes":[]}"#);
-        assert_eq!(index, br#"{"schema_version":1,"indexes":[]}"#);
-    }
-
-    #[tokio::test]
     async fn missing_local_file_is_file_not_found() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("missing.json");

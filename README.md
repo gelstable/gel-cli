@@ -74,6 +74,16 @@ source, while conflicting mirror records are rejected. Relative paths are
 resolved relative to `cli.toml`; absolute paths and `file://` URLs can be used
 for local manifests.
 
+Each configured source is loaded atomically for the requested channel and
+platform. If any selected index from one source is unavailable or invalid, that
+source is rejected without contributing partial package data. Other healthy
+sources continue to work and the CLI reports the degraded source.
+
+A source with no matching index, or a valid index with no packages, is healthy
+and produces an empty result. The CLI reports a registry error only when no
+configured source is healthy, or when healthy sources publish conflicting
+metadata for the same artifact identity.
+
 For compatibility, `GEL_PKG_ROOT` (preferred) and the legacy
 `EDGEDB_PKG_ROOT` environment variable select the legacy package-root mode and
 override `[registry].sources`. Migrate to `[registry].sources` for manifest

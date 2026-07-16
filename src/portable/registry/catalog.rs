@@ -1,56 +1,35 @@
 //! Composed package catalog construction and query helpers.
 
 use std::collections::HashMap;
-use std::fmt;
-use std::path::Path;
+use std::future::Future;
 
-use url::Url;
+use futures_util::StreamExt;
 
 use super::config::{Config, RegistrySource};
-use super::index::{IndexDocument, InstallRef, PackageData, valid_blake2b};
+use super::index::{IndexDocument, ValidatedArtifact};
 use super::manifest::Manifest;
-use super::source::{Source, SourceError, SourceLoader};
-use super::types::{
-    Channel, CliPackage, Compression, ExtensionPackage, PackageHash, PackageType, ServerPackage,
-};
-use crate::portable::ver;
+use super::source::{Source, SourceLoader};
+use super::types::{ArtifactIdentity, Channel, CliPackage, ExtensionPackage, ServerPackage};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum ArtifactKind {
-    Server,
-    Cli,
-    Extension,
+const MAX_CONCURRENT_SOURCE_LOADS: usize = 4;
+
+async fn collect_bounded_ordered<T, U, F, Fut>(values: Vec<T>, limit: usize, operation: F) -> Vec<U>
+where
+    F: Fn(T) -> Fut,
+    Fut: Future<Output = U>,
+{
+    let mut completed = futures_util::stream::iter(values.into_iter().enumerate())
+        .map(|(index, value)| {
+            let future = operation(value);
+            async move { (index, future.await) }
+        })
+        .buffer_unordered(limit)
+        .collect::<Vec<_>>()
+        .await;
+    completed.sort_by_key(|(index, _)| *index);
+    completed.into_iter().map(|(_, value)| value).collect()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ArtifactKey {
-    kind: ArtifactKind,
-    name: Box<str>,
-    version: Box<str>,
-    slot: Box<str>,
-}
-
-impl fmt::Display for ArtifactKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self.kind {
-            ArtifactKind::Server => "server",
-            ArtifactKind::Cli => "cli",
-            ArtifactKind::Extension => "extension",
-        };
-        write!(
-            f,
-            "{kind} {}@{} slot {}",
-            self.name, self.version, self.slot
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-enum NormalizedArtifact {
-    Server(ArtifactKey, ServerPackage),
-    Cli(ArtifactKey, CliPackage),
-    Extension(ArtifactKey, ExtensionPackage),
-}
 #[derive(Clone, Debug)]
 struct CatalogEntry {
     artifact_index: usize,
@@ -64,7 +43,89 @@ enum DuplicateRelation {
 
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
-    artifacts: Vec<NormalizedArtifact>,
+    artifacts: Vec<ValidatedArtifact>,
+}
+#[derive(Debug)]
+pub(crate) struct CatalogLoad {
+    pub(crate) catalog: Catalog,
+    pub(crate) source_reports: Vec<SourceReport>,
+}
+
+#[derive(Debug)]
+pub(crate) enum SourceReport {
+    Healthy {
+        source: RegistrySource,
+        selected_indexes: usize,
+        artifact_count: usize,
+    },
+    Unavailable {
+        source: RegistrySource,
+        error: anyhow::Error,
+    },
+    Rejected {
+        source: RegistrySource,
+        error: anyhow::Error,
+    },
+}
+
+impl SourceReport {
+    pub(crate) fn warning(&self) -> Option<String> {
+        match self {
+            SourceReport::Healthy { .. } => None,
+            SourceReport::Unavailable { source, error } => Some(format!(
+                "registry source {source} is unavailable: {error:#}",
+            )),
+            SourceReport::Rejected { source, error } => {
+                Some(format!("registry source {source} was rejected: {error:#}",))
+            }
+        }
+    }
+}
+
+pub(crate) fn for_each_degraded_report<F>(reports: &[SourceReport], mut on_report: F)
+where
+    F: FnMut(&SourceReport),
+{
+    let mut reported_sources = Vec::<RegistrySource>::new();
+    for report in reports {
+        let source = match report {
+            SourceReport::Healthy { .. } => continue,
+            SourceReport::Unavailable { source, .. } | SourceReport::Rejected { source, .. } => {
+                source
+            }
+        };
+        if reported_sources
+            .iter()
+            .any(|reported_source| reported_source == source)
+        {
+            continue;
+        }
+        reported_sources.push(source.clone());
+        on_report(report);
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("no healthy registry sources: {summary}")]
+pub(crate) struct NoHealthySources {
+    reports: Vec<SourceReport>,
+    summary: String,
+}
+
+impl NoHealthySources {
+    fn new(reports: Vec<SourceReport>) -> Self {
+        let summary = reports
+            .iter()
+            .filter_map(SourceReport::warning)
+            .collect::<Vec<_>>()
+            .join("; ");
+        Self { reports, summary }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reports(&self) -> &[SourceReport] {
+        &self.reports
+    }
 }
 
 impl Catalog {
@@ -73,158 +134,91 @@ impl Catalog {
         loader: &SourceLoader,
         channel: Channel,
         platform: &str,
-    ) -> anyhow::Result<Catalog> {
+    ) -> anyhow::Result<CatalogLoad> {
+        let source_inputs = config
+            .sources
+            .iter()
+            .cloned()
+            .enumerate()
+            .collect::<Vec<_>>();
+        let resolved = collect_bounded_ordered(
+            source_inputs,
+            MAX_CONCURRENT_SOURCE_LOADS,
+            |(source_ordinal, registry_source)| async move {
+                resolve_configured_source(
+                    source_ordinal,
+                    registry_source,
+                    loader,
+                    channel,
+                    platform,
+                )
+                .await
+            },
+        )
+        .await;
+
+        let index_inputs = resolved
+            .iter()
+            .flat_map(|outcome| match outcome {
+                ResolvedSourceOutcome::Ready { indexes, .. } => indexes.clone(),
+                ResolvedSourceOutcome::Unavailable { .. }
+                | ResolvedSourceOutcome::Rejected { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let validated_indexes = collect_bounded_ordered(
+            index_inputs,
+            MAX_CONCURRENT_SOURCE_LOADS,
+            |input| async move { load_and_validate_index(loader, input, platform).await },
+        )
+        .await;
+
+        let mut accumulators = resolved
+            .into_iter()
+            .map(SourceAccumulator::from_resolved)
+            .collect::<Vec<_>>();
+        for outcome in validated_indexes {
+            let source_ordinal = outcome.source_ordinal();
+            accumulators[source_ordinal].record_index(outcome);
+        }
+
         let mut artifacts = Vec::new();
-        let mut seen: HashMap<ArtifactKey, CatalogEntry> = HashMap::new();
-        let mut first_source_error: Option<anyhow::Error> = None;
+        let mut seen: HashMap<ArtifactIdentity, CatalogEntry> = HashMap::new();
+        let mut healthy_sources = 0usize;
+        let mut source_reports = Vec::with_capacity(config.sources.len());
 
-        for registry_source in &config.sources {
-            let index_sources = match registry_source {
-                RegistrySource::Manifest(manifest_source) => {
-                    let manifest_bytes = match loader.load_manifest(manifest_source).await {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            let recoverable = is_recoverable_source_failure(&error);
-                            let error = anyhow::Error::new(error).context(format!(
-                                "failed to load registry manifest {}",
-                                manifest_source.display()
-                            ));
-                            log::warn!("{error:#}");
-                            if recoverable {
-                                if first_source_error.is_none() {
-                                    first_source_error = Some(error);
-                                }
-                                continue;
-                            }
-                            return Err(error);
-                        }
-                    };
-                    let manifest = match Manifest::from_slice(&manifest_bytes) {
-                        Ok(manifest) => manifest,
-                        Err(error) => {
-                            let error = error.context(format!(
-                                "failed to parse registry manifest {}",
-                                manifest_source.display()
-                            ));
-                            log::warn!("{error:#}");
-                            return Err(error);
-                        }
-                    };
-                    match manifest.select_indexes(manifest_source, channel, platform) {
-                        Ok(sources) => sources
-                            .into_iter()
-                            .map(|source| {
-                                let artifact_base = source.clone();
-                                (source, artifact_base)
-                            })
-                            .collect(),
-                        Err(error) => {
-                            let error = error.context(format!(
-                                "failed to select registry indexes from {}",
-                                manifest_source.display()
-                            ));
-                            log::warn!("{error:#}");
-                            return Err(error);
-                        }
-                    }
+        for outcome in accumulators.into_iter().map(SourceAccumulator::finish) {
+            match outcome {
+                ConfiguredSourceOutcome::Healthy {
+                    source,
+                    selected_indexes,
+                    artifacts: source_artifacts,
+                } => {
+                    healthy_sources += 1;
+                    let artifact_count = source_artifacts.len();
+                    compose_source_artifacts(&mut artifacts, &mut seen, source_artifacts)?;
+                    source_reports.push(SourceReport::Healthy {
+                        source,
+                        selected_indexes,
+                        artifact_count,
+                    });
                 }
-                RegistrySource::LegacyPackageRoot(root) => {
-                    let index_source =
-                        match super::source::legacy_index_url(root, platform, channel) {
-                            Ok(url) => Source::Http(url),
-                            Err(error) => {
-                                let error = error.context(format!(
-                                    "failed to construct legacy registry index for {}",
-                                    root
-                                ));
-                                log::warn!("{error:#}");
-                                return Err(error);
-                            }
-                        };
-                    let artifact_base = Source::Http(root.clone());
-                    vec![(index_source, artifact_base)]
+                ConfiguredSourceOutcome::Unavailable { source, error } => {
+                    source_reports.push(SourceReport::Unavailable { source, error });
                 }
-            };
-
-            for (index_source, artifact_base) in index_sources {
-                let index_bytes = match loader.load_index(&index_source).await {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        let recoverable = is_recoverable_source_failure(&error);
-                        let error = anyhow::Error::new(error).context(format!(
-                            "failed to load registry index {}",
-                            index_source.display()
-                        ));
-                        log::warn!("{error:#}");
-                        if recoverable {
-                            if first_source_error.is_none() {
-                                first_source_error = Some(error);
-                            }
-                            continue;
-                        }
-                        return Err(error);
-                    }
-                };
-                let index = match IndexDocument::from_slice(&index_bytes) {
-                    Ok(index) => index,
-                    Err(error) => {
-                        let error = error.context(format!(
-                            "failed to parse registry index {}",
-                            index_source.display()
-                        ));
-                        log::warn!("{error:#}");
-                        return Err(error);
-                    }
-                };
-
-                for pkg in &index.packages {
-                    if let Some(artifact) = normalize_artifact(&index_source, &artifact_base, pkg) {
-                        let key = artifact.key().clone();
-                        if let Some(first_entry) = seen.get(&key) {
-                            let first_artifact = &artifacts[first_entry.artifact_index];
-                            match duplicate_relation(first_artifact, &artifact) {
-                                DuplicateRelation::EquivalentMirror => {
-                                    log::info!(
-                                        "duplicate registry artifact {key} from {} duplicates {}; using first source {}, ignoring duplicate {}",
-                                        index_source.display(),
-                                        first_entry.index_source.display(),
-                                        artifact_url(first_artifact),
-                                        artifact_url(&artifact),
-                                    );
-                                    continue;
-                                }
-                                DuplicateRelation::Conflict { fields } => {
-                                    anyhow::bail!(
-                                        "conflicting registry artifact {key}: {} ({}) disagrees with {} ({}) on {}; refusing to choose between sources",
-                                        index_source.display(),
-                                        artifact_url(&artifact),
-                                        first_entry.index_source.display(),
-                                        artifact_url(first_artifact),
-                                        fields.join(", "),
-                                    );
-                                }
-                            }
-                        }
-                        seen.insert(
-                            key,
-                            CatalogEntry {
-                                artifact_index: artifacts.len(),
-                                index_source: index_source.clone(),
-                            },
-                        );
-                        artifacts.push(artifact);
-                    }
+                ConfiguredSourceOutcome::Rejected { source, error } => {
+                    source_reports.push(SourceReport::Rejected { source, error });
                 }
             }
         }
 
-        if artifacts.is_empty() {
-            if let Some(error) = first_source_error {
-                return Err(error);
-            }
+        if healthy_sources == 0 {
+            return Err(NoHealthySources::new(source_reports).into());
         }
 
-        Ok(Catalog { artifacts })
+        Ok(CatalogLoad {
+            catalog: Catalog { artifacts },
+            source_reports,
+        })
     }
 
     pub fn server_packages(&self) -> Vec<ServerPackage> {
@@ -232,7 +226,7 @@ impl Catalog {
             .artifacts
             .iter()
             .filter_map(|artifact| match artifact {
-                NormalizedArtifact::Server(_, package) => Some(package.clone()),
+                ValidatedArtifact::Server(_, package) => Some(package.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -251,7 +245,7 @@ impl Catalog {
             .artifacts
             .iter()
             .filter_map(|artifact| match artifact {
-                NormalizedArtifact::Cli(_, package) => Some(package.clone()),
+                ValidatedArtifact::Cli(_, package) => Some(package.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -269,7 +263,7 @@ impl Catalog {
             .artifacts
             .iter()
             .filter_map(|artifact| match artifact {
-                NormalizedArtifact::Extension(_, package)
+                ValidatedArtifact::Extension(_, package)
                     if package.tags.get("server_slot").map(|s| s.as_str()) == Some(slot) =>
                 {
                     Some(package.clone())
@@ -291,77 +285,401 @@ impl Catalog {
 pub async fn load_default_async(channel: Channel, platform: &str) -> anyhow::Result<Catalog> {
     let config = Config::load()?;
     let loader = SourceLoader::new()?;
-    Catalog::load(&config, &loader, channel, platform).await
-}
-
-fn is_recoverable_source_failure(error: &SourceError) -> bool {
-    matches!(error, SourceError::Network { .. })
-        || is_missing_source_failure(error)
-        || matches!(
-            error,
-            SourceError::Http { status, .. } if is_unavailability_status(*status)
-        )
-}
-
-fn is_unavailability_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
-fn is_missing_source_failure(error: &SourceError) -> bool {
-    match error {
-        SourceError::SourceNotFound { .. } => true,
-        SourceError::FileIo { error, .. } => error.kind() == std::io::ErrorKind::NotFound,
-        SourceError::Http { .. } | SourceError::Network { .. } => false,
+    let load = Catalog::load(&config, &loader, channel, platform).await?;
+    for report in &load.source_reports {
+        if let SourceReport::Healthy {
+            source,
+            selected_indexes,
+            artifact_count,
+        } = report
+        {
+            log::debug!(
+                "registry source {source} loaded {selected_indexes} indexes and {artifact_count} artifacts"
+            );
+        }
     }
+    for_each_degraded_report(&load.source_reports, |report| {
+        if let Some(warning) = report.warning() {
+            log::warn!("{warning}");
+        }
+    });
+    Ok(load.catalog)
 }
 
-fn is_missing_source_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<SourceError>()
-            .is_some_and(is_missing_source_failure)
-    })
+enum ConfiguredSourceOutcome {
+    Healthy {
+        source: RegistrySource,
+        selected_indexes: usize,
+        artifacts: Vec<(Source, ValidatedArtifact)>,
+    },
+    Unavailable {
+        source: RegistrySource,
+        error: anyhow::Error,
+    },
+    Rejected {
+        source: RegistrySource,
+        error: anyhow::Error,
+    },
 }
 
-impl NormalizedArtifact {
-    fn key(&self) -> &ArtifactKey {
+#[derive(Clone)]
+struct SelectedIndexInput {
+    source_ordinal: usize,
+    index_ordinal: usize,
+    index_source: Source,
+    artifact_base: Source,
+}
+
+enum ResolvedSourceOutcome {
+    Ready {
+        source: RegistrySource,
+        indexes: Vec<SelectedIndexInput>,
+    },
+    Unavailable {
+        source: RegistrySource,
+        error: anyhow::Error,
+    },
+    Rejected {
+        source: RegistrySource,
+        error: anyhow::Error,
+    },
+}
+
+enum ValidatedIndexOutcome {
+    Healthy {
+        source_ordinal: usize,
+        index_ordinal: usize,
+        index_source: Source,
+        artifacts: Vec<ValidatedArtifact>,
+    },
+    Unavailable {
+        source_ordinal: usize,
+        index_ordinal: usize,
+        error: anyhow::Error,
+    },
+    Rejected {
+        source_ordinal: usize,
+        index_ordinal: usize,
+        error: anyhow::Error,
+    },
+}
+
+impl ValidatedIndexOutcome {
+    fn source_ordinal(&self) -> usize {
         match self {
-            NormalizedArtifact::Server(key, _)
-            | NormalizedArtifact::Cli(key, _)
-            | NormalizedArtifact::Extension(key, _) => key,
+            Self::Healthy { source_ordinal, .. }
+            | Self::Unavailable { source_ordinal, .. }
+            | Self::Rejected { source_ordinal, .. } => *source_ordinal,
+        }
+    }
+
+    fn index_ordinal(&self) -> usize {
+        match self {
+            Self::Healthy { index_ordinal, .. }
+            | Self::Unavailable { index_ordinal, .. }
+            | Self::Rejected { index_ordinal, .. } => *index_ordinal,
         }
     }
 }
-fn duplicate_relation(first: &NormalizedArtifact, later: &NormalizedArtifact) -> DuplicateRelation {
+
+enum IndexFailure {
+    Unavailable(anyhow::Error),
+    Rejected(anyhow::Error),
+}
+
+struct SourceAccumulator {
+    source: RegistrySource,
+    selected_indexes: usize,
+    next_index_ordinal: usize,
+    artifacts: Vec<(Source, ValidatedArtifact)>,
+    failure: Option<IndexFailure>,
+}
+
+impl SourceAccumulator {
+    fn from_resolved(outcome: ResolvedSourceOutcome) -> Self {
+        match outcome {
+            ResolvedSourceOutcome::Ready { source, indexes } => Self {
+                source,
+                selected_indexes: indexes.len(),
+                next_index_ordinal: 0,
+                artifacts: Vec::new(),
+                failure: None,
+            },
+            ResolvedSourceOutcome::Unavailable { source, error } => Self {
+                source,
+                selected_indexes: 0,
+                artifacts: Vec::new(),
+                next_index_ordinal: 0,
+                failure: Some(IndexFailure::Unavailable(error)),
+            },
+            ResolvedSourceOutcome::Rejected { source, error } => Self {
+                source,
+                selected_indexes: 0,
+                artifacts: Vec::new(),
+                next_index_ordinal: 0,
+                failure: Some(IndexFailure::Rejected(error)),
+            },
+        }
+    }
+
+    fn record_index(&mut self, outcome: ValidatedIndexOutcome) {
+        let index_ordinal = outcome.index_ordinal();
+        debug_assert_eq!(self.next_index_ordinal, index_ordinal);
+        self.next_index_ordinal += 1;
+        match outcome {
+            ValidatedIndexOutcome::Healthy {
+                index_source,
+                artifacts,
+                ..
+            } => {
+                if self.failure.is_none() {
+                    self.artifacts.extend(
+                        artifacts
+                            .into_iter()
+                            .map(|artifact| (index_source.clone(), artifact)),
+                    );
+                }
+            }
+            ValidatedIndexOutcome::Unavailable { error, .. } => {
+                if self.failure.is_none() {
+                    self.artifacts.clear();
+                    self.failure = Some(IndexFailure::Unavailable(error));
+                }
+            }
+            ValidatedIndexOutcome::Rejected { error, .. } => {
+                if self.failure.is_none() {
+                    self.artifacts.clear();
+                    self.failure = Some(IndexFailure::Rejected(error));
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> ConfiguredSourceOutcome {
+        match self.failure {
+            None => ConfiguredSourceOutcome::Healthy {
+                source: self.source,
+                selected_indexes: self.selected_indexes,
+                artifacts: self.artifacts,
+            },
+            Some(IndexFailure::Unavailable(error)) => ConfiguredSourceOutcome::Unavailable {
+                source: self.source,
+                error,
+            },
+            Some(IndexFailure::Rejected(error)) => ConfiguredSourceOutcome::Rejected {
+                source: self.source,
+                error,
+            },
+        }
+    }
+}
+
+async fn resolve_configured_source(
+    source_ordinal: usize,
+    registry_source: RegistrySource,
+    loader: &SourceLoader,
+    channel: Channel,
+    platform: &str,
+) -> ResolvedSourceOutcome {
+    let source = registry_source.clone();
+    let indexes = match &registry_source {
+        RegistrySource::Manifest(manifest_source) => {
+            let manifest_bytes = match loader.load_manifest(manifest_source).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return ResolvedSourceOutcome::Unavailable {
+                        source,
+                        error: anyhow::Error::new(error).context(format!(
+                            "failed to load registry manifest {}",
+                            manifest_source.display()
+                        )),
+                    };
+                }
+            };
+            let manifest = match Manifest::from_slice(&manifest_bytes) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    return ResolvedSourceOutcome::Rejected {
+                        source,
+                        error: error.context(format!(
+                            "failed to parse registry manifest {}",
+                            manifest_source.display()
+                        )),
+                    };
+                }
+            };
+            let sources = match manifest.select_indexes(manifest_source, channel, platform) {
+                Ok(sources) => sources,
+                Err(error) => {
+                    return ResolvedSourceOutcome::Rejected {
+                        source,
+                        error: error.context(format!(
+                            "failed to select registry indexes from {}",
+                            manifest_source.display()
+                        )),
+                    };
+                }
+            };
+            sources
+                .into_iter()
+                .enumerate()
+                .map(|(index_ordinal, index_source)| SelectedIndexInput {
+                    source_ordinal,
+                    index_ordinal,
+                    artifact_base: index_source.clone(),
+                    index_source,
+                })
+                .collect::<Vec<_>>()
+        }
+        RegistrySource::LegacyPackageRoot(root) => {
+            let index_source = match super::source::legacy_index_url(root, platform, channel) {
+                Ok(url) => Source::Http(url),
+                Err(error) => {
+                    return ResolvedSourceOutcome::Rejected {
+                        source,
+                        error: error.context(format!(
+                            "failed to construct legacy registry index for {root}"
+                        )),
+                    };
+                }
+            };
+            let artifact_base = Source::Http(root.clone());
+            vec![SelectedIndexInput {
+                source_ordinal,
+                index_ordinal: 0,
+                index_source,
+                artifact_base,
+            }]
+        }
+    };
+
+    ResolvedSourceOutcome::Ready { source, indexes }
+}
+
+async fn load_and_validate_index(
+    loader: &SourceLoader,
+    input: SelectedIndexInput,
+    platform: &str,
+) -> ValidatedIndexOutcome {
+    let SelectedIndexInput {
+        source_ordinal,
+        index_ordinal,
+        index_source,
+        artifact_base,
+    } = input;
+    let index_bytes = match loader.load_index(&index_source).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return ValidatedIndexOutcome::Unavailable {
+                source_ordinal,
+                index_ordinal,
+                error: anyhow::Error::new(error).context(format!(
+                    "failed to load registry index {}",
+                    index_source.display()
+                )),
+            };
+        }
+    };
+    let index = match IndexDocument::from_slice(&index_bytes) {
+        Ok(index) => index,
+        Err(error) => {
+            return ValidatedIndexOutcome::Rejected {
+                source_ordinal,
+                index_ordinal,
+                error: error.context(format!(
+                    "failed to parse registry index {}",
+                    index_source.display()
+                )),
+            };
+        }
+    };
+    let validated = match index.validate(&index_source, &artifact_base, platform) {
+        Ok(validated) => validated,
+        Err(error) => {
+            return ValidatedIndexOutcome::Rejected {
+                source_ordinal,
+                index_ordinal,
+                error: anyhow::Error::new(error).context(format!(
+                    "failed to validate registry index {}",
+                    index_source.display()
+                )),
+            };
+        }
+    };
+
+    ValidatedIndexOutcome::Healthy {
+        source_ordinal,
+        index_ordinal,
+        index_source,
+        artifacts: validated.into_artifacts(),
+    }
+}
+
+fn compose_source_artifacts(
+    artifacts: &mut Vec<ValidatedArtifact>,
+    seen: &mut HashMap<ArtifactIdentity, CatalogEntry>,
+    source_artifacts: Vec<(Source, ValidatedArtifact)>,
+) -> anyhow::Result<()> {
+    for (index_source, artifact) in source_artifacts {
+        let identity = artifact.identity().clone();
+        if let Some(first_entry) = seen.get(&identity) {
+            let first_artifact = &artifacts[first_entry.artifact_index];
+            match duplicate_relation(first_artifact, &artifact) {
+                DuplicateRelation::EquivalentMirror => continue,
+                DuplicateRelation::Conflict { fields } => {
+                    anyhow::bail!(
+                        "conflicting registry artifact {identity}: {} ({}) disagrees with {} ({}) on {}; refusing to choose between sources",
+                        index_source.display(),
+                        artifact.url(),
+                        first_entry.index_source.display(),
+                        first_artifact.url(),
+                        fields.join(", "),
+                    );
+                }
+            }
+        }
+        seen.insert(
+            identity,
+            CatalogEntry {
+                artifact_index: artifacts.len(),
+                index_source,
+            },
+        );
+        artifacts.push(artifact);
+    }
+    Ok(())
+}
+
+fn duplicate_relation(first: &ValidatedArtifact, later: &ValidatedArtifact) -> DuplicateRelation {
     let mut fields = Vec::new();
     match (first, later) {
-        (NormalizedArtifact::Server(_, first), NormalizedArtifact::Server(_, later)) => {
+        (ValidatedArtifact::Server(_, first), ValidatedArtifact::Server(_, later)) => {
             if first.size != later.size {
                 fields.push("size");
             }
-            if !package_hash_equal(&first.hash, &later.hash) {
+            if first.hash != later.hash {
                 fields.push("hash");
             }
             if first.tags != later.tags {
                 fields.push("tags");
             }
         }
-        (NormalizedArtifact::Cli(_, first), NormalizedArtifact::Cli(_, later)) => {
+        (ValidatedArtifact::Cli(_, first), ValidatedArtifact::Cli(_, later)) => {
             if first.size != later.size {
                 fields.push("size");
             }
-            if !package_hash_equal(&first.hash, &later.hash) {
+            if first.hash != later.hash {
                 fields.push("hash");
             }
             if first.compression_variant() != later.compression_variant() {
                 fields.push("compression");
             }
         }
-        (NormalizedArtifact::Extension(_, first), NormalizedArtifact::Extension(_, later)) => {
+        (ValidatedArtifact::Extension(_, first), ValidatedArtifact::Extension(_, later)) => {
             if first.size != later.size {
                 fields.push("size");
             }
-            if !package_hash_equal(&first.hash, &later.hash) {
+            if first.hash != later.hash {
                 fields.push("hash");
             }
             if first.tags != later.tags {
@@ -377,345 +695,412 @@ fn duplicate_relation(first: &NormalizedArtifact, later: &NormalizedArtifact) ->
     }
 }
 
-fn package_hash_equal(first: &PackageHash, later: &PackageHash) -> bool {
-    match (first, later) {
-        (PackageHash::Blake2b(first), PackageHash::Blake2b(later))
-        | (PackageHash::Unknown(first), PackageHash::Unknown(later)) => first == later,
-        _ => false,
-    }
-}
-
 impl CliPackage {
     fn compression_variant(&self) -> Option<&'static str> {
         self.compression.as_ref().map(|_| "zstd")
     }
 }
 
-fn artifact_url(artifact: &NormalizedArtifact) -> &Url {
-    match artifact {
-        NormalizedArtifact::Server(_, package) => &package.url,
-        NormalizedArtifact::Cli(_, package) => &package.url,
-        NormalizedArtifact::Extension(_, package) => &package.url,
-    }
-}
-
-fn normalize_artifact(
-    index_source: &Source,
-    artifact_base: &Source,
-    pkg: &PackageData,
-) -> Option<NormalizedArtifact> {
-    let artifact = normalize_server(index_source, artifact_base, pkg)
-        .or_else(|| normalize_cli(index_source, artifact_base, pkg))
-        .or_else(|| normalize_extension(index_source, artifact_base, pkg));
-    if artifact.is_none() && is_supported_portable_package(pkg) {
-        log::info!("Skipping registry package {pkg:?}");
-    }
-    artifact
-}
-
-fn is_supported_portable_package(pkg: &PackageData) -> bool {
-    matches!(
-        pkg.basename.as_str(),
-        "gel-server" | "edgedb-server" | "gel-cli" | "edgedb-cli"
-    ) || pkg.tags.contains_key("extension")
-}
-
-fn normalize_server(
-    _index_source: &Source,
-    artifact_base: &Source,
-    pkg: &PackageData,
-) -> Option<NormalizedArtifact> {
-    if !matches!(pkg.basename.as_str(), "gel-server" | "edgedb-server") {
-        return None;
-    }
-    let installref = choose_installref(
-        artifact_base,
-        pkg,
-        &[(Some("application/x-tar"), Some("zstd"))],
-    )?;
-    let version = parse_build_version(&pkg.version)?;
-    let url = resolve_installref_url(artifact_base, &installref.path)?;
-    let hash = installref_hash(installref)?;
-    let key = ArtifactKey {
-        kind: ArtifactKind::Server,
-        name: pkg.basename.clone().into_boxed_str(),
-        version: pkg.version.clone().into_boxed_str(),
-        slot: pkg.slot.clone().into_boxed_str(),
-    };
-    Some(NormalizedArtifact::Server(
-        key,
-        ServerPackage {
-            name: pkg.basename.clone(),
-            version,
-            url,
-            size: installref.verification.size,
-            hash,
-            kind: PackageType::TarZst,
-            slot: pkg.slot.clone(),
-            tags: pkg.tags.clone(),
-        },
-    ))
-}
-
-fn normalize_cli(
-    _index_source: &Source,
-    artifact_base: &Source,
-    pkg: &PackageData,
-) -> Option<NormalizedArtifact> {
-    if !matches!(pkg.basename.as_str(), "gel-cli" | "edgedb-cli") {
-        return None;
-    }
-
-    let installref = choose_installref(
-        artifact_base,
-        pkg,
-        &[(None, Some("zstd")), (None, Some("identity"))],
-    )?;
-    let version = pkg.version.parse::<ver::Semver>().ok()?;
-    let url = resolve_installref_url(artifact_base, &installref.path)?;
-    let hash = installref_hash(installref)?;
-    let compression = if installref.encoding.as_deref() == Some("zstd") {
-        Some(Compression::Zstd)
-    } else {
-        None
-    };
-    let key = ArtifactKey {
-        kind: ArtifactKind::Cli,
-        name: pkg.basename.clone().into_boxed_str(),
-        version: pkg.version.clone().into_boxed_str(),
-        slot: pkg.slot.clone().into_boxed_str(),
-    };
-    Some(NormalizedArtifact::Cli(
-        key,
-        CliPackage {
-            version,
-            url,
-            size: installref.verification.size,
-            hash,
-            compression,
-        },
-    ))
-}
-
-fn normalize_extension(
-    _index_source: &Source,
-    artifact_base: &Source,
-    pkg: &PackageData,
-) -> Option<NormalizedArtifact> {
-    let extension_name = pkg.tags.get("extension")?.clone();
-    let installref = choose_installref(
-        artifact_base,
-        pkg,
-        &[(Some("application/zip"), Some("identity"))],
-    )?;
-    let version = parse_build_version(&pkg.version)?;
-    let url = resolve_installref_url(artifact_base, &installref.path)?;
-    let hash = installref_hash(installref)?;
-    let key = ArtifactKey {
-        kind: ArtifactKind::Extension,
-        name: extension_name.clone().into_boxed_str(),
-        version: pkg.version.clone().into_boxed_str(),
-        slot: pkg.slot.clone().into_boxed_str(),
-    };
-    Some(NormalizedArtifact::Extension(
-        key,
-        ExtensionPackage {
-            name: extension_name,
-            version,
-            url,
-            size: installref.verification.size,
-            hash,
-            kind: PackageType::Zip,
-            slot: pkg.slot.clone(),
-            tags: pkg.tags.clone(),
-        },
-    ))
-}
-
-fn choose_installref<'a>(
-    artifact_base: &Source,
-    pkg: &'a PackageData,
-    candidates: &[(Option<&'static str>, Option<&'static str>)],
-) -> Option<&'a InstallRef> {
-    for (kind, encoding) in candidates {
-        if let Some(installref) = pkg.installrefs.iter().find(|installref| {
-            kind.is_none_or(|kind| installref.kind == kind)
-                && installref.encoding.as_deref() == *encoding
-                && installref
-                    .verification
-                    .blake2b
-                    .as_deref()
-                    .map(valid_blake2b)
-                    .unwrap_or(false)
-                && resolve_installref_url(artifact_base, &installref.path).is_some()
-        }) {
-            return Some(installref);
-        }
-    }
-    None
-}
-
-fn resolve_installref_url(artifact_base: &Source, value: &str) -> Option<Url> {
-    if let Ok(url) = Url::parse(value) {
-        return match url.scheme() {
-            "http" | "https" | "file" => Some(url),
-            _ => None,
-        };
-    }
-
-    match artifact_base {
-        Source::Http(base) => base.join(value).ok(),
-        Source::File(path) => {
-            let path = if Path::new(value).is_absolute() {
-                Path::new(value).to_path_buf()
-            } else {
-                path.parent().unwrap_or_else(|| Path::new(".")).join(value)
-            };
-            Url::from_file_path(path).ok()
-        }
-    }
-}
-
-fn installref_hash(installref: &InstallRef) -> Option<PackageHash> {
-    let hash = installref.verification.blake2b.as_ref()?;
-    if !valid_blake2b(hash) {
-        return None;
-    }
-    Some(PackageHash::Blake2b(hash.clone().into_boxed_str()))
-}
-
-fn parse_build_version(value: &str) -> Option<ver::Build> {
-    value.parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::portable::registry::index::Verification;
-    use std::collections::HashMap;
-    use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-
-    struct CapturingLogger(Arc<Mutex<Vec<String>>>);
-
-    impl log::Log for CapturingLogger {
-        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Info
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            if self.enabled(record.metadata()) {
-                let mut messages = self
-                    .0
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                messages.push(format!("{}", record.args()));
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    static LOG_MESSAGES: LazyLock<Arc<Mutex<Vec<String>>>> = LazyLock::new(|| {
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        let logger = CapturingLogger(messages.clone());
-        log::set_boxed_logger(Box::new(logger)).expect("failed to install capture logger");
-        log::set_max_level(log::LevelFilter::Info);
-        messages
-    });
-    static LOG_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
-
-    fn capture_info_logs() -> (Arc<Mutex<Vec<String>>>, MutexGuard<'static, ()>) {
-        let guard = LOG_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let messages = LOG_MESSAGES.clone();
-        let mut message_buffer = messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        message_buffer.clear();
-        drop(message_buffer);
-        (messages, guard)
-    }
+    use url::Url;
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    fn write_manifest_with_indexes(
+        directory: &std::path::Path,
+        manifest_name: &str,
+        indexes: &[&str],
+    ) -> std::path::PathBuf {
+        let manifest = directory.join(manifest_name);
+        let indexes = indexes
+            .iter()
+            .map(|url| {
+                serde_json::json!({
+                    "channel": "stable",
+                    "platform": "linux",
+                    "url": url,
+                })
+            })
+            .collect::<Vec<_>>();
+        fs_err::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "indexes": indexes,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        manifest
+    }
 
-    fn package_data(basename: &str, version: &str, tags: HashMap<String, String>) -> PackageData {
-        PackageData {
-            basename: basename.to_owned(),
-            version: version.to_owned(),
-            slot: "7".to_owned(),
-            tags,
-            installrefs: vec![InstallRef {
-                path: "https://example.com/package".to_owned(),
-                kind: "application/x-tar".to_owned(),
-                encoding: Some("zstd".to_owned()),
-                verification: Verification {
-                    size: 10,
-                    blake2b: Some(HASH.to_owned()),
-                },
-            }],
-        }
+    fn server_index(hash: &str) -> String {
+        format!(
+            r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://example.com/server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{hash}"}}}}]}}]}}"#
+        )
     }
 
     #[test]
-    fn supported_portable_package_predicate_is_narrow() {
-        for basename in ["gel-server", "edgedb-server", "gel-cli", "edgedb-cli"] {
-            assert!(is_supported_portable_package(&package_data(
-                basename,
-                "7.0",
-                HashMap::new(),
-            )));
-        }
-        assert!(!is_supported_portable_package(&package_data(
-            "apt-package",
-            "7.0",
-            HashMap::new(),
-        )));
-        assert!(is_supported_portable_package(&package_data(
-            "custom-package",
-            "7.0",
-            HashMap::from([("extension".to_owned(), "custom".to_owned())]),
-        )));
+    fn degraded_report_callback_deduplicates_equal_sources() {
+        let source = RegistrySource::Manifest(Source::File("missing.json".into()));
+        let reports = vec![
+            SourceReport::Healthy {
+                source: source.clone(),
+                selected_indexes: 0,
+                artifact_count: 0,
+            },
+            SourceReport::Unavailable {
+                source: source.clone(),
+                error: anyhow::anyhow!("first failure"),
+            },
+            SourceReport::Unavailable {
+                source,
+                error: anyhow::anyhow!("duplicate failure"),
+            },
+        ];
+        let mut warnings = Vec::new();
+        for_each_degraded_report(&reports, |report| {
+            if let Some(warning) = report.warning() {
+                warnings.push(warning);
+            }
+        });
+
+        assert_eq!(warnings.len(), 1);
     }
 
     #[test]
-    fn bare_supported_package_is_skipped_without_build_metadata() {
-        let (_messages, _capture_guard) = capture_info_logs();
-        let pkg = package_data("gel-server", "7.0", HashMap::new());
-        let source = Source::Http(Url::parse("https://example.com/index.json").unwrap());
+    fn degraded_report_callback_preserves_distinct_source_order() {
+        let first = RegistrySource::Manifest(Source::File("first.json".into()));
+        let second = RegistrySource::Manifest(Source::File("second.json".into()));
+        let reports = vec![
+            SourceReport::Healthy {
+                source: first.clone(),
+                selected_indexes: 0,
+                artifact_count: 0,
+            },
+            SourceReport::Unavailable {
+                source: first,
+                error: anyhow::anyhow!("first failure"),
+            },
+            SourceReport::Rejected {
+                source: second,
+                error: anyhow::anyhow!("second failure"),
+            },
+        ];
+        let mut warnings = Vec::new();
+        for_each_degraded_report(&reports, |report| {
+            if let Some(warning) = report.warning() {
+                warnings.push(warning);
+            }
+        });
 
-        assert!(normalize_artifact(&source, &source, &pkg).is_none());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("first.json"));
+        assert!(warnings[1].contains("second.json"));
     }
-    #[test]
-    fn bare_supported_package_skip_emits_info_diagnostic() {
-        let (messages, _capture_guard) = capture_info_logs();
-        let pkg = package_data("gel-server", "7.0", HashMap::new());
-        let source = Source::Http(Url::parse("https://example.com/index.json").unwrap());
 
-        assert!(normalize_artifact(&source, &source, &pkg).is_none());
-        let messages = messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.contains("Skipping registry package"))
+    #[tokio::test]
+    async fn bounded_collection_preserves_input_order_and_limit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let values = (0usize..12).collect::<Vec<_>>();
+        let output = collect_bounded_ordered(values, 4, {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |value| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis((12 - value) as u64)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    value
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(output, (0usize..12).collect::<Vec<_>>());
+        assert_eq!(maximum.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn concurrent_completion_does_not_change_source_precedence() {
+        use std::time::Duration;
+        let server = wiremock::MockServer::start().await;
+        let first_artifact = "https://first.example.com/server.tar.zst";
+        let second_artifact = "https://second.example.com/server.tar.zst";
+        let index_body = |artifact_url: &str| {
+            format!(
+                r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"{artifact_url}","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
+            )
+        };
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/first.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_string(index_body(first_artifact)),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/second.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(index_body(second_artifact)),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let write_manifest = |name: &str, index_url: String| {
+            let path = tmp.path().join(name);
+            fs_err::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "indexes": [{
+                        "channel": "stable",
+                        "platform": "linux",
+                        "url": index_url,
+                    }],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            path
+        };
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(write_manifest(
+                    "first-manifest.json",
+                    format!("{}/first.json", server.uri()),
+                ))),
+                RegistrySource::Manifest(Source::File(write_manifest(
+                    "second-manifest.json",
+                    format!("{}/second.json", server.uri()),
+                ))),
+            ],
+        };
+        let load = Catalog::load(
+            &config,
+            &SourceLoader::new().unwrap(),
+            Channel::Stable,
+            "linux",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            load.catalog.server_packages()[0].url.as_str(),
+            first_artifact
         );
     }
 
-    #[test]
-    fn unrelated_malformed_package_stays_quiet() {
-        let (messages, _capture_guard) = capture_info_logs();
-        let pkg = package_data("apt-package", "not-a-build", HashMap::new());
-        let source = Source::Http(Url::parse("https://example.com/index.json").unwrap());
-        assert!(normalize_artifact(&source, &source, &pkg).is_none());
-        let messages = messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[tokio::test]
+    async fn unavailable_source_plus_healthy_empty_index_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_manifest =
+            write_manifest_with_indexes(tmp.path(), "empty-manifest.json", &["empty.json"]);
+        fs_err::write(tmp.path().join("empty.json"), br#"{"packages":[]}"#).unwrap();
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(tmp.path().join("missing.json"))),
+                RegistrySource::Manifest(Source::File(empty_manifest.clone())),
+            ],
+        };
+        let load = Catalog::load(
+            &config,
+            &SourceLoader::new().unwrap(),
+            Channel::Stable,
+            "linux",
+        )
+        .await
+        .unwrap();
+        assert!(load.catalog.server_packages().is_empty());
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Unavailable { .. }
+        ));
+        assert!(matches!(
+            &load.source_reports[1],
+            SourceReport::Healthy {
+                source: RegistrySource::Manifest(Source::File(source_path)),
+                selected_indexes: 1,
+                artifact_count: 0,
+            } if source_path == &empty_manifest
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_source_plus_manifest_without_match_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = write_manifest_with_indexes(tmp.path(), "bad-manifest.json", &["bad.json"]);
+        fs_err::write(tmp.path().join("bad.json"), server_index("bad")).unwrap();
+        let no_match = tmp.path().join("no-match.json");
+        fs_err::write(&no_match, br#"{"schema_version":1,"indexes":[]}"#).unwrap();
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(bad)),
+                RegistrySource::Manifest(Source::File(no_match)),
+            ],
+        };
+        let load = Catalog::load(
+            &config,
+            &SourceLoader::new().unwrap(),
+            Channel::Stable,
+            "linux",
+        )
+        .await
+        .unwrap();
+        assert!(load.catalog.server_packages().is_empty());
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Rejected { .. }
+        ));
+        assert!(matches!(
+            &load.source_reports[1],
+            SourceReport::Healthy { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_healthy_sources_preserves_configured_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(tmp.path().join("first.json"))),
+                RegistrySource::Manifest(Source::File(tmp.path().join("second.json"))),
+            ],
+        };
+        let error = Catalog::load(
+            &config,
+            &SourceLoader::new().unwrap(),
+            Channel::Stable,
+            "linux",
+        )
+        .await
+        .unwrap_err();
+        let error = error.downcast_ref::<NoHealthySources>().unwrap();
+        assert_eq!(error.reports().len(), 2);
         assert!(
-            !messages
-                .iter()
-                .any(|message| message.contains("Skipping registry package"))
+            error.to_string().find("first.json").unwrap()
+                < error.to_string().find("second.json").unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn one_failed_selected_index_rejects_the_whole_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = write_manifest_with_indexes(
+            tmp.path(),
+            "registry.json",
+            &["good.json", "missing.json"],
+        );
+        fs_err::write(tmp.path().join("good.json"), server_index(HASH)).unwrap();
+        let empty_manifest =
+            write_manifest_with_indexes(tmp.path(), "empty-manifest.json", &["empty.json"]);
+        fs_err::write(tmp.path().join("empty.json"), br#"{"packages":[]}"#).unwrap();
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(manifest)),
+                RegistrySource::Manifest(Source::File(empty_manifest)),
+            ],
+        };
+        let load = Catalog::load(
+            &config,
+            &SourceLoader::new().unwrap(),
+            Channel::Stable,
+            "linux",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Unavailable { .. }
+        ));
+        assert!(load.catalog.server_packages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_invalid_selected_index_rejects_prior_valid_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest =
+            write_manifest_with_indexes(tmp.path(), "registry.json", &["good.json", "bad.json"]);
+        fs_err::write(tmp.path().join("good.json"), server_index(HASH)).unwrap();
+        fs_err::write(tmp.path().join("bad.json"), server_index("bad")).unwrap();
+        let empty_manifest =
+            write_manifest_with_indexes(tmp.path(), "empty-manifest.json", &["empty.json"]);
+        fs_err::write(tmp.path().join("empty.json"), br#"{"packages":[]}"#).unwrap();
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(manifest)),
+                RegistrySource::Manifest(Source::File(empty_manifest)),
+            ],
+        };
+        let load = Catalog::load(
+            &config,
+            &SourceLoader::new().unwrap(),
+            Channel::Stable,
+            "linux",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Rejected { .. }
+        ));
+        assert!(load.catalog.server_packages().is_empty());
+    }
+    #[tokio::test]
+    async fn earlier_rejected_selected_index_preserves_manifest_ordered_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest =
+            write_manifest_with_indexes(tmp.path(), "registry.json", &["bad.json", "missing.json"]);
+        fs_err::write(tmp.path().join("bad.json"), server_index("bad")).unwrap();
+        let empty_manifest =
+            write_manifest_with_indexes(tmp.path(), "empty-manifest.json", &["empty.json"]);
+        fs_err::write(tmp.path().join("empty.json"), br#"{"packages":[]}"#).unwrap();
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(manifest)),
+                RegistrySource::Manifest(Source::File(empty_manifest)),
+            ],
+        };
+        let load = Catalog::load(
+            &config,
+            &SourceLoader::new().unwrap(),
+            Channel::Stable,
+            "linux",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Rejected { error, .. }
+                if error.to_string().contains("bad.json")
+        ));
+        assert!(load.catalog.server_packages().is_empty());
+    }
+
+    fn duplicate_config(tmp: &tempfile::TempDir, first: &str, second: &str) -> Config {
+        let manifest = tmp.path().join("registry.json");
+        let one = tmp.path().join("one.json");
+        let two = tmp.path().join("two.json");
+        fs_err::write(
+            &manifest,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"one.json"},{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"two.json"}]}"#,
+        )
+        .unwrap();
+        fs_err::write(one, first).unwrap();
+        fs_err::write(two, second).unwrap();
+        Config {
+            sources: vec![RegistrySource::Manifest(Source::File(manifest))],
+        }
     }
 
     #[tokio::test]
@@ -727,7 +1112,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(index_path))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(format!(
-                r#"{{"packages":[{{"basename":"gel-cli","version":"7.10.2","slot":"7","tags":{{}},"installrefs":[{{"ref":"{artifact_path}","type":"application/octet-stream","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
+                r#"{{"packages":[{{"basename":"gel-cli","version":"7.10.2","slot":"7","tags":{{}},"installrefs":[{{"ref":"{artifact_path}","type":"application/x-pie-executable","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
             )))
             .mount(&server)
             .await;
@@ -739,7 +1124,8 @@ mod tests {
         let loader = SourceLoader::new().unwrap();
         let catalog = Catalog::load(&config, &loader, Channel::Stable, platform)
             .await
-            .unwrap();
+            .unwrap()
+            .catalog;
 
         assert_eq!(catalog.cli_packages().len(), 1);
         assert_eq!(
@@ -749,7 +1135,6 @@ mod tests {
     }
     #[tokio::test]
     async fn equivalent_duplicate_artifacts_keep_first_source() {
-        let (_messages, _capture_guard) = capture_info_logs();
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("registry.json");
         let one = tmp.path().join("one.json");
@@ -771,7 +1156,8 @@ mod tests {
         let loader = SourceLoader::new().unwrap();
         let catalog = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
-            .unwrap();
+            .unwrap()
+            .catalog;
 
         let packages = catalog.server_packages();
         assert_eq!(packages.len(), 1);
@@ -783,7 +1169,6 @@ mod tests {
 
     #[tokio::test]
     async fn mirror_duplicate_artifacts_keep_first_source() {
-        let (_messages, _capture_guard) = capture_info_logs();
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("registry.json");
         let one = tmp.path().join("one.json");
@@ -814,7 +1199,8 @@ mod tests {
         let loader = SourceLoader::new().unwrap();
         let catalog = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
-            .unwrap();
+            .unwrap()
+            .catalog;
 
         let packages = catalog.server_packages();
         assert_eq!(packages.len(), 1);
@@ -822,53 +1208,6 @@ mod tests {
             packages[0].url,
             url::Url::parse("https://mirror-one.example.com/gel-server.tar.zst").unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn mirror_duplicate_diagnostic_names_ignored_artifact_url() {
-        let (messages, _capture_guard) = capture_info_logs();
-        let tmp = tempfile::tempdir().unwrap();
-        let manifest = tmp.path().join("registry.json");
-        let one = tmp.path().join("one.json");
-        let two = tmp.path().join("two.json");
-        fs_err::write(
-            &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"one.json"},{"channel":"stable","platform":"linux","url":"two.json"}]}"#,
-        )
-        .unwrap();
-        fs_err::write(
-            &one,
-            format!(
-                r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://first.example.com/gel-server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
-            ),
-        )
-        .unwrap();
-        fs_err::write(
-            &two,
-            format!(
-                r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://ignored.example.com/gel-server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
-            ),
-        )
-        .unwrap();
-
-        let config = Config {
-            sources: vec![RegistrySource::Manifest(Source::File(manifest))],
-        };
-        let loader = SourceLoader::new().unwrap();
-        Catalog::load(&config, &loader, Channel::Stable, "linux")
-            .await
-            .unwrap();
-
-        let messages = messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let diagnostic = messages
-            .iter()
-            .find(|message| message.contains("https://ignored.example.com/gel-server.tar.zst"))
-            .expect("duplicate diagnostic");
-        assert!(diagnostic.contains("https://first.example.com/gel-server.tar.zst"));
-        assert!(diagnostic.contains("using first source"));
     }
 
     #[tokio::test]
@@ -954,20 +1293,19 @@ mod tests {
 
     #[tokio::test]
     async fn cli_and_extension_mirror_duplicates_keep_first_source() {
-        let (_messages, _capture_guard) = capture_info_logs();
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("registry.json");
         let one = tmp.path().join("one.json");
         let two = tmp.path().join("two.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"one.json"},{"channel":"stable","platform":"linux","url":"two.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"one.json"},{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"two.json"}]}"#,
         )
         .unwrap();
         let index = |cli_url: &str, extension_url: &str| {
             format!(
                 r#"{{"packages":[
-                    {{"basename":"gel-cli","version":"7.0.0","slot":"7","tags":{{}},"installrefs":[{{"ref":"{cli_url}","type":"application/octet-stream","encoding":"zstd","verification":{{"size":11,"blake2b":"{HASH}"}}}}]}},
+                    {{"basename":"gel-cli","version":"7.0.0","slot":"7","tags":{{}},"installrefs":[{{"ref":"{cli_url}","type":"application/x-pie-executable","encoding":"zstd","verification":{{"size":11,"blake2b":"{HASH}"}}}}]}},
                     {{"basename":"ignored-package","version":"7.0+abcdef0","slot":"7","tags":{{"extension":"local-example","server_slot":"7"}},"installrefs":[{{"ref":"{extension_url}","type":"application/zip","encoding":"identity","verification":{{"size":12,"blake2b":"{HASH}"}}}}]}}
                 ]}}"#
             )
@@ -993,9 +1331,15 @@ mod tests {
             sources: vec![RegistrySource::Manifest(Source::File(manifest))],
         };
         let loader = SourceLoader::new().unwrap();
-        let catalog = Catalog::load(&config, &loader, Channel::Stable, "linux")
-            .await
-            .unwrap();
+        let catalog = Catalog::load(
+            &config,
+            &loader,
+            Channel::Stable,
+            "x86_64-unknown-linux-gnu",
+        )
+        .await
+        .unwrap()
+        .catalog;
 
         assert_eq!(catalog.cli_packages().len(), 1);
         assert_eq!(
@@ -1008,7 +1352,115 @@ mod tests {
             url::Url::parse("https://extension-one.example.com/local-example.zip").unwrap()
         );
     }
-    async fn catalog_with_http_source_status(status: u16) -> anyhow::Result<Catalog> {
+
+    #[tokio::test]
+    async fn cli_records_with_different_wire_slots_are_one_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = |url: &str, slot: &str| {
+            format!(
+                r#"{{"packages":[{{"basename":"gel-cli","version":"7.10.2","slot":"{slot}","tags":{{}},"installrefs":[{{"ref":"{url}","type":"application/x-pie-executable","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
+            )
+        };
+        let config = duplicate_config(
+            &tmp,
+            &index("https://first.example.com/gel-cli.zst", "one"),
+            &index("https://second.example.com/gel-cli.zst", "two"),
+        );
+        let loader = SourceLoader::new().unwrap();
+        let catalog = Catalog::load(
+            &config,
+            &loader,
+            Channel::Stable,
+            "x86_64-unknown-linux-gnu",
+        )
+        .await
+        .unwrap()
+        .catalog;
+
+        assert_eq!(catalog.cli_packages().len(), 1);
+        assert_eq!(
+            catalog.cli_packages()[0].url,
+            Url::parse("https://first.example.com/gel-cli.zst").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tag_difference_is_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = |tag: &str| {
+            format!(
+                r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{"channel":"{tag}"}},"installrefs":[{{"ref":"https://example.com/gel-server-{tag}.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
+            )
+        };
+        let config = duplicate_config(&tmp, &index("stable"), &index("testing"));
+        let loader = SourceLoader::new().unwrap();
+        let error = Catalog::load(
+            &config,
+            &loader,
+            Channel::Stable,
+            "x86_64-unknown-linux-gnu",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("tags"));
+    }
+
+    #[tokio::test]
+    async fn cli_compression_difference_is_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = |encoding: &str, url: &str| {
+            format!(
+                r#"{{"packages":[{{"basename":"gel-cli","version":"7.10.2","slot":"7","tags":{{}},"installrefs":[{{"ref":"{url}","type":"application/x-pie-executable","encoding":"{encoding}","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
+            )
+        };
+        let config = duplicate_config(
+            &tmp,
+            &index("zstd", "https://first.example.com/gel-cli.zst"),
+            &index("identity", "https://second.example.com/gel-cli"),
+        );
+        let loader = SourceLoader::new().unwrap();
+        let error = Catalog::load(
+            &config,
+            &loader,
+            Channel::Stable,
+            "x86_64-unknown-linux-gnu",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("compression"));
+    }
+
+    #[tokio::test]
+    async fn extension_tag_difference_is_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = |extra_tag: &str, url: &str| {
+            format!(
+                r#"{{"packages":[{{"basename":"extension-package","version":"7.0+abcdef0","slot":"7","tags":{{"extension":"pgvector","server_slot":"7"{extra_tag}}},"installrefs":[{{"ref":"{url}","type":"application/zip","encoding":"identity","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
+            )
+        };
+        let config = duplicate_config(
+            &tmp,
+            &index("", "https://first.example.com/pgvector.zip"),
+            &index(
+                r#","source":"mirror""#,
+                "https://second.example.com/pgvector.zip",
+            ),
+        );
+        let loader = SourceLoader::new().unwrap();
+        let error = Catalog::load(
+            &config,
+            &loader,
+            Channel::Stable,
+            "x86_64-unknown-linux-gnu",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("tags"));
+    }
+    async fn catalog_with_http_source_status(status: u16) -> anyhow::Result<CatalogLoad> {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/unavailable.json"))
@@ -1045,20 +1497,26 @@ mod tests {
     #[tokio::test]
     async fn unavailable_http_sources_allow_later_source_artifacts() {
         for status in [429, 500, 502, 503, 599] {
-            let catalog = catalog_with_http_source_status(status).await.unwrap();
+            let catalog = catalog_with_http_source_status(status)
+                .await
+                .unwrap()
+                .catalog;
             assert_eq!(catalog.server_packages().len(), 1, "HTTP {status}");
         }
     }
 
     #[tokio::test]
-    async fn non_unavailability_http_source_errors_are_hard() {
-        let error = catalog_with_http_source_status(403).await.unwrap_err();
-        assert!(format!("{error:#}").contains("HTTP 403"));
+    async fn non_unavailability_http_source_errors_allow_later_source_artifacts() {
+        let load = catalog_with_http_source_status(403).await.unwrap();
+        assert_eq!(load.catalog.server_packages().len(), 1);
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Unavailable { .. }
+        ));
     }
 
     #[tokio::test]
     async fn later_sources_load_after_earlier_source_failure() {
-        let (_messages, _capture_guard) = capture_info_logs();
         let tmp = tempfile::tempdir().unwrap();
         let missing_manifest = tmp.path().join("missing-registry.json");
         let manifest = tmp.path().join("registry.json");
@@ -1083,11 +1541,19 @@ mod tests {
             ],
         };
         let loader = SourceLoader::new().unwrap();
-        let catalog = Catalog::load(&config, &loader, Channel::Stable, "linux")
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
             .unwrap();
 
-        assert_eq!(catalog.server_packages().len(), 1);
+        assert_eq!(load.catalog.server_packages().len(), 1);
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Unavailable { .. }
+        ));
+        assert!(matches!(
+            &load.source_reports[1],
+            SourceReport::Healthy { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1097,7 +1563,7 @@ mod tests {
         let index = tmp.path().join("stable-linux.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"stable-linux.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"stable-linux.json"}]}"#,
         )
         .unwrap();
         fs_err::write(
@@ -1130,7 +1596,7 @@ mod tests {
                             "installrefs": [
                                 {{
                                     "ref": "https://example.com/gel-cli.zst",
-                                    "type": "application/octet-stream",
+                                    "type": "application/x-pie-executable",
                                     "encoding": "zstd",
                                     "verification": {{
                                         "size": 11,
@@ -1169,9 +1635,15 @@ mod tests {
             sources: vec![RegistrySource::Manifest(Source::File(manifest))],
         };
         let loader = SourceLoader::new().unwrap();
-        let catalog = Catalog::load(&config, &loader, Channel::Stable, "linux")
-            .await
-            .unwrap();
+        let catalog = Catalog::load(
+            &config,
+            &loader,
+            Channel::Stable,
+            "x86_64-unknown-linux-gnu",
+        )
+        .await
+        .unwrap()
+        .catalog;
 
         assert_eq!(catalog.server_packages().len(), 1);
         assert_eq!(catalog.cli_packages().len(), 1);
@@ -1181,7 +1653,6 @@ mod tests {
 
     #[tokio::test]
     async fn non_missing_source_errors_are_not_masked_by_earlier_missing_sources() {
-        let (_messages, _capture_guard) = capture_info_logs();
         let tmp = tempfile::tempdir().unwrap();
         let missing_manifest = tmp.path().join("missing-registry.json");
         let manifest = tmp.path().join("registry.json");
@@ -1205,12 +1676,19 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("failed to parse registry index"));
-        assert!(!is_missing_source_error(&err));
+        let aggregate = err.downcast_ref::<NoHealthySources>().unwrap();
+        assert!(matches!(
+            &aggregate.reports()[0],
+            SourceReport::Unavailable { .. }
+        ));
+        assert!(matches!(
+            &aggregate.reports()[1],
+            SourceReport::Rejected { .. }
+        ));
     }
 
     #[tokio::test]
     async fn missing_manifest_source_returns_error() {
-        let (_messages, _capture_guard) = capture_info_logs();
         let tmp = tempfile::tempdir().unwrap();
         let missing_manifest = tmp.path().join("missing-registry.json");
         let config = Config {
@@ -1252,7 +1730,8 @@ mod tests {
 
         let catalog = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
-            .unwrap();
+            .unwrap()
+            .catalog;
 
         assert!(catalog.server_packages().is_empty());
         assert!(catalog.cli_packages().is_empty());
@@ -1261,7 +1740,6 @@ mod tests {
 
     #[tokio::test]
     async fn network_manifest_failure_continues_when_later_source_has_artifacts() {
-        let (_messages, _capture_guard) = capture_info_logs();
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("registry.json");
         let index = tmp.path().join("stable-linux.json");
@@ -1286,16 +1764,23 @@ mod tests {
         };
         let loader = SourceLoader::new().unwrap();
 
-        let catalog = Catalog::load(&config, &loader, Channel::Stable, "linux")
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
             .unwrap();
 
-        assert_eq!(catalog.server_packages().len(), 1);
+        assert_eq!(load.catalog.server_packages().len(), 1);
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Unavailable { .. }
+        ));
+        assert!(matches!(
+            &load.source_reports[1],
+            SourceReport::Healthy { .. }
+        ));
     }
 
     #[tokio::test]
-    async fn malformed_second_source_fails_after_valid_artifacts() {
-        let (_messages, _capture_guard) = capture_info_logs();
+    async fn malformed_second_source_is_rejected_after_valid_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
         let valid_manifest = tmp.path().join("valid-registry.json");
         let valid_index = tmp.path().join("stable-linux.json");
@@ -1321,19 +1806,18 @@ mod tests {
         };
         let loader = SourceLoader::new().unwrap();
 
-        let error = Catalog::load(&config, &loader, Channel::Stable, "linux")
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("failed to parse registry manifest")
-        );
+        assert_eq!(load.catalog.server_packages().len(), 1);
+        assert!(matches!(
+            &load.source_reports[1],
+            SourceReport::Rejected { .. }
+        ));
     }
     #[tokio::test]
     async fn missing_selected_index_continues_when_later_source_has_artifacts() {
-        let (_messages, _capture_guard) = capture_info_logs();
         let tmp = tempfile::tempdir().unwrap();
         let missing_manifest = tmp.path().join("missing-index-registry.json");
         let manifest = tmp.path().join("registry.json");
@@ -1363,16 +1847,23 @@ mod tests {
             ],
         };
         let loader = SourceLoader::new().unwrap();
-        let catalog = Catalog::load(&config, &loader, Channel::Stable, "linux")
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
             .unwrap();
 
-        assert_eq!(catalog.server_packages().len(), 1);
+        assert_eq!(load.catalog.server_packages().len(), 1);
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Unavailable { .. }
+        ));
+        assert!(matches!(
+            &load.source_reports[1],
+            SourceReport::Healthy { .. }
+        ));
     }
 
     #[tokio::test]
     async fn network_selected_index_failure_continues_when_later_source_has_artifacts() {
-        let (_messages, _capture_guard) = capture_info_logs();
         let tmp = tempfile::tempdir().unwrap();
         let unreachable_index_manifest = tmp.path().join("network-index-registry.json");
         let manifest = tmp.path().join("registry.json");
@@ -1402,10 +1893,18 @@ mod tests {
             ],
         };
         let loader = SourceLoader::new().unwrap();
-        let catalog = Catalog::load(&config, &loader, Channel::Stable, "linux")
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
             .unwrap();
 
-        assert_eq!(catalog.server_packages().len(), 1);
+        assert_eq!(load.catalog.server_packages().len(), 1);
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Unavailable { .. }
+        ));
+        assert!(matches!(
+            &load.source_reports[1],
+            SourceReport::Healthy { .. }
+        ));
     }
 }

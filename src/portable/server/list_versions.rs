@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use color_print::cprintln;
 use gel_cli_derive::IntoArgs;
+use serde::Serialize;
 
 use crate::branding::BRANDING;
 use crate::portable::local::{self, InstallInfo};
@@ -221,8 +222,46 @@ pub struct DebugInstall {
 }
 
 #[derive(serde::Serialize)]
+struct JsonServerPackage<'a> {
+    name: &'a str,
+    version: &'a ver::Build,
+    url: &'a url::Url,
+    size: u64,
+    hash: String,
+    kind: &'a registry::types::PackageType,
+    slot: &'a str,
+    tags: &'a std::collections::HashMap<String, String>,
+}
+
+fn serialize_server_package<S>(
+    package: &Option<ServerPackage>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match package {
+        Some(package) => JsonServerPackage {
+            name: &package.name,
+            version: &package.version,
+            url: &package.url,
+            size: package.size,
+            hash: format!("blake2b:{}", package.hash),
+            kind: &package.kind,
+            slot: &package.slot,
+            tags: &package.tags,
+        }
+        .serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+#[derive(serde::Serialize)]
 pub struct DebugInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_server_package"
+    )]
     package: Option<ServerPackage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     install: Option<DebugInstall>,
@@ -245,17 +284,76 @@ pub async fn all_packages() -> anyhow::Result<Vec<ServerPackage>> {
     all_packages_with_async(&config, &loader, platform).await
 }
 
+fn report_source(report: &registry::catalog::SourceReport) -> &registry::config::RegistrySource {
+    match report {
+        registry::catalog::SourceReport::Healthy { source, .. }
+        | registry::catalog::SourceReport::Unavailable { source, .. }
+        | registry::catalog::SourceReport::Rejected { source, .. } => source,
+    }
+}
+
+fn is_degraded_report(report: &registry::catalog::SourceReport) -> bool {
+    !matches!(report, registry::catalog::SourceReport::Healthy { .. })
+}
+
+async fn all_packages_with_reporter<F>(
+    config: &registry::Config,
+    loader: &registry::SourceLoader,
+    platform: &str,
+    mut on_report: F,
+) -> anyhow::Result<Vec<ServerPackage>>
+where
+    F: FnMut(&registry::catalog::SourceReport),
+{
+    let mut pkgs = Vec::with_capacity(16);
+    let mut first_degraded_reports = Vec::new();
+    for channel in [Channel::Stable, Channel::Testing, Channel::Nightly] {
+        let load: registry::CatalogLoad =
+            registry::Catalog::load(config, loader, channel, platform).await?;
+        pkgs.extend(load.catalog.server_packages());
+        for report in load.source_reports {
+            if !is_degraded_report(&report) {
+                continue;
+            }
+            if first_degraded_reports
+                .iter()
+                .any(|first| report_source(first) == report_source(&report))
+            {
+                continue;
+            }
+            first_degraded_reports.push(report);
+        }
+    }
+    let mut emitted_sources = Vec::<registry::config::RegistrySource>::new();
+    for configured_source in &config.sources {
+        if emitted_sources
+            .iter()
+            .any(|emitted_source| emitted_source == configured_source)
+        {
+            continue;
+        }
+        if let Some(report) = first_degraded_reports
+            .iter()
+            .find(|report| report_source(report) == configured_source)
+        {
+            on_report(report);
+            emitted_sources.push(configured_source.clone());
+        }
+    }
+    Ok(pkgs)
+}
+
 pub(crate) async fn all_packages_with_async(
     config: &registry::Config,
     loader: &registry::SourceLoader,
     platform: &str,
 ) -> anyhow::Result<Vec<ServerPackage>> {
-    let mut pkgs = Vec::with_capacity(16);
-    for channel in [Channel::Stable, Channel::Testing, Channel::Nightly] {
-        let catalog = registry::Catalog::load(config, loader, channel, platform).await?;
-        pkgs.extend(catalog.server_packages());
-    }
-    Ok(pkgs)
+    all_packages_with_reporter(config, loader, platform, |report| {
+        if let Some(warning) = report.warning() {
+            log::warn!("{warning}");
+        }
+    })
+    .await
 }
 
 fn print_table(items: impl Iterator<Item = (ver::Build, bool)>) {
@@ -290,7 +388,10 @@ impl DebugInstall {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::portable::registry::{Config, RegistrySource, Source, SourceLoader};
+    use crate::portable::registry::catalog::{NoHealthySources, SourceReport};
+    use crate::portable::registry::config::{Config, RegistrySource};
+    use crate::portable::registry::source::{Source, SourceLoader};
+    use crate::portable::registry::types::PackageType;
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -314,12 +415,12 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        fs_err::write(&stable_index, &server_index_body("7.0+abcdef0")).unwrap();
+        fs_err::write(&stable_index, server_index_body("7.0+abcdef0")).unwrap();
         // malformed-index.json: not valid JSON, must abort the whole load.
         fs_err::write(tmp.path().join("malformed-index.json"), b"{not-json").unwrap();
         fs_err::write(
             tmp.path().join("nightly-linux.json"),
-            &server_index_body("8.0+abcdef0"),
+            server_index_body("8.0+abcdef0"),
         )
         .unwrap();
 
@@ -332,12 +433,15 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            error.to_string().contains("failed to parse registry index"),
-            "expected registry index parse failure to propagate, got: {error}"
-        );
+        let aggregate = error
+            .downcast_ref::<NoHealthySources>()
+            .expect("expected no-healthy-sources aggregate");
+        assert_eq!(aggregate.reports().len(), 1);
+        assert!(matches!(
+            &aggregate.reports()[0],
+            SourceReport::Rejected { .. }
+        ));
     }
-
     #[tokio::test]
     async fn all_packages_with_returns_packages_when_all_channels_load() {
         let tmp = tempfile::tempdir().unwrap();
@@ -351,9 +455,21 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        fs_err::write(tmp.path().join("stable.json"), &server_index_body("7.0+abcdef0")).unwrap();
-        fs_err::write(tmp.path().join("testing.json"), &server_index_body("7.1+abcdef0")).unwrap();
-        fs_err::write(tmp.path().join("nightly.json"), &server_index_body("8.0+abcdef0")).unwrap();
+        fs_err::write(
+            tmp.path().join("stable.json"),
+            server_index_body("7.0+abcdef0"),
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("testing.json"),
+            server_index_body("7.1+abcdef0"),
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("nightly.json"),
+            server_index_body("8.0+abcdef0"),
+        )
+        .unwrap();
 
         let config = Config {
             sources: vec![RegistrySource::Manifest(Source::File(manifest))],
@@ -365,5 +481,302 @@ mod tests {
             .unwrap();
 
         assert_eq!(packages.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn all_packages_with_reports_degraded_source_through_callback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("registry.json");
+        let missing_manifest = tmp.path().join("missing-registry.json");
+        fs_err::write(
+            &manifest,
+            br#"{"schema_version":1,"indexes":[
+              {"channel":"stable","platform":"linux","url":"stable.json"},
+              {"channel":"testing","platform":"linux","url":"testing.json"},
+              {"channel":"nightly","platform":"linux","url":"nightly.json"}
+            ]}"#,
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("stable.json"),
+            server_index_body("7.0+abcdef0"),
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("testing.json"),
+            server_index_body("7.1+abcdef0"),
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("nightly.json"),
+            server_index_body("8.0+abcdef0"),
+        )
+        .unwrap();
+
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(manifest)),
+                RegistrySource::Manifest(Source::File(missing_manifest)),
+            ],
+        };
+        let loader = SourceLoader::new().unwrap();
+        let mut warnings = Vec::new();
+
+        let packages = all_packages_with_reporter(&config, &loader, "linux", |report| {
+            if let Some(warning) = report.warning() {
+                warnings.push(warning);
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(packages.len(), 3);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("is unavailable"))
+        );
+    }
+
+    #[tokio::test]
+    async fn all_packages_with_reports_warns_once_per_distinct_degraded_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("registry.json");
+        let missing_manifest = tmp.path().join("missing-registry.json");
+        let second_missing_manifest = tmp.path().join("second-missing-registry.json");
+        fs_err::write(
+            &manifest,
+            br#"{"schema_version":1,"indexes":[
+              {"channel":"stable","platform":"linux","url":"stable.json"},
+              {"channel":"testing","platform":"linux","url":"testing.json"},
+              {"channel":"nightly","platform":"linux","url":"nightly.json"}
+            ]}"#,
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("stable.json"),
+            server_index_body("7.0+abcdef0"),
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("testing.json"),
+            server_index_body("7.1+abcdef0"),
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("nightly.json"),
+            server_index_body("8.0+abcdef0"),
+        )
+        .unwrap();
+
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(manifest)),
+                RegistrySource::Manifest(Source::File(missing_manifest.clone())),
+                RegistrySource::Manifest(Source::File(second_missing_manifest.clone())),
+            ],
+        };
+        let loader = SourceLoader::new().unwrap();
+        let mut warnings = Vec::new();
+
+        all_packages_with_reporter(&config, &loader, "linux", |report| {
+            if let Some(warning) = report.warning() {
+                warnings.push(warning);
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains(&missing_manifest.display().to_string()));
+        assert!(warnings[1].contains(&second_missing_manifest.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn all_packages_with_reports_warns_once_for_duplicate_equal_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let healthy_manifest = tmp.path().join("healthy.json");
+        let stable_index = tmp.path().join("stable.json");
+        let missing_manifest = tmp.path().join("missing.json");
+        fs_err::write(
+            &healthy_manifest,
+            br#"{"schema_version":1,"indexes":[
+              {"channel":"stable","platform":"linux","url":"stable.json"}
+            ]}"#,
+        )
+        .unwrap();
+        fs_err::write(&stable_index, server_index_body("7.0+abcdef0")).unwrap();
+
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(healthy_manifest)),
+                RegistrySource::Manifest(Source::File(missing_manifest.clone())),
+                RegistrySource::Manifest(Source::File(missing_manifest)),
+            ],
+        };
+        let loader = SourceLoader::new().unwrap();
+        let mut warnings = Vec::new();
+
+        all_packages_with_reporter(&config, &loader, "linux", |report| {
+            if let Some(warning) = report.warning() {
+                warnings.push(warning);
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_packages_with_reports_keeps_first_degraded_outcome_per_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_manifest = tmp.path().join("first.json");
+        let fallback_manifest = tmp.path().join("fallback.json");
+        fs_err::write(
+            &first_manifest,
+            br#"{"schema_version":1,"indexes":[
+              {"channel":"stable","platform":"linux","url":"first-missing.json"},
+              {"channel":"testing","platform":"linux","url":"first-malformed.json"},
+              {"channel":"nightly","platform":"linux","url":"first-nightly.json"}
+            ]}"#,
+        )
+        .unwrap();
+        fs_err::write(tmp.path().join("first-malformed.json"), b"{not-json").unwrap();
+        fs_err::write(
+            tmp.path().join("first-nightly.json"),
+            server_index_body("8.0+aaaaaaa"),
+        )
+        .unwrap();
+        fs_err::write(
+            &fallback_manifest,
+            br#"{"schema_version":1,"indexes":[
+              {"channel":"stable","platform":"linux","url":"fallback-stable.json"},
+              {"channel":"testing","platform":"linux","url":"fallback-testing.json"},
+              {"channel":"nightly","platform":"linux","url":"fallback-nightly.json"}
+            ]}"#,
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("fallback-stable.json"),
+            server_index_body("7.0+bbbbbbb"),
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("fallback-testing.json"),
+            server_index_body("7.1+bbbbbbb"),
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("fallback-nightly.json"),
+            server_index_body("8.1+bbbbbbb"),
+        )
+        .unwrap();
+
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(first_manifest)),
+                RegistrySource::Manifest(Source::File(fallback_manifest)),
+            ],
+        };
+        let loader = SourceLoader::new().unwrap();
+        let mut warnings = Vec::new();
+
+        all_packages_with_reporter(&config, &loader, "linux", |report| {
+            if let Some(warning) = report.warning() {
+                warnings.push(warning);
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn all_packages_with_reports_emits_degraded_sources_in_config_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_manifest = tmp.path().join("first.json");
+        let second_manifest = tmp.path().join("second.json");
+        fs_err::write(
+            &first_manifest,
+            br#"{"schema_version":1,"indexes":[
+              {"channel":"stable","platform":"linux","url":"first-stable.json"},
+              {"channel":"testing","platform":"linux","url":"first-testing-missing.json"},
+              {"channel":"nightly","platform":"linux","url":"first-nightly.json"}
+            ]}"#,
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("first-stable.json"),
+            server_index_body("7.0+aaaaaaa"),
+        )
+        .unwrap();
+        fs_err::write(
+            tmp.path().join("first-nightly.json"),
+            server_index_body("8.0+aaaaaaa"),
+        )
+        .unwrap();
+        fs_err::write(
+            &second_manifest,
+            br#"{"schema_version":1,"indexes":[
+              {"channel":"stable","platform":"linux","url":"second-stable-missing.json"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let config = Config {
+            sources: vec![
+                RegistrySource::Manifest(Source::File(first_manifest.clone())),
+                RegistrySource::Manifest(Source::File(second_manifest.clone())),
+            ],
+        };
+        let loader = SourceLoader::new().unwrap();
+        let mut warnings = Vec::new();
+
+        all_packages_with_reporter(&config, &loader, "linux", |report| {
+            if let Some(warning) = report.warning() {
+                warnings.push(warning);
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains(&first_manifest.display().to_string()));
+        assert!(warnings[1].contains(&second_manifest.display().to_string()));
+    }
+
+    #[test]
+    fn list_versions_json_preserves_prefixed_server_digest() {
+        let package = ServerPackage {
+            name: "gel-server".to_string(),
+            version: "7.0+abcdef0".parse().unwrap(),
+            url: url::Url::parse("https://example.com/server.tar.zst").unwrap(),
+            size: 10,
+            hash: HASH.parse().unwrap(),
+            kind: PackageType::TarZst,
+            slot: "7".to_string(),
+            tags: std::collections::HashMap::new(),
+        };
+        let json = serde_json::to_string(&JsonVersionInfo {
+            channel: Channel::Stable,
+            version: package.version.clone(),
+            installed: false,
+            debug_info: DebugInfo {
+                package: Some(package),
+                install: None,
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"channel":"stable","version":"7.0+abcdef0","installed":false,"debug-info":{{"package":{{"name":"gel-server","version":"7.0+abcdef0","url":"https://example.com/server.tar.zst","size":10,"hash":"blake2b:{HASH}","kind":"TarZst","slot":"7","tags":{{}}}}}}}}"#
+            )
+        );
     }
 }

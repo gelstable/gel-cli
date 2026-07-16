@@ -39,9 +39,7 @@ use crate::platform::{cache_dir, config_dir, tmp_file_path, wsl_dir};
 use crate::portable::exit_codes;
 use crate::portable::local::{InstanceInfo, NonLocalInstance, Paths, write_json};
 use crate::portable::options;
-use crate::portable::registry::{
-    self, ServerPackage, download_package_verified_sync, download_sync,
-};
+use crate::portable::registry::{self, download_cli_package_verified_sync, download_sync};
 use crate::portable::server;
 use crate::portable::ver;
 use crate::print::{self, Highlight, msg};
@@ -453,7 +451,7 @@ fn download_binary(dest: &Path) -> anyhow::Result<()> {
 
     let down_path = dest.with_extension("download");
     let tmp_path = tmp_file_path(dest);
-    download_package_verified_sync(&down_path, &pkg.url, &pkg.hash, false)?;
+    download_cli_package_verified_sync(&down_path, &pkg, false)?;
     upgrade::unpack_file(&down_path, &tmp_path, pkg.compression)?;
     fs_err::rename(&tmp_path, dest)?;
 

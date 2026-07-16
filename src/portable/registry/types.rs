@@ -88,19 +88,19 @@ pub struct ServerPackage {
     pub version: ver::Build,
     pub url: url::Url,
     pub size: u64,
-    pub hash: PackageHash,
+    pub hash: Blake2bDigest,
     pub kind: PackageType,
     pub slot: String,
     pub tags: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+
 pub struct CliPackage {
     pub version: ver::Semver,
     pub url: url::Url,
     pub size: u64,
-    pub hash: PackageHash,
+    pub hash: Blake2bDigest,
     pub compression: Option<Compression>,
 }
 
@@ -110,15 +110,120 @@ pub struct ExtensionPackage {
     pub version: ver::Build,
     pub url: url::Url,
     pub size: u64,
-    pub hash: PackageHash,
+    pub hash: Blake2bDigest,
     pub kind: PackageType,
     pub slot: String,
     pub tags: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ArtifactIdentity {
+    Server {
+        name: Box<str>,
+        version: Box<str>,
+        slot: Box<str>,
+    },
+    Cli {
+        name: Box<str>,
+        version: Box<str>,
+    },
+    Extension {
+        name: Box<str>,
+        version: Box<str>,
+        server_slot: Box<str>,
+    },
+}
+
+impl fmt::Display for ArtifactIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Server {
+                name,
+                version,
+                slot,
+            } => write!(formatter, "server {name}@{version} slot {slot}"),
+            Self::Cli { name, version } => write!(formatter, "cli {name}@{version}"),
+            Self::Extension {
+                name,
+                version,
+                server_slot,
+            } => write!(
+                formatter,
+                "extension {name}@{version} server slot {server_slot}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Blake2bDigest([u8; 64]);
+
+#[derive(Debug, thiserror::Error)]
+pub enum DigestParseError {
+    #[error("invalid Blake2b digest length {actual}; expected 128 hexadecimal characters")]
+    InvalidLength { actual: usize },
+    #[error("invalid Blake2b hexadecimal digest: {0}")]
+    InvalidHex(#[from] hex::FromHexError),
+}
+
+impl Blake2bDigest {
+    pub(crate) fn as_bytes(&self) -> &[u8; 64] {
+        &self.0
+    }
+
+    pub(crate) fn short(&self) -> String {
+        self.to_string().chars().take(7).collect()
+    }
+}
+
+impl std::str::FromStr for Blake2bDigest {
+    type Err = DigestParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 128 {
+            return Err(DigestParseError::InvalidLength {
+                actual: value.len(),
+            });
+        }
+        let bytes = hex::decode(value)?;
+        let bytes: [u8; 64] =
+            bytes
+                .try_into()
+                .map_err(|bytes: Vec<u8>| DigestParseError::InvalidLength {
+                    actual: bytes.len() * 2,
+                })?;
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for Blake2bDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&hex::encode(self.0))
+    }
+}
+
+impl Serialize for Blake2bDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: ser::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Blake2bDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageHash {
-    Blake2b(Box<str>),
+    Blake2b(Blake2bDigest),
     Unknown(Box<str>),
 }
 
@@ -133,7 +238,6 @@ impl PackageType {
 
 impl ServerPackage {
     pub fn cache_file_name(&self) -> String {
-        // TODO(tailhook) use package hash when that is available
         let hash = self.hash.short();
         format!(
             "edgedb-server_{}_{:7}{}",
@@ -150,27 +254,11 @@ impl fmt::Display for ServerPackage {
     }
 }
 
-impl PackageHash {
-    pub(crate) fn short(&self) -> &str {
-        let value = match self {
-            PackageHash::Blake2b(value) => value.as_ref(),
-            PackageHash::Unknown(value) => value
-                .split_once(':')
-                .map_or(value.as_ref(), |(_, digest)| digest),
-        };
-        let end = value
-            .char_indices()
-            .nth(7)
-            .map_or(value.len(), |(idx, _)| idx);
-        &value[..end]
-    }
-}
-
 impl fmt::Display for PackageHash {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PackageHash::Blake2b(val) => write!(f, "blake2b:{val}"),
-            PackageHash::Unknown(val) => write!(f, "{val}"),
+            PackageHash::Blake2b(digest) => write!(formatter, "blake2b:{digest}"),
+            PackageHash::Unknown(value) => formatter.write_str(value),
         }
     }
 }
@@ -409,14 +497,14 @@ impl<'de> Deserialize<'de> for PackageHash {
     where
         D: de::Deserializer<'de>,
     {
-        let s: String = Deserialize::deserialize(deserializer)?;
-        if let Some(hash) = s.strip_prefix("blake2b:") {
-            if hash.len() != 128 {
-                return Err(de::Error::custom("invalid blake2b hash length"));
-            }
-            return Ok(PackageHash::Blake2b(hash.into()));
+        let value = String::deserialize(deserializer)?;
+        match value.strip_prefix("blake2b:") {
+            Some(digest) => digest
+                .parse()
+                .map(PackageHash::Blake2b)
+                .map_err(de::Error::custom),
+            None => Ok(PackageHash::Unknown(value.into_boxed_str())),
         }
-        Ok(PackageHash::Unknown(s.into()))
     }
 }
 
@@ -691,27 +779,74 @@ mod tests {
             );
         }
     }
+
     #[test]
-    fn short_hash_handles_blake2b() {
-        let hash = PackageHash::Blake2b("abcdef123456".into());
-        assert_eq!(hash.short(), "abcdef1");
+    fn blake2b_digest_accepts_upper_and_lower_hex() {
+        let lower = "ab".repeat(64).parse::<Blake2bDigest>().unwrap();
+        let upper = "AB".repeat(64).parse::<Blake2bDigest>().unwrap();
+        assert_eq!(lower, upper);
+        assert_eq!(lower.to_string(), "ab".repeat(64));
     }
 
     #[test]
-    fn short_hash_handles_unknown_with_prefix() {
-        let hash = PackageHash::Unknown("sha256:abcdef123456".into());
-        assert_eq!(hash.short(), "abcdef1");
+    fn blake2b_digest_rejects_wrong_length() {
+        let error = "ab".repeat(63).parse::<Blake2bDigest>().unwrap_err();
+        assert!(matches!(
+            error,
+            DigestParseError::InvalidLength { actual: 126 }
+        ));
     }
 
     #[test]
-    fn short_hash_handles_unknown_long_prefix() {
-        let hash = PackageHash::Unknown("sha512-256:abcdef123456".into());
-        assert_eq!(hash.short(), "abcdef1");
+    fn blake2b_digest_rejects_non_hex() {
+        let error = format!("{}zz", "ab".repeat(63))
+            .parse::<Blake2bDigest>()
+            .unwrap_err();
+        assert!(matches!(error, DigestParseError::InvalidHex(_)));
     }
 
     #[test]
-    fn short_hash_handles_short_values() {
-        let hash = PackageHash::Unknown("sha256:abc".into());
-        assert_eq!(hash.short(), "abc");
+    fn package_hash_round_trips_canonical_blake2b() {
+        let digest = "AB".repeat(64).parse::<Blake2bDigest>().unwrap();
+        let value = PackageHash::Blake2b(digest);
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(json, format!("\"blake2b:{}\"", "ab".repeat(64)));
+        assert_eq!(serde_json::from_str::<PackageHash>(&json).unwrap(), value);
+    }
+    #[test]
+    fn artifact_identity_contains_only_kind_specific_fields() {
+        let server_seven = ArtifactIdentity::Server {
+            name: "gel-server".into(),
+            version: "7.0+abcdef0".into(),
+            slot: "7".into(),
+        };
+        let server_eight = ArtifactIdentity::Server {
+            name: "gel-server".into(),
+            version: "7.0+abcdef0".into(),
+            slot: "8".into(),
+        };
+        let cli = ArtifactIdentity::Cli {
+            name: "gel-cli".into(),
+            version: "7.10.2".into(),
+        };
+        let extension_seven = ArtifactIdentity::Extension {
+            name: "pgvector".into(),
+            version: "7.0+abcdef0".into(),
+            server_slot: "7".into(),
+        };
+        let extension_eight = ArtifactIdentity::Extension {
+            name: "pgvector".into(),
+            version: "7.0+abcdef0".into(),
+            server_slot: "8".into(),
+        };
+        assert_ne!(server_seven, server_eight);
+        assert_eq!(
+            cli,
+            ArtifactIdentity::Cli {
+                name: "gel-cli".into(),
+                version: "7.10.2".into(),
+            }
+        );
+        assert_ne!(extension_seven, extension_eight);
     }
 }

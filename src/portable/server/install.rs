@@ -18,7 +18,8 @@ use crate::portable::exit_codes;
 use crate::portable::local::{InstallInfo, write_json};
 use crate::portable::platform::optional_docker_check;
 use crate::portable::registry::{
-    self, Channel, Query, QuerySelector, ServerPackage, download_package_verified,
+    self, Channel, PackageHash, Query, QuerySelector, ServerPackage,
+    download_server_package_verified,
 };
 use crate::portable::ver::{self, Build};
 use crate::print::{self, Highlight};
@@ -54,9 +55,15 @@ pub struct Command {
     pub channel: Option<Channel>,
 }
 
+fn server_package_with<F>(query: &Query, selector: F) -> anyhow::Result<ServerPackage>
+where
+    F: FnOnce(&Query) -> anyhow::Result<Option<ServerPackage>>,
+{
+    selector(query)?.with_context(|| format!("no package matching your criteria found: {query:?}"))
+}
+
 pub fn version(query: &Query) -> anyhow::Result<InstallInfo> {
-    let pkg_info = registry::get_server_package(query)?
-        .with_context(|| format!("no package matching your criteria found: {query:?}"))?;
+    let pkg_info = server_package_with(query, registry::get_server_package)?;
     ver::print_version_hint(&pkg_info.version.specific(), query);
     package(&pkg_info)
 }
@@ -97,7 +104,7 @@ pub async fn package(pkg_info: &ServerPackage) -> anyhow::Result<InstallInfo> {
     let info = InstallInfo {
         version: pkg_info.version.clone(),
         package_url: pkg_info.url.clone(),
-        package_hash: pkg_info.hash.clone(),
+        package_hash: PackageHash::Blake2b(pkg_info.hash),
         installed_at: SystemTime::now(),
         slot: pkg_info.slot.clone(),
     };
@@ -143,7 +150,7 @@ pub async fn download_package(pkg_info: &ServerPackage) -> anyhow::Result<PathBu
     let download_dir = cache_dir.join("downloads");
     fs::create_dir_all(&download_dir)?;
     let cache_path = download_dir.join(pkg_info.cache_file_name());
-    download_package_verified(&cache_path, &pkg_info.url, &pkg_info.hash, false).await?;
+    download_server_package_verified(&cache_path, pkg_info, false).await?;
     Ok(cache_path)
 }
 
@@ -231,4 +238,22 @@ fn unlink_cache(cache_file: &Path) {
             log::warn!("Failed to remove cache {cache_file:?}: {e}");
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_package_selection_propagates_registry_error() {
+        let query = Query::stable();
+        let result = server_package_with(&query, |_query| {
+            Err(anyhow::anyhow!("no healthy registry sources"))
+        });
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "no healthy registry sources"
+        );
+    }
 }

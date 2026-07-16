@@ -10,7 +10,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use crate::platform::{binary_path, current_exe, home_dir, tmp_file_path};
 use crate::portable::platform;
 use crate::portable::registry::{
-    self, Channel, CliPackage, Compression, download_package_verified_sync,
+    self, Channel, CliPackage, Compression, download_cli_package_verified_sync,
 };
 use crate::portable::ver;
 use crate::print::{self, Highlight, msg};
@@ -92,7 +92,7 @@ fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
     let down_path = path.with_extension("download");
     let tmp_path = tmp_file_path(&path);
 
-    download_package_verified_sync(&down_path, &pkg.url, &pkg.hash, cmd.quiet)?;
+    download_cli_package_verified_sync(&down_path, &pkg, cmd.quiet)?;
     unpack_file(&down_path, &tmp_path, pkg.compression)?;
 
     let backup_path = path.with_extension("backup");
@@ -127,11 +127,21 @@ fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
 }
 
 fn cli_package(channel: Channel, target_plat: &str) -> anyhow::Result<Option<CliPackage>> {
-    let packages =
-        registry::get_platform_cli_packages(channel, target_plat, Duration::from_secs(60))?;
+    cli_package_with(channel, target_plat, registry::get_platform_cli_packages)
+}
+
+fn cli_package_with<F>(
+    channel: Channel,
+    target_platform: &str,
+    loader: F,
+) -> anyhow::Result<Option<CliPackage>>
+where
+    F: FnOnce(Channel, &str, Duration) -> anyhow::Result<Vec<CliPackage>>,
+{
+    let packages = loader(channel, target_platform, Duration::from_secs(60))?;
     Ok(packages
         .into_iter()
-        .max_by(|a, b| a.version.cmp(&b.version)))
+        .max_by(|first, second| first.version.cmp(&second.version)))
 }
 
 pub fn can_upgrade() -> bool {
@@ -221,4 +231,56 @@ pub fn upgrade_to_arm64() -> anyhow::Result<()> {
         },
         binary_path()?,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_package_propagates_no_healthy_sources_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::portable::registry::config::Config {
+            sources: vec![crate::portable::registry::config::RegistrySource::Manifest(
+                crate::portable::registry::source::Source::File(
+                    tmp.path().join("missing-registry.json"),
+                ),
+            )],
+        };
+        let loader = crate::portable::registry::source::SourceLoader::new().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(crate::portable::registry::catalog::Catalog::load(
+                &config,
+                &loader,
+                Channel::Stable,
+                "linux",
+            ))
+            .unwrap_err();
+
+        let returned =
+            cli_package_with(Channel::Stable, "linux", |_channel, _platform, _timeout| {
+                Err(error)
+            })
+            .unwrap_err();
+
+        assert!(
+            returned
+                .downcast_ref::<crate::portable::registry::catalog::NoHealthySources>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cli_package_returns_none_for_empty_discovery() {
+        let result = cli_package_with(Channel::Stable, "linux", |_channel, _platform, _timeout| {
+            Ok(Vec::new())
+        })
+        .unwrap();
+
+        assert!(result.is_none());
+    }
 }

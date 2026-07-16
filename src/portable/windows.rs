@@ -39,8 +39,9 @@ use crate::platform::{cache_dir, config_dir, tmp_file_path, wsl_dir};
 use crate::portable::exit_codes;
 use crate::portable::local::{InstanceInfo, NonLocalInstance, Paths, write_json};
 use crate::portable::options;
-use crate::portable::registry::download_sync;
-use crate::portable::registry::{PackageHash, ServerPackage};
+use crate::portable::registry::{
+    self, ServerPackage, download_package_verified_sync, download_sync,
+};
 use crate::portable::server;
 use crate::portable::ver;
 use crate::print::{self, Highlight, msg};
@@ -420,13 +421,11 @@ fn download_binary(dest: &Path) -> anyhow::Result<()> {
         .unwrap();
     let platform = format!("{arch}-unknown-linux-musl");
 
-    let pkgs = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let catalog = registry::load_default_or_empty(upgrade::channel(), &platform).await?;
-            Ok::<_, anyhow::Error>(catalog.cli_packages())
-        })?;
+    let pkgs = registry::get_platform_cli_packages(
+        upgrade::channel(),
+        &platform,
+        Duration::from_secs(60),
+    )?;
     let pkg = pkgs.iter().find(|pkg| pkg.version == my_ver).cloned();
     let pkg = match pkg {
         Some(pkg) => pkg,
@@ -438,7 +437,7 @@ fn download_binary(dest: &Path) -> anyhow::Result<()> {
             if pkg.version < my_ver {
                 return Err(bug::error(format!(
                     "latest version of linux CLI {} \
-                 is older that current windows CLI {}",
+                 is older than current windows CLI {}",
                     pkg.version, my_ver
                 )));
             }
@@ -454,7 +453,7 @@ fn download_binary(dest: &Path) -> anyhow::Result<()> {
 
     let down_path = dest.with_extension("download");
     let tmp_path = tmp_file_path(dest);
-    download_sync(&down_path, &pkg.url, false)?;
+    download_package_verified_sync(&down_path, &pkg.url, &pkg.hash, false)?;
     upgrade::unpack_file(&down_path, &tmp_path, pkg.compression)?;
     fs_err::rename(&tmp_path, dest)?;
 

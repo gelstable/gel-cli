@@ -136,7 +136,8 @@ pub fn run(cmd: &Command, opts: &crate::options::Options) -> anyhow::Result<()> 
             upgrade_state: None,
         }
     } else {
-        let selector = version_selector(cmd.version.as_ref(), cmd.channel, cmd.nightly);
+        let selector =
+            QuerySelector::from_install_flags(cmd.version.as_ref(), cmd.channel, cmd.nightly);
         let (query, _) = Query::from_selector(selector, || anyhow::Ok(Query::stable()))?;
         let inst = install::version(&query).context(concatcp!("error installing ", BRANDING))?;
         let specific_version = &inst.version.specific();
@@ -238,22 +239,6 @@ pub struct Command {
     /// Do not ask questions. Assume user wants to upgrade instance.
     #[arg(long)]
     pub non_interactive: bool,
-}
-
-fn version_selector<'a>(
-    version: Option<&'a ver::Filter>,
-    channel: Option<Channel>,
-    nightly: bool,
-) -> Option<QuerySelector<'a>> {
-    if let Some(version) = version {
-        Some(QuerySelector::Version(version))
-    } else if let Some(channel) = channel {
-        Some(QuerySelector::Channel(channel))
-    } else if nightly {
-        Some(QuerySelector::Channel(Channel::Nightly))
-    } else {
-        None
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
@@ -363,7 +348,8 @@ fn create_cloud(
 
     let org = cloud::ops::get_org(&name.org_slug, client)?;
 
-    let selector = version_selector(cmd.version.as_ref(), cmd.channel, cmd.nightly);
+    let selector =
+        QuerySelector::from_install_flags(cmd.version.as_ref(), cmd.channel, cmd.nightly);
     let (query, _) = Query::from_selector(selector, || anyhow::Ok(Query::stable()))?;
 
     let server_ver = cloud::versions::get_version(&query, client)?;

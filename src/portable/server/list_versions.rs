@@ -55,7 +55,7 @@ pub fn run(cmd: &Command) -> Result<(), anyhow::Error> {
 
     let installed = local::get_installed()?;
     let installed_count = installed.len();
-    let all_packages = all_packages();
+    let all_packages = all_packages()?;
     let all_package_count = all_packages.len();
 
     // Determine the latest stable version
@@ -238,26 +238,24 @@ pub struct JsonVersionInfo {
 }
 
 #[tokio::main(flavor = "current_thread")]
-pub async fn all_packages() -> Vec<ServerPackage> {
-    let mut pkgs = Vec::with_capacity(16);
-    match load_packages(Channel::Stable).await {
-        Ok(stable) => pkgs.extend(stable),
-        Err(e) => log::warn!("Unable to fetch stable packages: {e:#}"),
-    };
-    match load_packages(Channel::Testing).await {
-        Ok(testing) => pkgs.extend(testing),
-        Err(e) => log::warn!("Unable to fetch testing packages: {e:#}"),
-    };
-    match load_packages(Channel::Nightly).await {
-        Ok(nightly) => pkgs.extend(nightly),
-        Err(e) => log::warn!("Unable to fetch nightly packages: {e:#}"),
-    }
-    pkgs
+pub async fn all_packages() -> anyhow::Result<Vec<ServerPackage>> {
+    let platform = crate::portable::platform::get_server()?;
+    let config = registry::Config::load()?;
+    let loader = registry::SourceLoader::new()?;
+    all_packages_with_async(&config, &loader, platform).await
 }
 
-async fn load_packages(channel: Channel) -> anyhow::Result<Vec<ServerPackage>> {
-    let catalog = registry::load_default(channel, crate::portable::platform::get_server()?).await?;
-    Ok(catalog.server_packages())
+pub(crate) async fn all_packages_with_async(
+    config: &registry::Config,
+    loader: &registry::SourceLoader,
+    platform: &str,
+) -> anyhow::Result<Vec<ServerPackage>> {
+    let mut pkgs = Vec::with_capacity(16);
+    for channel in [Channel::Stable, Channel::Testing, Channel::Nightly] {
+        let catalog = registry::Catalog::load(config, loader, channel, platform).await?;
+        pkgs.extend(catalog.server_packages());
+    }
+    Ok(pkgs)
 }
 
 fn print_table(items: impl Iterator<Item = (ver::Build, bool)>) {
@@ -286,5 +284,86 @@ impl DebugInstall {
             server_path: install.server_path().ok(),
             install,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::portable::registry::{Config, RegistrySource, Source, SourceLoader};
+
+    const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn server_index_body(version: &str) -> String {
+        format!(
+            r#"{{"packages":[{{"basename":"gel-server","version":"{version}","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://example.com/gel-server-{version}.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn all_packages_with_propagates_registry_source_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("registry.json");
+        let stable_index = tmp.path().join("stable-linux.json");
+        fs_err::write(
+            &manifest,
+            br#"{"schema_version":1,"indexes":[
+              {"channel":"stable","platform":"linux","url":"stable-linux.json"},
+              {"channel":"testing","platform":"linux","url":"malformed-index.json"},
+              {"channel":"nightly","platform":"linux","url":"nightly-linux.json"}
+            ]}"#,
+        )
+        .unwrap();
+        fs_err::write(&stable_index, &server_index_body("7.0+abcdef0")).unwrap();
+        // malformed-index.json: not valid JSON, must abort the whole load.
+        fs_err::write(tmp.path().join("malformed-index.json"), b"{not-json").unwrap();
+        fs_err::write(
+            tmp.path().join("nightly-linux.json"),
+            &server_index_body("8.0+abcdef0"),
+        )
+        .unwrap();
+
+        let config = Config {
+            sources: vec![RegistrySource::Manifest(Source::File(manifest))],
+        };
+        let loader = SourceLoader::new().unwrap();
+
+        let error = all_packages_with_async(&config, &loader, "linux")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("failed to parse registry index"),
+            "expected registry index parse failure to propagate, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_packages_with_returns_packages_when_all_channels_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("registry.json");
+        fs_err::write(
+            &manifest,
+            br#"{"schema_version":1,"indexes":[
+              {"channel":"stable","platform":"linux","url":"stable.json"},
+              {"channel":"testing","platform":"linux","url":"testing.json"},
+              {"channel":"nightly","platform":"linux","url":"nightly.json"}
+            ]}"#,
+        )
+        .unwrap();
+        fs_err::write(tmp.path().join("stable.json"), &server_index_body("7.0+abcdef0")).unwrap();
+        fs_err::write(tmp.path().join("testing.json"), &server_index_body("7.1+abcdef0")).unwrap();
+        fs_err::write(tmp.path().join("nightly.json"), &server_index_body("8.0+abcdef0")).unwrap();
+
+        let config = Config {
+            sources: vec![RegistrySource::Manifest(Source::File(manifest))],
+        };
+        let loader = SourceLoader::new().unwrap();
+
+        let packages = all_packages_with_async(&config, &loader, "linux")
+            .await
+            .unwrap();
+
+        assert_eq!(packages.len(), 3);
     }
 }

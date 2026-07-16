@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use fn_error_context::context;
@@ -8,7 +9,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::platform::{binary_path, current_exe, home_dir, tmp_file_path};
 use crate::portable::platform;
-use crate::portable::registry::{self, Channel, CliPackage, Compression, download_sync};
+use crate::portable::registry::{
+    self, Channel, CliPackage, Compression, download_package_verified_sync,
+};
 use crate::portable::ver;
 use crate::print::{self, Highlight, msg};
 use crate::process;
@@ -89,7 +92,7 @@ fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
     let down_path = path.with_extension("download");
     let tmp_path = tmp_file_path(&path);
 
-    download_sync(&down_path, &pkg.url, cmd.quiet)?;
+    download_package_verified_sync(&down_path, &pkg.url, &pkg.hash, cmd.quiet)?;
     unpack_file(&down_path, &tmp_path, pkg.compression)?;
 
     let backup_path = path.with_extension("backup");
@@ -124,18 +127,11 @@ fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
 }
 
 fn cli_package(channel: Channel, target_plat: &str) -> anyhow::Result<Option<CliPackage>> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(async move {
-            let catalog = registry::load_default(channel, target_plat).await?;
-            Ok::<_, anyhow::Error>(
-                catalog
-                    .cli_packages()
-                    .into_iter()
-                    .max_by(|a, b| a.version.cmp(&b.version)),
-            )
-        })
+    let packages =
+        registry::get_platform_cli_packages(channel, target_plat, Duration::from_secs(60))?;
+    Ok(packages
+        .into_iter()
+        .max_by(|a, b| a.version.cmp(&b.version)))
 }
 
 pub fn can_upgrade() -> bool {

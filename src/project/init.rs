@@ -1067,7 +1067,7 @@ fn parse_ver_and_find(value: &str) -> anyhow::Result<Option<(Query, ServerPackag
 
 #[tokio::main(flavor = "current_thread")]
 async fn print_versions(title: &str) -> anyhow::Result<()> {
-    let mut avail = registry::load_platform_server_packages(
+    let mut avail = registry::load_platform_server_packages_async(
         Channel::Stable,
         crate::portable::platform::get_server()?,
     )

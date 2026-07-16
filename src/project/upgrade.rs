@@ -23,8 +23,16 @@ use crate::question;
 use super::get_stash_path;
 
 pub fn run(options: &Command, opts: &crate::options::Options) -> anyhow::Result<()> {
-    let (query, version_set) =
-        Query::from_selector(upgrade_selector(options), || Ok(Query::stable()))?;
+    let (query, version_set) = Query::from_selector(
+        QuerySelector::from_upgrade_flags(
+            options.to_version.as_ref(),
+            options.to_channel,
+            options.to_nightly,
+            options.to_testing,
+            options.to_latest,
+        ),
+        || Ok(Query::stable()),
+    )?;
     if version_set {
         update_toml(options, opts, query)
     } else {
@@ -96,22 +104,6 @@ pub struct Command {
     /// Do not ask questions, assume user wants to upgrade instance
     #[arg(long)]
     pub non_interactive: bool,
-}
-
-fn upgrade_selector(options: &Command) -> Option<QuerySelector<'_>> {
-    if let Some(version) = options.to_version.as_ref() {
-        Some(QuerySelector::Version(version))
-    } else if let Some(channel) = options.to_channel {
-        Some(QuerySelector::Channel(channel))
-    } else if options.to_nightly {
-        Some(QuerySelector::Channel(Channel::Nightly))
-    } else if options.to_testing {
-        Some(QuerySelector::Channel(Channel::Testing))
-    } else if options.to_latest {
-        Some(QuerySelector::Channel(Channel::Stable))
-    } else {
-        None
-    }
 }
 
 pub fn update_toml(

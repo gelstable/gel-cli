@@ -8,17 +8,13 @@ use crate::table;
 
 pub fn run(cmd: &Command) -> anyhow::Result<()> {
     // note this assumes that latest is set if no nightly and version
-    let selector = if let Some(version) = cmd.version.as_ref() {
-        Some(QuerySelector::Version(version))
-    } else if let Some(channel) = cmd.channel {
-        Some(QuerySelector::Channel(channel))
-    } else if cmd.nightly {
-        Some(QuerySelector::Channel(Channel::Nightly))
-    } else if cmd.latest {
-        Some(QuerySelector::Channel(Channel::Stable))
-    } else {
-        None
-    };
+    let selector = QuerySelector::from_upgrade_flags(
+        cmd.version.as_ref(),
+        cmd.channel,
+        cmd.nightly,
+        false,
+        cmd.latest,
+    );
     let (query, _) = Query::from_selector(selector, || {
         anyhow::bail!(
             "One of `--latest`, `--channel=`, \

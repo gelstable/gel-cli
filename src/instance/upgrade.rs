@@ -109,22 +109,6 @@ pub struct Command {
     pub non_interactive: bool,
 }
 
-fn upgrade_selector(cmd: &Command) -> Option<QuerySelector<'_>> {
-    if let Some(version) = cmd.to_version.as_ref() {
-        Some(QuerySelector::Version(version))
-    } else if let Some(channel) = cmd.to_channel {
-        Some(QuerySelector::Channel(channel))
-    } else if cmd.to_nightly {
-        Some(QuerySelector::Channel(Channel::Nightly))
-    } else if cmd.to_testing {
-        Some(QuerySelector::Channel(Channel::Testing))
-    } else if cmd.to_latest {
-        Some(QuerySelector::Channel(Channel::Stable))
-    } else {
-        None
-    }
-}
-
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct UpgradeMeta {
     pub source: ver::Build,
@@ -229,8 +213,16 @@ fn upgrade_local_cmd(
 ) -> anyhow::Result<()> {
     let inst = InstanceInfo::read(name)?;
     let inst_ver = inst.get_version()?.specific();
-    let (ver_query, ver_option) =
-        Query::from_selector(upgrade_selector(cmd), || Query::from_version(&inst_ver))?;
+    let (ver_query, ver_option) = Query::from_selector(
+        QuerySelector::from_upgrade_flags(
+            cmd.to_version.as_ref(),
+            cmd.to_channel,
+            cmd.to_nightly,
+            cmd.to_testing,
+            cmd.to_latest,
+        ),
+        || Query::from_version(&inst_ver),
+    )?;
     check_project(name, cmd.force, &ver_query)?;
 
     if cfg!(windows) {
@@ -284,7 +276,16 @@ fn upgrade_cloud_cmd(
     name: &CloudName,
     opts: &crate::options::Options,
 ) -> anyhow::Result<()> {
-    let (query, _) = Query::from_selector(upgrade_selector(cmd), || anyhow::Ok(Query::stable()))?;
+    let (query, _) = Query::from_selector(
+        QuerySelector::from_upgrade_flags(
+            cmd.to_version.as_ref(),
+            cmd.to_channel,
+            cmd.to_nightly,
+            cmd.to_testing,
+            cmd.to_latest,
+        ),
+        || anyhow::Ok(Query::stable()),
+    )?;
 
     let client = cloud::client::CloudClient::new(&opts.cloud_options)?;
     client.ensure_authenticated()?;

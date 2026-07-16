@@ -1,6 +1,5 @@
 //! Shared package discovery domain types.
 
-use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -34,10 +33,50 @@ pub struct Query {
     pub version: Option<ver::Filter>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QuerySelector<'a> {
     Channel(Channel),
     Version(&'a ver::Filter),
+}
+
+impl<'a> QuerySelector<'a> {
+    pub fn from_install_flags(
+        version: Option<&'a ver::Filter>,
+        channel: Option<Channel>,
+        nightly: bool,
+    ) -> Option<QuerySelector<'a>> {
+        if let Some(version) = version {
+            Some(QuerySelector::Version(version))
+        } else if let Some(channel) = channel {
+            Some(QuerySelector::Channel(channel))
+        } else if nightly {
+            Some(QuerySelector::Channel(Channel::Nightly))
+        } else {
+            None
+        }
+    }
+
+    pub fn from_upgrade_flags(
+        version: Option<&'a ver::Filter>,
+        channel: Option<Channel>,
+        nightly: bool,
+        testing: bool,
+        latest: bool,
+    ) -> Option<QuerySelector<'a>> {
+        if let Some(version) = version {
+            Some(QuerySelector::Version(version))
+        } else if let Some(channel) = channel {
+            Some(QuerySelector::Channel(channel))
+        } else if nightly {
+            Some(QuerySelector::Channel(Channel::Nightly))
+        } else if testing {
+            Some(QuerySelector::Channel(Channel::Testing))
+        } else if latest {
+            Some(QuerySelector::Channel(Channel::Stable))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,14 +151,18 @@ impl fmt::Display for ServerPackage {
 }
 
 impl PackageHash {
-    fn short(&self) -> &str {
-        match self {
-            PackageHash::Blake2b(val) => &val[..7],
-            PackageHash::Unknown(val) => {
-                let start = val.find(':').unwrap_or(val.len().saturating_sub(7));
-                &val[start..min(7, val.len() - start)]
-            }
-        }
+    pub(crate) fn short(&self) -> &str {
+        let value = match self {
+            PackageHash::Blake2b(value) => value.as_ref(),
+            PackageHash::Unknown(value) => value
+                .split_once(':')
+                .map_or(value.as_ref(), |(_, digest)| digest),
+        };
+        let end = value
+            .char_indices()
+            .nth(7)
+            .map_or(value.len(), |(idx, _)| idx);
+        &value[..end]
     }
 }
 
@@ -552,5 +595,123 @@ mod tests {
 
         assert_eq!(query, Query::from_filter(&filter).unwrap());
         assert!(explicit);
+    }
+    #[test]
+    fn install_selector_precedence_is_table_driven() {
+        let filter = ver::Filter {
+            major: 7,
+            minor: Some(FilterMinor::Dev(1)),
+            exact: false,
+        };
+        let cases = [
+            (
+                Some(&filter),
+                Some(Channel::Testing),
+                true,
+                Some(QuerySelector::Version(&filter)),
+            ),
+            (
+                None,
+                Some(Channel::Testing),
+                true,
+                Some(QuerySelector::Channel(Channel::Testing)),
+            ),
+            (
+                None,
+                None,
+                true,
+                Some(QuerySelector::Channel(Channel::Nightly)),
+            ),
+            (None, None, false, None),
+        ];
+
+        for (version, channel, nightly, expected) in cases {
+            assert_eq!(
+                QuerySelector::from_install_flags(version, channel, nightly),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_selector_precedence_is_table_driven() {
+        let filter = ver::Filter {
+            major: 7,
+            minor: Some(FilterMinor::Dev(1)),
+            exact: false,
+        };
+        let cases = [
+            (
+                Some(&filter),
+                Some(Channel::Testing),
+                true,
+                true,
+                true,
+                Some(QuerySelector::Version(&filter)),
+            ),
+            (
+                None,
+                Some(Channel::Testing),
+                true,
+                true,
+                true,
+                Some(QuerySelector::Channel(Channel::Testing)),
+            ),
+            (
+                None,
+                None,
+                true,
+                true,
+                true,
+                Some(QuerySelector::Channel(Channel::Nightly)),
+            ),
+            (
+                None,
+                None,
+                false,
+                true,
+                true,
+                Some(QuerySelector::Channel(Channel::Testing)),
+            ),
+            (
+                None,
+                None,
+                false,
+                false,
+                true,
+                Some(QuerySelector::Channel(Channel::Stable)),
+            ),
+            (None, None, false, false, false, None),
+        ];
+
+        for (version, channel, nightly, testing, latest, expected) in cases {
+            assert_eq!(
+                QuerySelector::from_upgrade_flags(version, channel, nightly, testing, latest),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn short_hash_handles_blake2b() {
+        let hash = PackageHash::Blake2b("abcdef123456".into());
+        assert_eq!(hash.short(), "abcdef1");
+    }
+
+    #[test]
+    fn short_hash_handles_unknown_with_prefix() {
+        let hash = PackageHash::Unknown("sha256:abcdef123456".into());
+        assert_eq!(hash.short(), "abcdef1");
+    }
+
+    #[test]
+    fn short_hash_handles_unknown_long_prefix() {
+        let hash = PackageHash::Unknown("sha512-256:abcdef123456".into());
+        assert_eq!(hash.short(), "abcdef1");
+    }
+
+    #[test]
+    fn short_hash_handles_short_values() {
+        let hash = PackageHash::Unknown("sha256:abc".into());
+        assert_eq!(hash.short(), "abc");
     }
 }

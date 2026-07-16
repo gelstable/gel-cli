@@ -19,7 +19,7 @@ use crate::migrations::migration;
 use crate::migrations::options::UpgradeCheck;
 use crate::migrations::timeout;
 use crate::portable::local::InstallInfo;
-use crate::portable::registry::{self, Channel, Query, QuerySelector, ServerPackage};
+use crate::portable::registry::{self, Query, QuerySelector, ServerPackage};
 use crate::portable::server::install;
 use crate::print::{self, Highlight, msg};
 use crate::process;
@@ -78,17 +78,13 @@ pub fn upgrade_check(_options: &Options, options: &UpgradeCheck) -> anyhow::Resu
 
     use crate::branding::{BRANDING, BRANDING_SERVER};
 
-    let selector = if let Some(version) = options.to_version.as_ref() {
-        Some(QuerySelector::Version(version))
-    } else if let Some(channel) = options.to_channel {
-        Some(QuerySelector::Channel(channel))
-    } else if options.to_nightly {
-        Some(QuerySelector::Channel(Channel::Nightly))
-    } else if options.to_testing {
-        Some(QuerySelector::Channel(Channel::Testing))
-    } else {
-        None
-    };
+    let selector = QuerySelector::from_upgrade_flags(
+        options.to_version.as_ref(),
+        options.to_channel,
+        options.to_nightly,
+        options.to_testing,
+        false,
+    );
     let (version, _) = Query::from_selector(selector, || Ok(Query::stable()))?;
 
     let pkg = registry::get_server_package(&version)?

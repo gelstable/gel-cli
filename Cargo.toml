@@ -99,10 +99,9 @@ textwrap = "0.16.0"
 log = "0.4.8"
 env_logger = "0.11.0"
 os-release = "0.1.0"
-reqwest = {version="0.13.4", default-features=false, features=["json", "rustls", "http2", "charset", "gzip", "brotli", "deflate"]}
-reqwest-middleware = {version = "0.5.2", features=["json"]}
-reqwest-retry = "0.9.1"
-http-cache-reqwest = { version = "1.0.0-alpha.6", features = ["manager-cacache"] }
+reqwest = { version = "0.12.8", default-features = false, features = ["json", "rustls-tls-native-roots", "http2", "charset", "gzip", "brotli", "deflate"] }
+reqwest-middleware = { version = "0.3.0", features = ["json"] }
+reqwest-retry = "0.6.0"
 tracing = "0.1.26"
 thiserror = "2.0.11"
 which = {version="6", default-features=false}

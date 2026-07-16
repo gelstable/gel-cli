@@ -3,74 +3,104 @@
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
-use serde::Deserialize;
 use url::Url;
 
 use crate::portable::registry::source::Source;
 
-pub const DEFAULT_REGISTRY_SOURCE: &str =
-    "https://raw.githubusercontent.com/community/gel-registry/main/registry.json";
+pub const DEFAULT_PACKAGE_ROOT: &str = "https://packages.geldata.com";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrySource {
+    Manifest(Source),
+    LegacyPackageRoot(Url),
+}
+
+impl RegistrySource {
+    pub fn display(&self) -> String {
+        match self {
+            RegistrySource::Manifest(source) => source.display(),
+            RegistrySource::LegacyPackageRoot(root) => root.to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    pub sources: Vec<Source>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawConfig {
-    registry: Option<RawRegistry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawRegistry {
-    #[serde(default)]
-    sources: Vec<String>,
+    pub sources: Vec<RegistrySource>,
 }
 
 impl Config {
     pub fn load() -> anyhow::Result<Config> {
-        let path = crate::platform::config_dir()?.join("gel.toml");
-        if !path.exists() {
-            return Self::default_with(DEFAULT_REGISTRY_SOURCE);
+        let pkg_root = crate::cli::env::Env::pkg_root()?;
+        let global = crate::config::get_config()?;
+        let config_path = match global.file_name.as_deref() {
+            Some(path) => path.to_path_buf(),
+            None => crate::platform::config_dir()?.join("cli.toml"),
+        };
+        Self::from_inputs(
+            pkg_root.as_deref(),
+            &global.registry.sources,
+            &config_path,
+            DEFAULT_PACKAGE_ROOT,
+        )
+    }
+
+    pub fn from_inputs(
+        pkg_root: Option<&str>,
+        registry_sources: &[String],
+        config_path: &Path,
+        default_package_root: &str,
+    ) -> anyhow::Result<Config> {
+        if let Some(pkg_root) = pkg_root {
+            return Ok(Config {
+                sources: vec![RegistrySource::LegacyPackageRoot(parse_package_root(
+                    pkg_root,
+                )?)],
+            });
         }
 
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read registry config {}", path.display()))?;
-        Self::from_toml_str(&text, &path, DEFAULT_REGISTRY_SOURCE)
+        if !registry_sources.is_empty() {
+            let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+            let sources = registry_sources
+                .iter()
+                .map(|source| parse_source(source, base_dir).map(RegistrySource::Manifest))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            return Ok(Config { sources });
+        }
+
+        Ok(Config {
+            sources: vec![RegistrySource::LegacyPackageRoot(parse_package_root(
+                default_package_root,
+            )?)],
+        })
     }
 
     pub fn from_toml_str(
         input: &str,
         config_path: &Path,
-        default_source: &str,
+        default_package_root: &str,
     ) -> anyhow::Result<Config> {
-        let raw: RawConfig = if input.trim().is_empty() {
-            RawConfig { registry: None }
+        let global: crate::config::Config = if input.trim().is_empty() {
+            Default::default()
         } else {
             toml::from_str(input).context("failed to parse registry config TOML")?
         };
-        let source_strings = raw.registry.map(|r| r.sources).unwrap_or_default();
-        if source_strings.is_empty() {
-            return Self::default_with(default_source);
-        }
-
-        let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-        let sources = source_strings
-            .iter()
-            .map(|s| parse_source(s, base_dir))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Config { sources })
-    }
-
-    fn default_with(default_source: &str) -> anyhow::Result<Config> {
-        Ok(Config {
-            sources: vec![parse_source(default_source, Path::new("."))?],
-        })
+        Self::from_inputs(
+            None,
+            &global.registry.sources,
+            config_path,
+            default_package_root,
+        )
     }
 }
 
-pub fn registry_http_cache_dir() -> anyhow::Result<PathBuf> {
-    Ok(crate::platform::cache_dir()?.join("registry").join("http"))
+fn parse_package_root(value: &str) -> anyhow::Result<Url> {
+    let url =
+        Url::parse(value).with_context(|| format!("invalid legacy package root URL {value:?}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        anyhow::bail!("invalid legacy package root URL {value:?}");
+    }
+    Ok(url)
 }
 
 fn parse_source(value: &str, base_dir: &Path) -> anyhow::Result<Source> {
@@ -127,13 +157,12 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
-    const DEFAULT_SOURCE: &str =
-        "https://raw.githubusercontent.com/community/gel-registry/main/registry.json";
+    const DEFAULT_SOURCE: &str = "https://packages.geldata.com";
 
     fn parse(input: &str) -> anyhow::Result<Config> {
         Config::from_toml_str(
             input,
-            Path::new("/home/me/.config/gel/gel.toml"),
+            Path::new("/home/me/.config/gel/cli.toml"),
             DEFAULT_SOURCE,
         )
     }
@@ -142,14 +171,22 @@ mod tests {
     fn missing_registry_table_uses_default_source() {
         let cfg = parse("").unwrap();
         assert_eq!(cfg.sources.len(), 1);
-        assert_eq!(cfg.sources[0].display(), DEFAULT_SOURCE);
+        assert!(matches!(
+            &cfg.sources[0],
+            RegistrySource::LegacyPackageRoot(root)
+                if root == &Url::parse(DEFAULT_SOURCE).unwrap()
+        ));
     }
 
     #[test]
     fn empty_sources_use_default_source() {
         let cfg = parse("[registry]\nsources = []\n").unwrap();
         assert_eq!(cfg.sources.len(), 1);
-        assert_eq!(cfg.sources[0].display(), DEFAULT_SOURCE);
+        assert!(matches!(
+            &cfg.sources[0],
+            RegistrySource::LegacyPackageRoot(root)
+                if root == &Url::parse(DEFAULT_SOURCE).unwrap()
+        ));
     }
 
     #[test]
@@ -199,6 +236,130 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid registry source URL"));
+    }
+
+    #[test]
+    fn rejects_unknown_registry_fields() {
+        let err = parse(
+            r#"[registry]
+            unknown = true
+        "#,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("unknown"));
+    }
+
+    #[test]
+    fn no_package_root_uses_configured_manifest_sources() {
+        let configured = vec![
+            "https://example.com/registry.json".to_owned(),
+            "./fixtures/registry.json".to_owned(),
+        ];
+
+        let cfg = Config::from_inputs(
+            None,
+            &configured,
+            Path::new("/home/me/.config/gel/cli.toml"),
+            DEFAULT_SOURCE,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &cfg.sources[0],
+            RegistrySource::Manifest(Source::Http(url))
+                if url.as_str() == "https://example.com/registry.json"
+        ));
+        assert!(matches!(
+            &cfg.sources[1],
+            RegistrySource::Manifest(Source::File(path))
+                if path == Path::new("/home/me/.config/gel/fixtures/registry.json")
+        ));
+    }
+
+    #[test]
+    fn package_root_input_replaces_configured_sources() {
+        let configured = vec!["https://example.com/registry.json".to_owned()];
+
+        let cfg = Config::from_inputs(
+            Some("https://mirror.example.test/packages"),
+            &configured,
+            Path::new("/home/me/.config/gel/cli.toml"),
+            DEFAULT_SOURCE,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.sources.len(), 1);
+        assert!(matches!(
+            &cfg.sources[0],
+            RegistrySource::LegacyPackageRoot(root)
+                if root == &Url::parse("https://mirror.example.test/packages").unwrap()
+        ));
+    }
+
+    #[test]
+    fn malformed_package_root_has_context() {
+        let err = Config::from_inputs(
+            Some("not a URL"),
+            &[],
+            Path::new("/home/me/.config/gel/cli.toml"),
+            DEFAULT_SOURCE,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("invalid legacy package root URL"));
+    }
+
+    #[test]
+    fn load_reads_registry_sources_from_cli_toml_not_gel_toml() {
+        let _lock = crate::cli::env::test_env_lock();
+        let env_names = ["HOME", "XDG_CONFIG_HOME", "GEL_PKG_ROOT", "EDGEDB_PKG_ROOT"];
+        let previous = env_names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..) {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
+            std::env::remove_var("GEL_PKG_ROOT");
+            std::env::remove_var("EDGEDB_PKG_ROOT");
+        }
+
+        let config_dir = crate::platform::config_dir().unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("cli.toml"),
+            "[registry]\nsources = [\"./from-cli.json\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("gel.toml"),
+            "[registry]\nsources = [\"./from-gel.json\"]\n",
+        )
+        .unwrap();
+
+        let config = Config::load().unwrap();
+
+        assert_eq!(config.sources.len(), 1);
+        assert_eq!(
+            config.sources[0].display(),
+            config_dir.join("from-cli.json").display().to_string()
+        );
     }
 
     #[test]

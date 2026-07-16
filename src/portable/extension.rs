@@ -13,7 +13,7 @@ use crate::hint::HintExt;
 use crate::options::{InstanceOptions, InstanceOptionsGlobal, Options};
 use crate::portable::local::InstanceInfo;
 use crate::portable::platform::get_server;
-use crate::portable::registry::{self, Channel, ExtensionPackage, PackageHash, download_verified};
+use crate::portable::registry::{self, Channel, ExtensionPackage, download_package_verified};
 use crate::portable::windows;
 use crate::print::Highlight;
 use crate::{print, table};
@@ -184,7 +184,7 @@ async fn install(cmd: &ExtensionInstall, _options: &Options) -> Result<(), anyho
     let channel = cmd.channel.unwrap_or(Channel::Stable);
     let slot = cmd.slot.clone().unwrap_or(version.extension_server_slot());
     debug!("Instance: {version} {channel:?} {slot}");
-    let catalog = registry::load_default_or_empty(channel, get_server()?).await?;
+    let catalog = registry::load_default_async(channel, get_server()?).await?;
     let packages = catalog.extension_packages(&slot);
 
     let package = select_extension_package(&packages, &cmd.extension);
@@ -227,22 +227,19 @@ async fn install(cmd: &ExtensionInstall, _options: &Options) -> Result<(), anyho
     Ok(())
 }
 
+fn extension_cache_file_name(pkg: &ExtensionPackage) -> String {
+    let hash = pkg.hash.to_string();
+    let hash = urlencoding::encode(&hash);
+    format!("{}_{}_{}.zip", pkg.name, pkg.version, hash)
+}
+
 #[context("failed to download extension package")]
-async fn download_package(
-    pkg: &crate::portable::registry::ExtensionPackage,
-) -> anyhow::Result<std::path::PathBuf> {
+async fn download_package(pkg: &ExtensionPackage) -> anyhow::Result<std::path::PathBuf> {
     let cache_dir = crate::platform::cache_dir()?;
     let download_dir = cache_dir.join("downloads");
     fs_err::create_dir_all(&download_dir)?;
-    let cache_path = download_dir.join(format!("{}_{}.zip", pkg.name, pkg.version));
-    match &pkg.hash {
-        PackageHash::Blake2b(hex) => {
-            download_verified(&cache_path, &pkg.url, hex, false).await?;
-        }
-        PackageHash::Unknown(val) => {
-            anyhow::bail!("cannot verify hash, unknown hash format {val:?}");
-        }
-    }
+    let cache_path = download_dir.join(extension_cache_file_name(pkg));
+    download_package_verified(&cache_path, &pkg.url, &pkg.hash, false).await?;
     Ok(cache_path)
 }
 
@@ -253,7 +250,7 @@ fn select_extension_package<'a>(
     packages
         .iter()
         .filter(|pkg| pkg.tags.get("extension").map(|s| s.as_str()) == Some(extension))
-        .max_by_key(|pkg| pkg.version.clone())
+        .max_by(|a, b| a.version.cmp(&b.version))
 }
 
 fn run_extension_loader(
@@ -303,7 +300,7 @@ async fn list_available(
     let channel = cmd.channel.unwrap_or(Channel::Stable);
     let slot = cmd.slot.clone().unwrap_or(version.extension_server_slot());
     debug!("Instance: {version} {channel:?} {slot}");
-    let catalog = registry::load_default_or_empty(channel, get_server()?).await?;
+    let catalog = registry::load_default_async(channel, get_server()?).await?;
     let packages = catalog.extension_packages(&slot);
 
     let mut table = Table::new();
@@ -324,7 +321,26 @@ mod tests {
     use crate::portable::registry::{ExtensionPackage, PackageHash, PackageType};
     use crate::portable::ver;
 
-    use super::select_extension_package;
+    use super::{extension_cache_file_name, select_extension_package};
+
+    #[test]
+    fn extension_cache_names_include_complete_hash() {
+        let mut first = extension_package("pgvector", "7.2+aaaaaaa");
+        first.hash = PackageHash::Blake2b(
+            "aaaaaaa111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+                .into(),
+        );
+        let mut second = first.clone();
+        second.hash = PackageHash::Blake2b(
+            "aaaaaaa222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"
+                .into(),
+        );
+        let cache_dir = tempfile::tempdir().unwrap();
+        let first_path = cache_dir.path().join(extension_cache_file_name(&first));
+        let second_path = cache_dir.path().join(extension_cache_file_name(&second));
+
+        assert_ne!(first_path, second_path);
+    }
 
     fn extension_package(name: &str, version: &str) -> ExtensionPackage {
         let mut tags = HashMap::new();

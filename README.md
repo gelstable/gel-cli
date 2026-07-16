@@ -49,6 +49,39 @@ Alternatively, if you don't have `direnv` hooked into your shell, you can enter 
 If you do not use Nix or direnv, standard `cargo` commands (`cargo build`, `cargo test`) will still work if you have a compatible Rust toolchain installed locally.
 
 
+Registry configuration
+======================
+
+The registry configuration is read from `cli.toml` in the platform config
+directory: `$XDG_CONFIG_HOME/edgedb/cli.toml` (usually
+`~/.config/edgedb/cli.toml`) on Unix, or
+`%LOCALAPPDATA%\EdgeDB\config\cli.toml` on Windows. Registry manifests can be
+configured with a `[registry]` table and an ordered `sources` array:
+
+```toml
+[registry]
+sources = [
+  "https://mirror.example.com/gel/registry.json", # operator-supplied manifest
+  "file:///srv/gel-registry/registry.json",
+  "./registry.json",
+]
+```
+
+The HTTP URL above is an operator-supplied manifest example. Sources are
+checked in the order listed. A later source is used when an earlier source is
+missing or unavailable; equivalent artifacts from mirrors keep the first
+source, while conflicting mirror records are rejected. Relative paths are
+resolved relative to `cli.toml`; absolute paths and `file://` URLs can be used
+for local manifests.
+
+For compatibility, `GEL_PKG_ROOT` (preferred) and the legacy
+`EDGEDB_PKG_ROOT` environment variable select the legacy package-root mode and
+override `[registry].sources`. Migrate to `[registry].sources` for manifest
+configuration; remove these environment variables when they are no longer
+needed. With neither an environment override nor configured sources, the
+built-in default is the legacy package root `https://packages.geldata.com`.
+That URL is a package root, not a registry manifest.
+
 Tests
 =====
 

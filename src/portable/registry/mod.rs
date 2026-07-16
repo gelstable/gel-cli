@@ -14,32 +14,48 @@ pub(crate) mod manifest;
 pub(crate) mod source;
 pub(crate) mod types;
 
-#[allow(unused_imports)]
-pub(crate) use catalog::{Catalog, load_default, load_default_or_empty};
-pub(crate) use config::Config;
-#[allow(unused_imports)]
+pub(crate) use catalog::{Catalog, load_default_async};
+pub(crate) use config::{Config, RegistrySource};
 pub(crate) use download::{
-    DEFAULT_TIMEOUT, USER_AGENT, download, download_sync, download_verified,
+    USER_AGENT, download_package_verified, download_package_verified_sync, download_sync,
 };
 pub(crate) use source::{Source, SourceLoader};
-#[allow(unused_imports)]
 pub(crate) use types::{
     Channel, CliPackage, Compression, ExtensionPackage, PackageHash, PackageType, Query,
-    QueryDisplay, QuerySelector, ServerPackage,
+    QuerySelector, ServerPackage,
 };
 
-fn server_platform(query: &Query) -> anyhow::Result<&'static str> {
-    if cfg!(all(target_arch = "aarch64", target_os = "macos"))
-        && query
-            .version
-            .as_ref()
-            .map(|v| v.major == 1)
-            .unwrap_or(false)
-    {
-        Ok("x86_64-apple-darwin")
+fn server_platform_for_host(
+    host_arch: &str,
+    host_os: &str,
+    native_platform: &'static str,
+    requested_major: Option<u32>,
+) -> &'static str {
+    if host_arch == "aarch64" && host_os == "macos" && requested_major == Some(1) {
+        "x86_64-apple-darwin"
     } else {
-        platform::get_server()
+        native_platform
     }
+}
+
+fn server_platform_for_query(query: &Query) -> anyhow::Result<&'static str> {
+    let native_platform = platform::get_server()?;
+    Ok(server_platform_for_host(
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        native_platform,
+        query.version.as_ref().map(|version| version.major),
+    ))
+}
+
+fn server_platform_for_specific(version: &ver::Specific) -> anyhow::Result<&'static str> {
+    let native_platform = platform::get_server()?;
+    Ok(server_platform_for_host(
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        native_platform,
+        Some(version.major),
+    ))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -64,14 +80,14 @@ async fn get_platform_cli_packages_async(
     platform: &str,
     timeo: Duration,
 ) -> anyhow::Result<Vec<CliPackage>> {
-    let catalog = timeout(timeo, load_default_or_empty(channel, platform)).await?;
+    let catalog = timeout(timeo, load_default_async(channel, platform)).await?;
     Ok(catalog.cli_packages())
 }
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn get_server_packages(channel: Channel) -> anyhow::Result<Vec<ServerPackage>> {
     let plat = platform::get_server()?;
-    load_platform_server_packages(channel, plat).await
+    load_platform_server_packages_async(channel, plat).await
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -79,19 +95,19 @@ pub async fn get_platform_server_packages(
     channel: Channel,
     platform: &str,
 ) -> anyhow::Result<Vec<ServerPackage>> {
-    load_platform_server_packages(channel, platform).await
+    load_platform_server_packages_async(channel, platform).await
 }
 
-pub(crate) async fn load_platform_server_packages(
+pub(crate) async fn load_platform_server_packages_async(
     channel: Channel,
     platform: &str,
 ) -> anyhow::Result<Vec<ServerPackage>> {
-    let catalog = load_default_or_empty(channel, platform).await?;
+    let catalog = load_default_async(channel, platform).await?;
     Ok(catalog.server_packages())
 }
 
-#[tokio::main(flavor = "current_thread")]
 #[allow(dead_code)]
+#[tokio::main(flavor = "current_thread")]
 pub async fn get_platform_extension_packages(
     channel: Channel,
     slot: &str,
@@ -105,52 +121,141 @@ async fn get_platform_extension_packages_async(
     slot: &str,
     platform: &str,
 ) -> anyhow::Result<Vec<ExtensionPackage>> {
-    let catalog = load_default_or_empty(channel, platform).await?;
+    let catalog = load_default_async(channel, platform).await?;
     Ok(catalog.extension_packages(slot))
 }
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn get_server_package(query: &Query) -> anyhow::Result<Option<ServerPackage>> {
-    let plat = server_platform(query)?;
-    if cfg!(all(target_arch = "aarch64", target_os = "macos"))
-        && query
-            .version
-            .as_ref()
-            .map(|v| v.major == 1)
-            .unwrap_or(false)
-    {
-        return get_platform_server_package(query, "x86_64-apple-darwin").await;
-    }
-    get_platform_server_package(query, plat).await
+    select_server_package_async(query).await
 }
 
-async fn get_platform_server_package(
+async fn select_server_package_async(query: &Query) -> anyhow::Result<Option<ServerPackage>> {
+    let platform = server_platform_for_query(query)?;
+    let packages = load_platform_server_packages_async(query.channel, platform).await?;
+    Ok(select_server_package_from_packages(packages, query))
+}
+
+fn select_server_package_from_packages(
+    packages: Vec<ServerPackage>,
     query: &Query,
-    platform: &str,
-) -> anyhow::Result<Option<ServerPackage>> {
+) -> Option<ServerPackage> {
     let filter = query.version.as_ref();
-    let pkg = load_platform_server_packages(query.channel, platform)
-        .await?
+    packages
         .into_iter()
         .filter(|pkg| filter.map(|q| q.matches(&pkg.version)).unwrap_or(true))
-        .max_by_key(|pkg| pkg.version.specific());
-    Ok(pkg)
+        .max_by_key(|pkg| pkg.version.specific())
 }
 
 #[tokio::main(flavor = "current_thread")]
-#[allow(dead_code)]
 pub async fn get_specific_package(
     version: &ver::Specific,
 ) -> anyhow::Result<Option<ServerPackage>> {
+    select_specific_server_package_async(version).await
+}
+
+async fn select_specific_server_package_async(
+    version: &ver::Specific,
+) -> anyhow::Result<Option<ServerPackage>> {
     let channel = Channel::from_version(version)?;
-    let all = if cfg!(all(target_arch = "aarch64", target_os = "macos")) && version.major == 1 {
-        load_platform_server_packages(channel, "x86_64-apple-darwin").await?
-    } else {
-        let plat = platform::get_server()?;
-        load_platform_server_packages(channel, plat).await?
-    };
-    let pkg = all
+    let platform = server_platform_for_specific(version)?;
+    let packages = load_platform_server_packages_async(channel, platform).await?;
+    Ok(select_specific_server_package_from_packages(
+        packages, version,
+    ))
+}
+
+fn select_specific_server_package_from_packages(
+    packages: Vec<ServerPackage>,
+    version: &ver::Specific,
+) -> Option<ServerPackage> {
+    packages
         .into_iter()
-        .find(|pkg| &pkg.version.specific() == version);
-    Ok(pkg)
+        .find(|pkg| pkg.version.specific() == *version)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn server_platform_falls_back_to_x86_for_aarch64_macos_v1() {
+        assert_eq!(
+            server_platform_for_host("aarch64", "macos", "aarch64-apple-darwin", Some(1),),
+            "x86_64-apple-darwin"
+        );
+    }
+
+    #[test]
+    fn server_platform_uses_native_for_aarch64_macos_v2_and_later() {
+        assert_eq!(
+            server_platform_for_host("aarch64", "macos", "aarch64-apple-darwin", Some(2),),
+            "aarch64-apple-darwin"
+        );
+    }
+
+    #[test]
+    fn server_platform_uses_native_on_other_hosts() {
+        assert_eq!(
+            server_platform_for_host("x86_64", "macos", "x86_64-apple-darwin", Some(1),),
+            "x86_64-apple-darwin"
+        );
+        assert_eq!(
+            server_platform_for_host("aarch64", "linux", "aarch64-unknown-linux-gnu", Some(1),),
+            "aarch64-unknown-linux-gnu"
+        );
+    }
+
+    #[test]
+    fn query_selection_uses_highest_matching_fixture_package() {
+        let packages = fixture_packages();
+        let query = Query {
+            channel: Channel::Stable,
+            version: Some(ver::Filter::from_str("1").unwrap()),
+        };
+
+        let package = select_server_package_from_packages(packages, &query).unwrap();
+        assert_eq!(
+            package.version.specific(),
+            ver::Specific::from_str("1.2").unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_selection_uses_matching_fixture_package() {
+        let packages = fixture_packages();
+        let version = ver::Specific::from_str("2.0").unwrap();
+
+        let package =
+            select_specific_server_package_from_packages(packages.clone(), &version).unwrap();
+        assert_eq!(package.version.specific(), version);
+
+        let missing = ver::Specific::from_str("3.0").unwrap();
+        assert!(select_specific_server_package_from_packages(packages, &missing).is_none());
+    }
+
+    fn fixture_packages() -> Vec<ServerPackage> {
+        vec![
+            fixture_package("1.1+aaaaaaa"),
+            fixture_package("1.2+bbbbbbb"),
+            fixture_package("2.0+ccccccc"),
+        ]
+    }
+
+    fn fixture_package(version: &str) -> ServerPackage {
+        ServerPackage {
+            name: "gel-server".into(),
+            version: ver::Build::from_str(version).unwrap(),
+            url: url::Url::parse("https://example.com/server.tar.zst").unwrap(),
+            size: 1,
+            hash: PackageHash::Unknown("sha256:fixture".into()),
+            kind: PackageType::TarZst,
+            slot: "default".into(),
+            tags: Default::default(),
+        }
+    }
+    #[test]
+    fn registry_catalog_loader_exposes_explicit_async_boundary() {
+        let _ = catalog::load_default_async;
+    }
 }

@@ -16,9 +16,9 @@ use crate::commands::ExitCode;
 use crate::platform;
 use crate::portable::exit_codes;
 use crate::portable::local::{InstallInfo, write_json};
-use crate::portable::platform::{get_server, optional_docker_check};
+use crate::portable::platform::optional_docker_check;
 use crate::portable::registry::{
-    self, Channel, PackageHash, Query, QuerySelector, ServerPackage, download_verified,
+    self, Channel, Query, QuerySelector, ServerPackage, download_package_verified,
 };
 use crate::portable::ver::{self, Build};
 use crate::print::{self, Highlight};
@@ -31,15 +31,11 @@ pub fn run(options: &Command) -> anyhow::Result<()> {
         print::error!("`{BRANDING_CLI_CMD} server install` not supported in Docker containers.");
         Err(ExitCode::new(exit_codes::DOCKER_CONTAINER))?;
     }
-    let selector = if let Some(version) = options.version.as_ref() {
-        Some(QuerySelector::Version(version))
-    } else if let Some(channel) = options.channel {
-        Some(QuerySelector::Channel(channel))
-    } else if options.nightly {
-        Some(QuerySelector::Channel(Channel::Nightly))
-    } else {
-        None
-    };
+    let selector = QuerySelector::from_install_flags(
+        options.version.as_ref(),
+        options.channel,
+        options.nightly,
+    );
     let (query, _) = Query::from_selector(selector, || Ok(Query::stable()))?;
     version(&query)?;
     Ok(())
@@ -59,7 +55,7 @@ pub struct Command {
 }
 
 pub fn version(query: &Query) -> anyhow::Result<InstallInfo> {
-    let pkg_info = select_package(query)?
+    let pkg_info = registry::get_server_package(query)?
         .with_context(|| format!("no package matching your criteria found: {query:?}"))?;
     ver::print_version_hint(&pkg_info.version.specific(), query);
     package(&pkg_info)
@@ -70,68 +66,9 @@ pub fn specific(version: &ver::Specific) -> anyhow::Result<InstallInfo> {
     if target_dir.exists() {
         return InstallInfo::read(&target_dir);
     }
-    let pkg = select_specific_package(version)?
+    let pkg = registry::get_specific_package(version)?
         .with_context(|| format!("cannot find package {version}"))?;
     package(&pkg)
-}
-
-fn server_platform(query: &Query) -> anyhow::Result<&'static str> {
-    if cfg!(all(target_arch = "aarch64", target_os = "macos"))
-        && query
-            .version
-            .as_ref()
-            .map(|version| version.major == 1)
-            .unwrap_or(false)
-    {
-        Ok("x86_64-apple-darwin")
-    } else {
-        get_server()
-    }
-}
-
-fn server_platform_for_specific(version: &ver::Specific) -> anyhow::Result<&'static str> {
-    if cfg!(all(target_arch = "aarch64", target_os = "macos")) && version.major == 1 {
-        Ok("x86_64-apple-darwin")
-    } else {
-        get_server()
-    }
-}
-
-fn select_package(query: &Query) -> anyhow::Result<Option<ServerPackage>> {
-    let platform = server_platform(query)?;
-    let query = query.clone();
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(async move {
-            let catalog = registry::load_default_or_empty(query.channel, platform).await?;
-            let filter = query.version.as_ref();
-            Ok::<_, anyhow::Error>(
-                catalog
-                    .server_packages()
-                    .into_iter()
-                    .filter(|pkg| filter.map(|q| q.matches(&pkg.version)).unwrap_or(true))
-                    .max_by_key(|pkg| pkg.version.specific()),
-            )
-        })
-}
-
-fn select_specific_package(version: &ver::Specific) -> anyhow::Result<Option<ServerPackage>> {
-    let platform = server_platform_for_specific(version)?;
-    let channel = Channel::from_version(version)?;
-    let version = version.clone();
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(async move {
-            let catalog = registry::load_default_or_empty(channel, platform).await?;
-            Ok::<_, anyhow::Error>(
-                catalog
-                    .server_packages()
-                    .into_iter()
-                    .find(|pkg| pkg.version.specific() == version),
-            )
-        })
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -206,14 +143,7 @@ pub async fn download_package(pkg_info: &ServerPackage) -> anyhow::Result<PathBu
     let download_dir = cache_dir.join("downloads");
     fs::create_dir_all(&download_dir)?;
     let cache_path = download_dir.join(pkg_info.cache_file_name());
-    match &pkg_info.hash {
-        PackageHash::Blake2b(hex) => {
-            download_verified(&cache_path, &pkg_info.url, hex, false).await?;
-        }
-        PackageHash::Unknown(val) => {
-            anyhow::bail!("cannot verify hash, unknown hash format {val:?}");
-        }
-    }
+    download_package_verified(&cache_path, &pkg_info.url, &pkg_info.hash, false).await?;
     Ok(cache_path)
 }
 

@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use super::types::PackageHash;
 use crate::branding::BRANDING_CLI;
 use anyhow::Context;
 use fn_error_context::context;
@@ -21,6 +22,16 @@ pub async fn download_sync(
     quiet: bool,
 ) -> Result<blake2b_simd::Hash, anyhow::Error> {
     download(dest, url, quiet).await
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn download_package_verified_sync(
+    dest: impl AsRef<Path>,
+    url: &Url,
+    hash: &PackageHash,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    download_package_verified(dest, url, hash, quiet).await
 }
 
 #[context("failed to download file at URL: {}", url)]
@@ -135,9 +146,24 @@ pub async fn download_verified(
     Ok(())
 }
 
+pub async fn download_package_verified(
+    dest: impl AsRef<Path>,
+    url: &Url,
+    hash: &PackageHash,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    match hash {
+        PackageHash::Blake2b(hex) => download_verified(dest, url, hex, quiet).await,
+        PackageHash::Unknown(value) => {
+            anyhow::bail!("cannot verify hash, unknown hash format {value:?}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::portable::registry::PackageHash;
     use tempfile::tempdir;
 
     fn hash_hex(bytes: &[u8]) -> String {
@@ -157,6 +183,64 @@ mod tests {
 
         assert_eq!(fs_err::read(&dest).unwrap(), contents);
         assert_eq!(hash.to_hex().to_string(), hash_hex(contents));
+    }
+
+    #[tokio::test]
+    async fn download_package_verified_accepts_matching_blake2b_for_file_url() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("artifact.bin");
+        let dest = tmp.path().join("output.bin");
+        let contents = b"local registry artifact contents";
+        fs_err::write(&src, contents).unwrap();
+        let url = Url::from_file_path(&src).unwrap();
+        let hash = PackageHash::Blake2b(hash_hex(contents).into_boxed_str());
+
+        download_package_verified(&dest, &url, &hash, true)
+            .await
+            .unwrap();
+
+        assert_eq!(fs_err::read(&dest).unwrap(), contents);
+    }
+
+    #[tokio::test]
+    async fn download_package_verified_rejects_hash_mismatch() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("artifact.bin");
+        let dest = tmp.path().join("output.bin");
+        let contents = b"local registry artifact contents";
+        fs_err::write(&src, contents).unwrap();
+        let url = Url::from_file_path(&src).unwrap();
+        let expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash = PackageHash::Blake2b(expected.into());
+
+        let err = download_package_verified(&dest, &url, &hash, true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!("hash mismatch {} != {expected}", hash_hex(contents))
+        );
+    }
+
+    #[tokio::test]
+    async fn download_package_verified_rejects_unknown_hash_format() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("artifact.bin");
+        let dest = tmp.path().join("output.bin");
+        fs_err::write(&src, b"local registry artifact contents").unwrap();
+        let url = Url::from_file_path(&src).unwrap();
+        let hash = PackageHash::Unknown("sha256:deadbeef".into());
+
+        let err = download_package_verified(&dest, &url, &hash, true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "cannot verify hash, unknown hash format \"sha256:deadbeef\""
+        );
+        assert!(!dest.exists());
     }
 
     #[tokio::test]

@@ -1,38 +1,22 @@
 #[cfg(test)]
 use std::ffi::OsString;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
-static TEST_ENV_LOCK: AtomicBool = AtomicBool::new(false);
+static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-pub(crate) struct TestEnvLock;
-
-#[cfg(test)]
-impl Drop for TestEnvLock {
-    fn drop(&mut self) {
-        TEST_ENV_LOCK.store(false, Ordering::Release);
-    }
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
-pub(crate) fn test_env_lock() -> TestEnvLock {
-    while TEST_ENV_LOCK
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        std::thread::yield_now();
-    }
-    TestEnvLock
-}
-
-#[cfg(test)]
-struct RestoreEnv(Vec<(&'static str, Option<OsString>)>);
+pub(crate) struct RestoreEnv(Vec<(&'static str, Option<OsString>)>);
 
 #[cfg(test)]
 impl RestoreEnv {
-    fn new(names: &[&'static str]) -> Self {
+    pub(crate) fn new(names: &[&'static str]) -> Self {
         Self(
             names
                 .iter()
@@ -41,7 +25,7 @@ impl RestoreEnv {
         )
     }
 
-    fn set(&self, name: &'static str, value: &str) {
+    pub(crate) fn set(&self, name: &'static str, value: &str) {
         unsafe {
             std::env::set_var(name, value);
         }

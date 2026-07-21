@@ -4,8 +4,8 @@ use std::path::Path;
 
 use anyhow::bail;
 use serde::Deserialize;
-use url::Url;
 
+use crate::portable::registry::source::{ReferenceKind, classify_reference, relative_http_ref};
 use crate::portable::registry::{Channel, Source};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,28 +51,20 @@ impl Manifest {
 }
 
 fn resolve_index_source(manifest_source: &Source, value: &str) -> anyhow::Result<Source> {
-    if let Ok(url) = Url::parse(value) {
-        match url.scheme() {
-            "http" | "https" => return Ok(Source::Http(url)),
-            "file" => return Source::from_file_url(url),
-            scheme if value.contains("://") => {
-                bail!("unsupported registry index source scheme {scheme}: {value}")
+    match classify_reference(value) {
+        ReferenceKind::HttpUrl(url) => Ok(Source::Http(url)),
+        ReferenceKind::FileUrl(url) => Source::from_file_url(url),
+        ReferenceKind::UnsupportedScheme(scheme) => {
+            bail!("unsupported registry index source scheme {scheme}: {value}")
+        }
+        ReferenceKind::Relative => match manifest_source {
+            Source::Http(base) => Ok(Source::Http(base.join(&relative_http_ref(value))?)),
+            Source::File(path) => {
+                let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+                Ok(Source::File(base_dir.join(value)))
             }
-            _ => {}
-        }
+        },
     }
-
-    match manifest_source {
-        Source::Http(base) => Ok(Source::Http(base.join(&relative_http_ref(value))?)),
-        Source::File(path) => {
-            let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-            Ok(Source::File(base_dir.join(value)))
-        }
-    }
-}
-
-fn relative_http_ref(value: &str) -> String {
-    value.replacen(':', "%3A", 1)
 }
 
 #[cfg(test)]

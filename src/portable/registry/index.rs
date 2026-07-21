@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::Deserialize;
 use url::Url;
 
-use super::source::Source;
+use super::source::{ReferenceKind, Source, classify_reference, relative_http_ref};
 use super::types::{
     ArtifactIdentity, Blake2bDigest, CliPackage, Compression, ExtensionPackage, PackageType,
     ServerPackage,
@@ -212,35 +212,34 @@ fn validate_cli(
             format!("no CLI artifact media type for platform {platform}"),
         )
     })?;
-    let installref = select_installref(index_source, package, |installref| {
-        installref.kind == media_type && installref.encoding.as_deref() == Some("zstd")
-    })
-    .or_else(|_| {
-        if package.installrefs.is_empty() {
-            Err(IndexValidationError::new(
-                index_source,
-                package,
-                "installrefs",
-                "package has no installrefs",
-            ))
-        } else {
-            package
-                .installrefs
-                .iter()
-                .find(|installref| {
-                    installref.kind == media_type
-                        && installref.encoding.as_deref() == Some("identity")
-                })
-                .ok_or_else(|| {
-                    IndexValidationError::new(
-                        index_source,
-                        package,
-                        "installrefs.type",
-                        format!("no {media_type} CLI installref with zstd or identity encoding"),
-                    )
-                })
-        }
-    })?;
+    let installref = package
+        .installrefs
+        .iter()
+        .find(|installref| {
+            installref.kind == media_type && installref.encoding.as_deref() == Some("zstd")
+        })
+        .or_else(|| {
+            package.installrefs.iter().find(|installref| {
+                installref.kind == media_type && installref.encoding.as_deref() == Some("identity")
+            })
+        })
+        .ok_or_else(|| {
+            if package.installrefs.is_empty() {
+                IndexValidationError::new(
+                    index_source,
+                    package,
+                    "installrefs",
+                    "package has no installrefs",
+                )
+            } else {
+                IndexValidationError::new(
+                    index_source,
+                    package,
+                    "installrefs.type",
+                    format!("no {media_type} CLI installref with zstd or identity encoding"),
+                )
+            }
+        })?;
     let version = package.version.parse::<ver::Semver>().map_err(|error| {
         IndexValidationError::new(index_source, package, "version", error.to_string())
     })?;
@@ -393,23 +392,20 @@ fn parse_installref_digest(
 }
 
 fn resolve_installref_url(artifact_base: &Source, value: &str) -> Option<Url> {
-    if let Ok(url) = Url::parse(value) {
-        return match url.scheme() {
-            "http" | "https" | "file" => Some(url),
-            _ => None,
-        };
-    }
-
-    match artifact_base {
-        Source::Http(base) => base.join(value).ok(),
-        Source::File(path) => {
-            let path = if Path::new(value).is_absolute() {
-                Path::new(value).to_path_buf()
-            } else {
-                path.parent().unwrap_or_else(|| Path::new(".")).join(value)
-            };
-            Url::from_file_path(path).ok()
-        }
+    match classify_reference(value) {
+        ReferenceKind::HttpUrl(url) | ReferenceKind::FileUrl(url) => Some(url),
+        ReferenceKind::UnsupportedScheme(_) => None,
+        ReferenceKind::Relative => match artifact_base {
+            Source::Http(base) => base.join(&relative_http_ref(value)).ok(),
+            Source::File(path) => {
+                let path = if Path::new(value).is_absolute() {
+                    Path::new(value).to_path_buf()
+                } else {
+                    path.parent().unwrap_or_else(|| Path::new(".")).join(value)
+                };
+                Url::from_file_path(path).ok()
+            }
+        },
     }
 }
 
@@ -576,6 +572,40 @@ mod tests {
             .validate(&source, &source, "x86_64-unknown-linux-musl")
             .unwrap_err();
         assert_eq!(error.field, "installrefs");
+    }
+
+    #[test]
+    fn colon_containing_installref_resolves_relative_to_index_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Source::File(tmp.path().join("index.json"));
+        let json = format!(
+            r#"{{"packages":[{{"basename":"gel-cli","version":"7.10.2","slot":"7","tags":{{}},"installrefs":[{{"ref":"release:2026/gel-cli.zst","type":"application/x-pie-executable","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#
+        );
+        let index = IndexDocument::from_slice(json.as_bytes()).unwrap();
+
+        let validated = index
+            .validate(&source, &source, "x86_64-unknown-linux-musl")
+            .unwrap();
+
+        let expected = Url::from_file_path(tmp.path().join("release:2026/gel-cli.zst")).unwrap();
+        assert!(matches!(
+            &validated.artifacts[0],
+            ValidatedArtifact::Cli(_, package) if package.url == expected
+        ));
+    }
+
+    #[test]
+    fn cli_without_installrefs_rejects_index() {
+        let index = IndexDocument::from_slice(
+            br#"{"packages":[{"basename":"gel-cli","version":"7.10.2","slot":"7","tags":{},"installrefs":[]}]}"#,
+        )
+        .unwrap();
+        let source = Source::Http(Url::parse("https://example.com/index.json").unwrap());
+        let error = index
+            .validate(&source, &source, "x86_64-unknown-linux-musl")
+            .unwrap_err();
+        assert_eq!(error.field, "installrefs");
+        assert!(error.to_string().contains("package has no installrefs"));
     }
 
     #[test]

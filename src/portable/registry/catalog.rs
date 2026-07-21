@@ -1,9 +1,10 @@
 //! Composed package catalog construction and query helpers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 
 use futures_util::StreamExt;
+use url::Url;
 
 use super::config::{Config, RegistrySource};
 use super::index::{IndexDocument, ValidatedArtifact};
@@ -41,6 +42,34 @@ enum DuplicateRelation {
     Conflict { fields: Vec<&'static str> },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CatalogConflict {
+    identity: ArtifactIdentity,
+    first_source: Source,
+    first_url: Url,
+    second_source: Source,
+    second_url: Url,
+    fields: Vec<&'static str>,
+}
+
+impl CatalogConflict {
+    pub(crate) fn identity(&self) -> &ArtifactIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn warning(&self) -> String {
+        format!(
+            "registry artifact {} is contested and excluded from results: {} ({}) disagrees with {} ({}) on {}; refusing to choose between sources",
+            self.identity,
+            self.second_source.display(),
+            self.second_url,
+            self.first_source.display(),
+            self.first_url,
+            self.fields.join(", "),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
     artifacts: Vec<ValidatedArtifact>,
@@ -49,6 +78,7 @@ pub struct Catalog {
 pub(crate) struct CatalogLoad {
     pub(crate) catalog: Catalog,
     pub(crate) source_reports: Vec<SourceReport>,
+    pub(crate) conflicts: Vec<CatalogConflict>,
 }
 
 #[derive(Debug)]
@@ -82,25 +112,39 @@ impl SourceReport {
     }
 }
 
+pub(crate) fn report_source(report: &SourceReport) -> &RegistrySource {
+    match report {
+        SourceReport::Healthy { source, .. }
+        | SourceReport::Unavailable { source, .. }
+        | SourceReport::Rejected { source, .. } => source,
+    }
+}
+
+pub(crate) fn dedupe_first_by_source<'a, T>(
+    items: impl IntoIterator<Item = &'a T>,
+    source_of: impl Fn(&'a T) -> &'a RegistrySource,
+) -> Vec<&'a T> {
+    let mut kept = Vec::new();
+    let mut seen_sources: Vec<&RegistrySource> = Vec::new();
+    for item in items {
+        let source = source_of(item);
+        if seen_sources.contains(&source) {
+            continue;
+        }
+        seen_sources.push(source);
+        kept.push(item);
+    }
+    kept
+}
+
 pub(crate) fn for_each_degraded_report<F>(reports: &[SourceReport], mut on_report: F)
 where
     F: FnMut(&SourceReport),
 {
-    let mut reported_sources = Vec::<RegistrySource>::new();
-    for report in reports {
-        let source = match report {
-            SourceReport::Healthy { .. } => continue,
-            SourceReport::Unavailable { source, .. } | SourceReport::Rejected { source, .. } => {
-                source
-            }
-        };
-        if reported_sources
-            .iter()
-            .any(|reported_source| reported_source == source)
-        {
-            continue;
-        }
-        reported_sources.push(source.clone());
+    let degraded = reports
+        .iter()
+        .filter(|report| !matches!(report, SourceReport::Healthy { .. }));
+    for report in dedupe_first_by_source(degraded, report_source) {
         on_report(report);
     }
 }
@@ -120,6 +164,11 @@ impl NoHealthySources {
             .collect::<Vec<_>>()
             .join("; ");
         Self { reports, summary }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(reports: Vec<SourceReport>) -> Self {
+        Self::new(reports)
     }
 
     #[cfg(test)]
@@ -183,6 +232,8 @@ impl Catalog {
 
         let mut artifacts = Vec::new();
         let mut seen: HashMap<ArtifactIdentity, CatalogEntry> = HashMap::new();
+        let mut contested: HashSet<ArtifactIdentity> = HashSet::new();
+        let mut conflicts: Vec<CatalogConflict> = Vec::new();
         let mut healthy_sources = 0usize;
         let mut source_reports = Vec::with_capacity(config.sources.len());
 
@@ -195,7 +246,13 @@ impl Catalog {
                 } => {
                     healthy_sources += 1;
                     let artifact_count = source_artifacts.len();
-                    compose_source_artifacts(&mut artifacts, &mut seen, source_artifacts)?;
+                    compose_source_artifacts(
+                        &mut artifacts,
+                        &mut seen,
+                        &mut contested,
+                        &mut conflicts,
+                        source_artifacts,
+                    );
                     source_reports.push(SourceReport::Healthy {
                         source,
                         selected_indexes,
@@ -215,9 +272,12 @@ impl Catalog {
             return Err(NoHealthySources::new(source_reports).into());
         }
 
+        artifacts.retain(|artifact| !contested.contains(artifact.identity()));
+
         Ok(CatalogLoad {
             catalog: Catalog { artifacts },
             source_reports,
+            conflicts,
         })
     }
 
@@ -303,7 +363,14 @@ pub async fn load_default_async(channel: Channel, platform: &str) -> anyhow::Res
             log::warn!("{warning}");
         }
     });
+    warn_conflicts(&load.conflicts);
     Ok(load.catalog)
+}
+
+pub(crate) fn warn_conflicts(conflicts: &[CatalogConflict]) {
+    for conflict in conflicts {
+        log::warn!("{}", conflict.warning());
+    }
 }
 
 enum ConfiguredSourceOutcome {
@@ -618,23 +685,30 @@ async fn load_and_validate_index(
 fn compose_source_artifacts(
     artifacts: &mut Vec<ValidatedArtifact>,
     seen: &mut HashMap<ArtifactIdentity, CatalogEntry>,
+    contested: &mut HashSet<ArtifactIdentity>,
+    conflicts: &mut Vec<CatalogConflict>,
     source_artifacts: Vec<(Source, ValidatedArtifact)>,
-) -> anyhow::Result<()> {
+) {
     for (index_source, artifact) in source_artifacts {
         let identity = artifact.identity().clone();
+        if contested.contains(&identity) {
+            continue;
+        }
         if let Some(first_entry) = seen.get(&identity) {
             let first_artifact = &artifacts[first_entry.artifact_index];
             match duplicate_relation(first_artifact, &artifact) {
                 DuplicateRelation::EquivalentMirror => continue,
                 DuplicateRelation::Conflict { fields } => {
-                    anyhow::bail!(
-                        "conflicting registry artifact {identity}: {} ({}) disagrees with {} ({}) on {}; refusing to choose between sources",
-                        index_source.display(),
-                        artifact.url(),
-                        first_entry.index_source.display(),
-                        first_artifact.url(),
-                        fields.join(", "),
-                    );
+                    conflicts.push(CatalogConflict {
+                        identity: identity.clone(),
+                        first_source: first_entry.index_source.clone(),
+                        first_url: first_artifact.url().clone(),
+                        second_source: index_source,
+                        second_url: artifact.url().clone(),
+                        fields,
+                    });
+                    contested.insert(identity);
+                    continue;
                 }
             }
         }
@@ -647,7 +721,6 @@ fn compose_source_artifacts(
         );
         artifacts.push(artifact);
     }
-    Ok(())
 }
 
 fn duplicate_relation(first: &ValidatedArtifact, later: &ValidatedArtifact) -> DuplicateRelation {
@@ -738,6 +811,36 @@ mod tests {
         format!(
             r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://example.com/server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{hash}"}}}}]}}]}}"#
         )
+    }
+
+    #[test]
+    fn load_default_async_logs_one_warning_per_conflict() {
+        let conflict = |version: &str| CatalogConflict {
+            identity: ArtifactIdentity::Server {
+                name: "gel-server".into(),
+                version: version.into(),
+                slot: "7".into(),
+            },
+            first_source: Source::File("one.json".into()),
+            first_url: Url::parse("https://one.example.com/gel-server.tar.zst").unwrap(),
+            second_source: Source::File("two.json".into()),
+            second_url: Url::parse("https://two.example.com/gel-server.tar.zst").unwrap(),
+            fields: vec!["hash"],
+        };
+        let conflicts = vec![conflict("7.0+abcdef0"), conflict("7.1+abcdef0")];
+
+        let warnings = conflicts
+            .iter()
+            .map(CatalogConflict::warning)
+            .collect::<Vec<_>>();
+
+        assert_eq!(warnings.len(), 2);
+        assert_ne!(warnings[0], warnings[1]);
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.contains("contested and excluded"))
+        );
     }
 
     #[test]
@@ -1211,7 +1314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflicting_duplicate_artifact_hash_errors() {
+    async fn conflicting_duplicate_artifact_hash_is_quarantined() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("registry.json");
         let one = tmp.path().join("one.json");
@@ -1241,18 +1344,20 @@ mod tests {
             sources: vec![RegistrySource::Manifest(Source::File(manifest))],
         };
         let loader = SourceLoader::new().unwrap();
-        let error = Catalog::load(&config, &loader, Channel::Stable, "linux")
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
-            .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("conflicting registry artifact"));
-        assert!(message.contains("hash"));
-        assert!(message.contains("mirror-one.example.com"));
-        assert!(message.contains("mirror-two.example.com"));
+            .unwrap();
+        assert!(load.catalog.server_packages().is_empty());
+        assert_eq!(load.conflicts.len(), 1);
+        let warning = load.conflicts[0].warning();
+        assert!(warning.contains("contested and excluded"));
+        assert!(warning.contains("hash"));
+        assert!(warning.contains("mirror-one.example.com"));
+        assert!(warning.contains("mirror-two.example.com"));
     }
 
     #[tokio::test]
-    async fn conflicting_duplicate_artifact_size_errors() {
+    async fn conflicting_duplicate_artifact_size_is_quarantined() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("registry.json");
         let one = tmp.path().join("one.json");
@@ -1281,14 +1386,16 @@ mod tests {
             sources: vec![RegistrySource::Manifest(Source::File(manifest))],
         };
         let loader = SourceLoader::new().unwrap();
-        let error = Catalog::load(&config, &loader, Channel::Stable, "linux")
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
             .await
-            .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("conflicting registry artifact"));
-        assert!(message.contains("size"));
-        assert!(message.contains("size-one.example.com"));
-        assert!(message.contains("size-two.example.com"));
+            .unwrap();
+        assert!(load.catalog.server_packages().is_empty());
+        assert_eq!(load.conflicts.len(), 1);
+        let warning = load.conflicts[0].warning();
+        assert!(warning.contains("contested and excluded"));
+        assert!(warning.contains("size"));
+        assert!(warning.contains("size-one.example.com"));
+        assert!(warning.contains("size-two.example.com"));
     }
 
     #[tokio::test]
@@ -1394,16 +1501,18 @@ mod tests {
         };
         let config = duplicate_config(&tmp, &index("stable"), &index("testing"));
         let loader = SourceLoader::new().unwrap();
-        let error = Catalog::load(
+        let load = Catalog::load(
             &config,
             &loader,
             Channel::Stable,
             "x86_64-unknown-linux-gnu",
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("tags"));
+        assert!(load.catalog.server_packages().is_empty());
+        assert_eq!(load.conflicts.len(), 1);
+        assert!(load.conflicts[0].warning().contains("tags"));
     }
 
     #[tokio::test]
@@ -1420,16 +1529,18 @@ mod tests {
             &index("identity", "https://second.example.com/gel-cli"),
         );
         let loader = SourceLoader::new().unwrap();
-        let error = Catalog::load(
+        let load = Catalog::load(
             &config,
             &loader,
             Channel::Stable,
             "x86_64-unknown-linux-gnu",
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("compression"));
+        assert!(load.catalog.cli_packages().is_empty());
+        assert_eq!(load.conflicts.len(), 1);
+        assert!(load.conflicts[0].warning().contains("compression"));
     }
 
     #[tokio::test]
@@ -1449,16 +1560,195 @@ mod tests {
             ),
         );
         let loader = SourceLoader::new().unwrap();
-        let error = Catalog::load(
+        let load = Catalog::load(
             &config,
             &loader,
             Channel::Stable,
             "x86_64-unknown-linux-gnu",
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("tags"));
+        assert!(load.catalog.extension_packages("7").is_empty());
+        assert_eq!(load.conflicts.len(), 1);
+        assert!(load.conflicts[0].warning().contains("tags"));
+    }
+
+    fn server_index_with(version: &str, url: &str, hash: &str) -> String {
+        format!(
+            r#"{{"packages":[{{"basename":"gel-server","version":"{version}","slot":"7","tags":{{}},"installrefs":[{{"ref":"{url}","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{hash}"}}}}]}}]}}"#
+        )
+    }
+
+    fn multi_source_config(tmp: &tempfile::TempDir, index_bodies: &[&str]) -> Config {
+        let sources = index_bodies
+            .iter()
+            .enumerate()
+            .map(|(ordinal, body)| {
+                let index_name = format!("index-{ordinal}.json");
+                let manifest = write_manifest_with_indexes(
+                    tmp.path(),
+                    &format!("manifest-{ordinal}.json"),
+                    &[&index_name],
+                );
+                fs_err::write(tmp.path().join(index_name), body).unwrap();
+                RegistrySource::Manifest(Source::File(manifest))
+            })
+            .collect();
+        Config { sources }
+    }
+
+    #[tokio::test]
+    async fn third_source_contributes_when_other_identity_is_contested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other_hash = format!("b{}", &HASH[1..]);
+        let config = multi_source_config(
+            &tmp,
+            &[
+                &server_index_with(
+                    "7.0+abcdef0",
+                    "https://first.example.com/gel-server.tar.zst",
+                    HASH,
+                ),
+                &server_index_with(
+                    "7.0+abcdef0",
+                    "https://second.example.com/gel-server.tar.zst",
+                    &other_hash,
+                ),
+                &server_index_with(
+                    "7.1+abcdef0",
+                    "https://third.example.com/gel-server.tar.zst",
+                    HASH,
+                ),
+            ],
+        );
+        let loader = SourceLoader::new().unwrap();
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
+            .await
+            .unwrap();
+
+        let packages = load.catalog.server_packages();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].version.to_string(), "7.1+abcdef0");
+        assert_eq!(load.conflicts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_shared_artifacts_contested_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other_hash = format!("b{}", &HASH[1..]);
+        let config = multi_source_config(
+            &tmp,
+            &[
+                &server_index_with(
+                    "7.0+abcdef0",
+                    "https://first.example.com/gel-server.tar.zst",
+                    HASH,
+                ),
+                &server_index_with(
+                    "7.0+abcdef0",
+                    "https://second.example.com/gel-server.tar.zst",
+                    &other_hash,
+                ),
+            ],
+        );
+        let loader = SourceLoader::new().unwrap();
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
+            .await
+            .unwrap();
+
+        assert!(load.catalog.server_packages().is_empty());
+        assert_eq!(load.conflicts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn third_arrival_for_contested_identity_adds_no_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let second_hash = format!("b{}", &HASH[1..]);
+        let third_hash = format!("c{}", &HASH[1..]);
+        let config = multi_source_config(
+            &tmp,
+            &[
+                &server_index_with(
+                    "7.0+abcdef0",
+                    "https://first.example.com/gel-server.tar.zst",
+                    HASH,
+                ),
+                &server_index_with(
+                    "7.0+abcdef0",
+                    "https://second.example.com/gel-server.tar.zst",
+                    &second_hash,
+                ),
+                &server_index_with(
+                    "7.0+abcdef0",
+                    "https://third.example.com/gel-server.tar.zst",
+                    &third_hash,
+                ),
+            ],
+        );
+        let loader = SourceLoader::new().unwrap();
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
+            .await
+            .unwrap();
+
+        assert!(load.catalog.server_packages().is_empty());
+        assert_eq!(load.conflicts.len(), 1);
+        assert!(load.conflicts[0].warning().contains("second.example.com"));
+    }
+
+    #[tokio::test]
+    async fn source_with_contested_artifact_remains_healthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other_hash = format!("b{}", &HASH[1..]);
+        let config = multi_source_config(
+            &tmp,
+            &[
+                &server_index_with(
+                    "7.0+abcdef0",
+                    "https://first.example.com/gel-server.tar.zst",
+                    HASH,
+                ),
+                &server_index_with(
+                    "7.0+abcdef0",
+                    "https://second.example.com/gel-server.tar.zst",
+                    &other_hash,
+                ),
+            ],
+        );
+        let loader = SourceLoader::new().unwrap();
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
+            .await
+            .unwrap();
+
+        assert!(
+            load.source_reports
+                .iter()
+                .all(|report| matches!(report, SourceReport::Healthy { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn same_source_internal_conflict_is_quarantined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other_hash = format!("b{}", &HASH[1..]);
+        let index_body = format!(
+            r#"{{"packages":[
+                {{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://one.example.com/gel-server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}},
+                {{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://two.example.com/gel-server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{other_hash}"}}}}]}}
+            ]}}"#
+        );
+        let config = multi_source_config(&tmp, &[&index_body]);
+        let loader = SourceLoader::new().unwrap();
+        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
+            .await
+            .unwrap();
+
+        assert!(load.catalog.server_packages().is_empty());
+        assert_eq!(load.conflicts.len(), 1);
+        assert!(matches!(
+            &load.source_reports[0],
+            SourceReport::Healthy { .. }
+        ));
     }
     async fn catalog_with_http_source_status(status: u16) -> anyhow::Result<CatalogLoad> {
         let server = wiremock::MockServer::start().await;
@@ -1516,44 +1806,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_sources_load_after_earlier_source_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let missing_manifest = tmp.path().join("missing-registry.json");
-        let manifest = tmp.path().join("registry.json");
-        let index = tmp.path().join("stable-linux.json");
-        fs_err::write(
-            &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"stable-linux.json"}]}"#,
-        )
-        .unwrap();
-        fs_err::write(
-            &index,
-            format!(
-                r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://example.com/gel-server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#,
+    async fn unavailable_first_source_continues_with_later_source() {
+        enum UnavailableVariant {
+            MissingManifestFile,
+            UnreachableManifestUrl,
+            ManifestPointsAtMissingIndexFile,
+            ManifestPointsAtUnreachableIndexUrl,
+        }
+        use UnavailableVariant::*;
+
+        for (name, variant) in [
+            ("missing manifest file", MissingManifestFile),
+            ("unreachable manifest URL", UnreachableManifestUrl),
+            (
+                "manifest points at missing index file",
+                ManifestPointsAtMissingIndexFile,
             ),
-        )
-        .unwrap();
-
-        let config = Config {
-            sources: vec![
-                RegistrySource::Manifest(Source::File(missing_manifest)),
-                RegistrySource::Manifest(Source::File(manifest)),
-            ],
-        };
-        let loader = SourceLoader::new().unwrap();
-        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
-            .await
+            (
+                "manifest points at unreachable index URL",
+                ManifestPointsAtUnreachableIndexUrl,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let manifest = tmp.path().join("registry.json");
+            fs_err::write(
+                &manifest,
+                br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"stable-linux.json"}]}"#,
+            )
             .unwrap();
+            fs_err::write(tmp.path().join("stable-linux.json"), server_index(HASH)).unwrap();
 
-        assert_eq!(load.catalog.server_packages().len(), 1);
-        assert!(matches!(
-            &load.source_reports[0],
-            SourceReport::Unavailable { .. }
-        ));
-        assert!(matches!(
-            &load.source_reports[1],
-            SourceReport::Healthy { .. }
-        ));
+            let first_source = match variant {
+                MissingManifestFile => {
+                    RegistrySource::Manifest(Source::File(tmp.path().join("missing-registry.json")))
+                }
+                UnreachableManifestUrl => RegistrySource::Manifest(Source::Http(
+                    Url::parse("http://127.0.0.1:1/registry.json").unwrap(),
+                )),
+                ManifestPointsAtMissingIndexFile => {
+                    let first_manifest = tmp.path().join("missing-index-registry.json");
+                    fs_err::write(
+                        &first_manifest,
+                        br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"missing-index.json"}]}"#,
+                    )
+                    .unwrap();
+                    RegistrySource::Manifest(Source::File(first_manifest))
+                }
+                ManifestPointsAtUnreachableIndexUrl => {
+                    let first_manifest = tmp.path().join("network-index-registry.json");
+                    fs_err::write(
+                        &first_manifest,
+                        br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"http://127.0.0.1:1/missing-index.json"}]}"#,
+                    )
+                    .unwrap();
+                    RegistrySource::Manifest(Source::File(first_manifest))
+                }
+            };
+
+            let config = Config {
+                sources: vec![
+                    first_source,
+                    RegistrySource::Manifest(Source::File(manifest)),
+                ],
+            };
+            let loader = SourceLoader::new().unwrap();
+            let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
+                .await
+                .unwrap();
+
+            assert_eq!(load.catalog.server_packages().len(), 1, "{name}");
+            assert!(
+                matches!(&load.source_reports[0], SourceReport::Unavailable { .. }),
+                "{name}"
+            );
+            assert!(
+                matches!(&load.source_reports[1], SourceReport::Healthy { .. }),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1739,47 +2069,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_manifest_failure_continues_when_later_source_has_artifacts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let manifest = tmp.path().join("registry.json");
-        let index = tmp.path().join("stable-linux.json");
-        fs_err::write(
-            &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"stable-linux.json"}]}"#,
-        )
-        .unwrap();
-        fs_err::write(
-            &index,
-            format!(
-                r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://example.com/gel-server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#,
-            ),
-        )
-        .unwrap();
-        let unreachable = Source::Http(Url::parse("http://127.0.0.1:1/registry.json").unwrap());
-        let config = Config {
-            sources: vec![
-                RegistrySource::Manifest(unreachable),
-                RegistrySource::Manifest(Source::File(manifest)),
-            ],
-        };
-        let loader = SourceLoader::new().unwrap();
-
-        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
-            .await
-            .unwrap();
-
-        assert_eq!(load.catalog.server_packages().len(), 1);
-        assert!(matches!(
-            &load.source_reports[0],
-            SourceReport::Unavailable { .. }
-        ));
-        assert!(matches!(
-            &load.source_reports[1],
-            SourceReport::Healthy { .. }
-        ));
-    }
-
-    #[tokio::test]
     async fn malformed_second_source_is_rejected_after_valid_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
         let valid_manifest = tmp.path().join("valid-registry.json");
@@ -1814,97 +2103,6 @@ mod tests {
         assert!(matches!(
             &load.source_reports[1],
             SourceReport::Rejected { .. }
-        ));
-    }
-    #[tokio::test]
-    async fn missing_selected_index_continues_when_later_source_has_artifacts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let missing_manifest = tmp.path().join("missing-index-registry.json");
-        let manifest = tmp.path().join("registry.json");
-        let index = tmp.path().join("stable-linux.json");
-        fs_err::write(
-            &missing_manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"missing-index.json"}]}"#,
-        )
-        .unwrap();
-        fs_err::write(
-            &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"stable-linux.json"}]}"#,
-        )
-        .unwrap();
-        fs_err::write(
-            &index,
-            format!(
-                r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://example.com/gel-server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#,
-            ),
-        )
-        .unwrap();
-
-        let config = Config {
-            sources: vec![
-                RegistrySource::Manifest(Source::File(missing_manifest)),
-                RegistrySource::Manifest(Source::File(manifest)),
-            ],
-        };
-        let loader = SourceLoader::new().unwrap();
-        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
-            .await
-            .unwrap();
-
-        assert_eq!(load.catalog.server_packages().len(), 1);
-        assert!(matches!(
-            &load.source_reports[0],
-            SourceReport::Unavailable { .. }
-        ));
-        assert!(matches!(
-            &load.source_reports[1],
-            SourceReport::Healthy { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn network_selected_index_failure_continues_when_later_source_has_artifacts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let unreachable_index_manifest = tmp.path().join("network-index-registry.json");
-        let manifest = tmp.path().join("registry.json");
-        let index = tmp.path().join("stable-linux.json");
-        fs_err::write(
-            &unreachable_index_manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"http://127.0.0.1:1/missing-index.json"}]}"#,
-        )
-        .unwrap();
-        fs_err::write(
-            &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"stable-linux.json"}]}"#,
-        )
-        .unwrap();
-        fs_err::write(
-            &index,
-            format!(
-                r#"{{"packages":[{{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://example.com/gel-server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}]}}"#,
-            ),
-        )
-        .unwrap();
-
-        let config = Config {
-            sources: vec![
-                RegistrySource::Manifest(Source::File(unreachable_index_manifest)),
-                RegistrySource::Manifest(Source::File(manifest)),
-            ],
-        };
-        let loader = SourceLoader::new().unwrap();
-        let load = Catalog::load(&config, &loader, Channel::Stable, "linux")
-            .await
-            .unwrap();
-
-        assert_eq!(load.catalog.server_packages().len(), 1);
-        assert!(matches!(
-            &load.source_reports[0],
-            SourceReport::Unavailable { .. }
-        ));
-        assert!(matches!(
-            &load.source_reports[1],
-            SourceReport::Healthy { .. }
         ));
     }
 }

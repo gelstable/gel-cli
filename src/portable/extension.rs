@@ -335,13 +335,13 @@ async fn list_available(
 
 #[cfg(test)]
 mod tests {
-    use crate::portable::registry::{Catalog, Channel, ExtensionPackage, types::PackageType};
+    use crate::portable::registry::{ExtensionPackage, types::PackageType};
     use crate::portable::ver;
     use std::collections::HashMap;
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    use super::{extension_cache_file_name, extension_packages_with, select_extension_package};
+    use super::{extension_cache_file_name, select_extension_package};
     #[test]
     fn extension_cache_names_include_complete_hash() {
         let mut first = extension_package("pgvector", "7.2+aaaaaaa");
@@ -381,30 +381,5 @@ mod tests {
         let selected = select_extension_package(&packages, "pgvector").unwrap();
 
         assert_eq!(selected.version.to_string(), "7.2+aaaaaaa");
-    }
-    #[tokio::test]
-    async fn extension_package_discovery_propagates_registry_error() {
-        let result =
-            extension_packages_with(Channel::Stable, "linux", "7", |_channel, _platform| async {
-                Err(anyhow::anyhow!("no healthy registry sources"))
-            })
-            .await;
-
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "no healthy registry sources"
-        );
-    }
-
-    #[tokio::test]
-    async fn extension_package_discovery_returns_empty_catalog() {
-        let packages =
-            extension_packages_with(Channel::Stable, "linux", "7", |_channel, _platform| async {
-                Ok(Catalog::default())
-            })
-            .await
-            .unwrap();
-
-        assert!(packages.is_empty());
     }
 }

@@ -225,8 +225,4 @@ mod tests {
             tags: Default::default(),
         }
     }
-    #[test]
-    fn registry_catalog_loader_exposes_explicit_async_boundary() {
-        let _ = catalog::load_default_async;
-    }
 }

@@ -88,6 +88,7 @@ pub struct ServerPackage {
     pub version: ver::Build,
     pub url: url::Url,
     pub size: u64,
+    #[serde(serialize_with = "serialize_digest_with_scheme")]
     pub hash: Blake2bDigest,
     pub kind: PackageType,
     pub slot: String,
@@ -95,7 +96,6 @@ pub struct ServerPackage {
 }
 
 #[derive(Debug, Clone)]
-
 pub struct CliPackage {
     pub version: ver::Semver,
     pub url: url::Url,
@@ -110,6 +110,7 @@ pub struct ExtensionPackage {
     pub version: ver::Build,
     pub url: url::Url,
     pub size: u64,
+    #[serde(serialize_with = "serialize_digest_with_scheme")]
     pub hash: Blake2bDigest,
     pub kind: PackageType,
     pub slot: String,
@@ -155,8 +156,22 @@ impl fmt::Display for ArtifactIdentity {
     }
 }
 
+/// Canonical text form is bare lowercase hex (`Display`, `Serialize`,
+/// `Deserialize`), matching the wire field `installrefs[].verification.blake2b`.
+/// A `blake2b:` prefix is a display convention owned by call sites that need it
+/// (see `serialize_digest_with_scheme`), not a property of the digest itself.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Blake2bDigest([u8; 64]);
+
+pub(crate) fn serialize_digest_with_scheme<S>(
+    digest: &Blake2bDigest,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: ser::Serializer,
+{
+    serializer.serialize_str(&format!("blake2b:{digest}"))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DigestParseError {
@@ -803,6 +818,55 @@ mod tests {
             .parse::<Blake2bDigest>()
             .unwrap_err();
         assert!(matches!(error, DigestParseError::InvalidHex(_)));
+    }
+
+    #[test]
+    fn server_package_json_hash_is_scheme_prefixed() {
+        let hash = "ab".repeat(64);
+        let package = ServerPackage {
+            name: "gel-server".to_string(),
+            version: "7.0+abcdef0".parse().unwrap(),
+            url: url::Url::parse("https://example.com/server.tar.zst").unwrap(),
+            size: 10,
+            hash: hash.parse().unwrap(),
+            kind: PackageType::TarZst,
+            slot: "7".to_string(),
+            tags: HashMap::new(),
+        };
+
+        let value = serde_json::to_value(&package).unwrap();
+
+        assert_eq!(value["hash"], format!("blake2b:{hash}"));
+    }
+
+    #[test]
+    fn extension_package_json_hash_is_scheme_prefixed() {
+        let hash = "ab".repeat(64);
+        let package = ExtensionPackage {
+            name: "pgvector".to_string(),
+            version: "7.0+abcdef0".parse().unwrap(),
+            url: url::Url::parse("https://example.com/pgvector.zip").unwrap(),
+            size: 10,
+            hash: hash.parse().unwrap(),
+            kind: PackageType::Zip,
+            slot: "7".to_string(),
+            tags: HashMap::new(),
+        };
+
+        let value = serde_json::to_value(&package).unwrap();
+
+        assert_eq!(value["hash"], format!("blake2b:{hash}"));
+    }
+
+    #[test]
+    fn blake2b_digest_value_serialization_stays_bare_hex() {
+        let hash = "ab".repeat(64);
+        let digest: Blake2bDigest = hash.parse().unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&digest).unwrap(),
+            format!("\"{hash}\"")
+        );
     }
 
     #[test]

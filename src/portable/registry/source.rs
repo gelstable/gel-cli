@@ -31,6 +31,32 @@ pub(crate) fn legacy_index_url(
     .map_err(Into::into)
 }
 
+/// Classification of a reference string found in a manifest or package index.
+pub(crate) enum ReferenceKind {
+    HttpUrl(Url),
+    FileUrl(Url),
+    Relative,
+    UnsupportedScheme(String),
+}
+
+pub(crate) fn classify_reference(value: &str) -> ReferenceKind {
+    if let Ok(url) = Url::parse(value) {
+        match url.scheme() {
+            "http" | "https" => return ReferenceKind::HttpUrl(url),
+            "file" => return ReferenceKind::FileUrl(url),
+            scheme if value.contains("://") => {
+                return ReferenceKind::UnsupportedScheme(scheme.to_string());
+            }
+            _ => {} // colon-in-first-segment relative ref, e.g. "release:2026/x"
+        }
+    }
+    ReferenceKind::Relative
+}
+
+pub(crate) fn relative_http_ref(value: &str) -> String {
+    value.replacen(':', "%3A", 1)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     Http(Url),
@@ -89,13 +115,14 @@ impl SourceLoader {
     }
 
     pub async fn load_manifest(&self, source: &Source) -> Result<Vec<u8>, SourceError> {
-        match source {
-            Source::Http(url) => self.load_http(url).await,
-            Source::File(path) => self.load_file(path).await,
-        }
+        self.load(source).await
     }
 
     pub async fn load_index(&self, source: &Source) -> Result<Vec<u8>, SourceError> {
+        self.load(source).await
+    }
+
+    async fn load(&self, source: &Source) -> Result<Vec<u8>, SourceError> {
         match source {
             Source::Http(url) => self.load_http(url).await,
             Source::File(path) => self.load_file(path).await,

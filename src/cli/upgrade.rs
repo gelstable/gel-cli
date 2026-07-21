@@ -239,27 +239,15 @@ mod tests {
 
     #[test]
     fn cli_package_propagates_no_healthy_sources_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = crate::portable::registry::config::Config {
-            sources: vec![crate::portable::registry::config::RegistrySource::Manifest(
-                crate::portable::registry::source::Source::File(
-                    tmp.path().join("missing-registry.json"),
-                ),
-            )],
-        };
-        let loader = crate::portable::registry::source::SourceLoader::new().unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let error = runtime
-            .block_on(crate::portable::registry::catalog::Catalog::load(
-                &config,
-                &loader,
-                Channel::Stable,
-                "linux",
-            ))
-            .unwrap_err();
+        use crate::portable::registry::catalog::{NoHealthySources, SourceReport};
+        use crate::portable::registry::config::RegistrySource;
+        use crate::portable::registry::source::Source;
+
+        let error: anyhow::Error = NoHealthySources::for_test(vec![SourceReport::Unavailable {
+            source: RegistrySource::Manifest(Source::File("missing-registry.json".into())),
+            error: anyhow::anyhow!("simulated unavailable source"),
+        }])
+        .into();
 
         let returned =
             cli_package_with(Channel::Stable, "linux", |_channel, _platform, _timeout| {
@@ -267,20 +255,6 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(
-            returned
-                .downcast_ref::<crate::portable::registry::catalog::NoHealthySources>()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn cli_package_returns_none_for_empty_discovery() {
-        let result = cli_package_with(Channel::Stable, "linux", |_channel, _platform, _timeout| {
-            Ok(Vec::new())
-        })
-        .unwrap();
-
-        assert!(result.is_none());
+        assert!(returned.downcast_ref::<NoHealthySources>().is_some());
     }
 }

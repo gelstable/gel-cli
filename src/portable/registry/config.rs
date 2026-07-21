@@ -297,29 +297,19 @@ mod tests {
     #[test]
     fn load_reads_registry_sources_from_cli_toml_not_gel_toml() {
         let _lock = crate::cli::env::test_env_lock();
-        let env_names = ["HOME", "XDG_CONFIG_HOME", "GEL_PKG_ROOT", "EDGEDB_PKG_ROOT"];
-        let previous = env_names
-            .iter()
-            .map(|name| (*name, std::env::var_os(name)))
-            .collect::<Vec<_>>();
-        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                for (name, value) in self.0.drain(..) {
-                    unsafe {
-                        match value {
-                            Some(value) => std::env::set_var(name, value),
-                            None => std::env::remove_var(name),
-                        }
-                    }
-                }
-            }
-        }
-        let _restore = Restore(previous);
+        let env = crate::cli::env::RestoreEnv::new(&[
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "GEL_PKG_ROOT",
+            "EDGEDB_PKG_ROOT",
+        ]);
         let tmp = tempfile::tempdir().unwrap();
+        env.set("HOME", &tmp.path().display().to_string());
+        env.set(
+            "XDG_CONFIG_HOME",
+            &tmp.path().join("config").display().to_string(),
+        );
         unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
             std::env::remove_var("GEL_PKG_ROOT");
             std::env::remove_var("EDGEDB_PKG_ROOT");
         }

@@ -14,6 +14,9 @@ pub(crate) mod manifest;
 pub(crate) mod source;
 pub(crate) mod types;
 
+#[cfg(test)]
+mod fixture_tests;
+
 pub(crate) use catalog::{Catalog, CatalogLoad, load_default_async};
 pub(crate) use config::Config;
 pub(crate) use download::{

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "indexes": [
+    {"channel": "stable", "platform": "x86_64-unknown-linux-gnu", "url": "stable-x86_64-unknown-linux-gnu.json"},
+    {"channel": "testing", "platform": "x86_64-unknown-linux-gnu", "url": "testing-x86_64-unknown-linux-gnu.json"},
+    {"channel": "nightly", "platform": "x86_64-unknown-linux-gnu", "url": "nightly-x86_64-unknown-linux-gnu.json"},
+    {"channel": "stable", "platform": "x86_64-unknown-linux-musl", "url": "stable-x86_64-unknown-linux-musl.json"},
+    {"channel": "testing", "platform": "x86_64-unknown-linux-musl", "url": "testing-x86_64-unknown-linux-musl.json"},
+    {"channel": "nightly", "platform": "x86_64-unknown-linux-musl", "url": "nightly-x86_64-unknown-linux-musl.json"},
+    {"channel": "stable", "platform": "aarch64-unknown-linux-gnu", "url": "stable-aarch64-unknown-linux-gnu.json"},
+    {"channel": "testing", "platform": "aarch64-unknown-linux-gnu", "url": "testing-aarch64-unknown-linux-gnu.json"},
+    {"channel": "nightly", "platform": "aarch64-unknown-linux-gnu", "url": "nightly-aarch64-unknown-linux-gnu.json"},
+    {"channel": "stable", "platform": "aarch64-unknown-linux-musl", "url": "stable-aarch64-unknown-linux-musl.json"},
+    {"channel": "testing", "platform": "aarch64-unknown-linux-musl", "url": "testing-aarch64-unknown-linux-musl.json"},
+    {"channel": "nightly", "platform": "aarch64-unknown-linux-musl", "url": "nightly-aarch64-unknown-linux-musl.json"},
+    {"channel": "stable", "platform": "x86_64-apple-darwin", "url": "stable-x86_64-apple-darwin.json"},
+    {"channel": "testing", "platform": "x86_64-apple-darwin", "url": "testing-x86_64-apple-darwin.json"},
+    {"channel": "nightly", "platform": "x86_64-apple-darwin", "url": "nightly-x86_64-apple-darwin.json"},
+    {"channel": "stable", "platform": "aarch64-apple-darwin", "url": "stable-aarch64-apple-darwin.json"},
+    {"channel": "testing", "platform": "aarch64-apple-darwin", "url": "testing-aarch64-apple-darwin.json"},
+    {"channel": "nightly", "platform": "aarch64-apple-darwin", "url": "nightly-aarch64-apple-darwin.json"}
+  ]
+}

@@ -147,13 +147,13 @@ fn validate_package(
     package: &PackageData,
 ) -> Result<Option<ValidatedArtifact>, IndexValidationError> {
     if matches!(package.basename.as_str(), "gel-server" | "edgedb-server") {
-        return validate_server(index_source, artifact_base, package).map(Some);
+        return validate_server(index_source, artifact_base, package);
     }
     if matches!(package.basename.as_str(), "gel-cli" | "edgedb-cli") {
-        return validate_cli(index_source, artifact_base, platform, package).map(Some);
+        return validate_cli(index_source, artifact_base, platform, package);
     }
     if package.tags.contains_key("extension") {
-        return validate_extension(index_source, artifact_base, package).map(Some);
+        return validate_extension(index_source, artifact_base, package);
     }
     Ok(None)
 }
@@ -162,10 +162,14 @@ fn validate_server(
     index_source: &Source,
     artifact_base: &Source,
     package: &PackageData,
-) -> Result<ValidatedArtifact, IndexValidationError> {
-    let installref = select_installref(index_source, package, |installref| {
+) -> Result<Option<ValidatedArtifact>, IndexValidationError> {
+    let installref = match select_installref(index_source, package, |installref| {
         installref.kind == "application/x-tar" && installref.encoding.as_deref() == Some("zstd")
-    })?;
+    }) {
+        Ok(Some(installref)) => installref,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let version = package.version.parse::<ver::Build>().map_err(|error| {
         IndexValidationError::new(index_source, package, "version", error.to_string())
     })?;
@@ -183,7 +187,7 @@ fn validate_server(
         version: package.version.clone().into_boxed_str(),
         slot: package.slot.clone().into_boxed_str(),
     };
-    Ok(ValidatedArtifact::Server(
+    Ok(Some(ValidatedArtifact::Server(
         identity,
         ServerPackage {
             name: package.basename.clone(),
@@ -195,7 +199,7 @@ fn validate_server(
             slot: package.slot.clone(),
             tags: package.tags.clone(),
         },
-    ))
+    )))
 }
 
 fn validate_cli(
@@ -203,7 +207,7 @@ fn validate_cli(
     artifact_base: &Source,
     platform: &str,
     package: &PackageData,
-) -> Result<ValidatedArtifact, IndexValidationError> {
+) -> Result<Option<ValidatedArtifact>, IndexValidationError> {
     let media_type = cli_media_type(platform).ok_or_else(|| {
         IndexValidationError::new(
             index_source,
@@ -212,7 +216,7 @@ fn validate_cli(
             format!("no CLI artifact media type for platform {platform}"),
         )
     })?;
-    let installref = package
+    let installref = match package
         .installrefs
         .iter()
         .find(|installref| {
@@ -222,24 +226,20 @@ fn validate_cli(
             package.installrefs.iter().find(|installref| {
                 installref.kind == media_type && installref.encoding.as_deref() == Some("identity")
             })
-        })
-        .ok_or_else(|| {
+        }) {
+        Some(installref) => installref,
+        None => {
             if package.installrefs.is_empty() {
-                IndexValidationError::new(
+                return Err(IndexValidationError::new(
                     index_source,
                     package,
                     "installrefs",
                     "package has no installrefs",
-                )
-            } else {
-                IndexValidationError::new(
-                    index_source,
-                    package,
-                    "installrefs.type",
-                    format!("no {media_type} CLI installref with zstd or identity encoding"),
-                )
+                ));
             }
-        })?;
+            return Ok(None);
+        }
+    };
     let version = package.version.parse::<ver::Semver>().map_err(|error| {
         IndexValidationError::new(index_source, package, "version", error.to_string())
     })?;
@@ -256,7 +256,7 @@ fn validate_cli(
         name: package.basename.clone().into_boxed_str(),
         version: package.version.clone().into_boxed_str(),
     };
-    Ok(ValidatedArtifact::Cli(
+    Ok(Some(ValidatedArtifact::Cli(
         identity,
         CliPackage {
             version,
@@ -266,14 +266,14 @@ fn validate_cli(
             compression: (installref.encoding.as_deref() == Some("zstd"))
                 .then_some(Compression::Zstd),
         },
-    ))
+    )))
 }
 
 fn validate_extension(
     index_source: &Source,
     artifact_base: &Source,
     package: &PackageData,
-) -> Result<ValidatedArtifact, IndexValidationError> {
+) -> Result<Option<ValidatedArtifact>, IndexValidationError> {
     let extension_name = package
         .tags
         .get("extension")
@@ -298,9 +298,13 @@ fn validate_extension(
                 "server_slot tag is missing or empty",
             )
         })?;
-    let installref = select_installref(index_source, package, |installref| {
+    let installref = match select_installref(index_source, package, |installref| {
         installref.kind == "application/zip" && installref.encoding.as_deref() == Some("identity")
-    })?;
+    }) {
+        Ok(Some(installref)) => installref,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let version = package.version.parse::<ver::Build>().map_err(|error| {
         IndexValidationError::new(index_source, package, "version", error.to_string())
     })?;
@@ -318,7 +322,7 @@ fn validate_extension(
         version: package.version.clone().into_boxed_str(),
         server_slot: server_slot.clone().into_boxed_str(),
     };
-    Ok(ValidatedArtifact::Extension(
+    Ok(Some(ValidatedArtifact::Extension(
         identity,
         ExtensionPackage {
             name: extension_name.clone(),
@@ -330,14 +334,14 @@ fn validate_extension(
             slot: package.slot.clone(),
             tags: package.tags.clone(),
         },
-    ))
+    )))
 }
 
 fn select_installref<'a, F>(
     index_source: &Source,
     package: &'a PackageData,
     matches: F,
-) -> Result<&'a InstallRef, IndexValidationError>
+) -> Result<Option<&'a InstallRef>, IndexValidationError>
 where
     F: Fn(&InstallRef) -> bool,
 {
@@ -349,18 +353,10 @@ where
             "package has no installrefs",
         ));
     }
-    package
+    Ok(package
         .installrefs
         .iter()
-        .find(|installref| matches(installref))
-        .ok_or_else(|| {
-            IndexValidationError::new(
-                index_source,
-                package,
-                "installrefs.type",
-                "no compatible installref",
-            )
-        })
+        .find(|installref| matches(installref)))
 }
 
 fn parse_installref_digest(
@@ -465,13 +461,42 @@ mod tests {
     }
 
     #[test]
-    fn wrong_platform_cli_media_type_rejects_index() {
+    fn wrong_platform_cli_media_type_is_skipped() {
+        // The package has installrefs, but none in the media type its platform
+        // requires (dosexec offered, x-pie-executable needed). That is
+        // "format not available", which skips the package rather than rejecting
+        // the whole index.
         let index = cli_index("", "application/x-dosexec", HASH);
         let source = Source::Http(Url::parse("https://example.com/index.json").unwrap());
-        let error = index
+        let validated = index
             .validate(&source, &source, "x86_64-unknown-linux-musl")
-            .unwrap_err();
-        assert_eq!(error.field, "installrefs.type");
+            .unwrap();
+        assert!(validated.artifacts.is_empty());
+    }
+
+    #[test]
+    fn skips_package_with_no_compatible_installref() {
+        // Regression: an extension packaged only as a tarball (the upstream
+        // `edgedb-server-6-dev8877-postgis` shape) must be skipped because no
+        // installref matches the zip+identity format extensions require. The
+        // co-resident valid gel-server must still validate, and the index as a
+        // whole must remain healthy.
+        let json = format!(
+            r#"{{"packages":[
+                {{"basename":"gel-server","version":"7.0+abcdef0","slot":"7","tags":{{}},"installrefs":[{{"ref":"https://example.com/server.tar.zst","type":"application/x-tar","encoding":"zstd","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}},
+                {{"basename":"edgedb-server-6-dev8877-postgis","version":"7.0+abcdef0","slot":"6-dev8877","tags":{{"extension":"postgis","server_slot":"6-dev8877"}},"installrefs":[{{"ref":"https://example.com/postgis.tar.gz","type":"application/x-tar","encoding":"gzip","verification":{{"size":10,"blake2b":"{HASH}"}}}}]}}
+            ]}}"#
+        );
+        let index = IndexDocument::from_slice(json.as_bytes()).unwrap();
+        let source = Source::Http(Url::parse("https://example.com/index.json").unwrap());
+        let validated = index
+            .validate(&source, &source, "x86_64-unknown-linux-gnu")
+            .unwrap();
+        assert_eq!(validated.artifacts.len(), 1);
+        assert!(matches!(
+            &validated.artifacts[0],
+            ValidatedArtifact::Server(..)
+        ));
     }
 
     #[test]

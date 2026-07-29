@@ -23,18 +23,30 @@ $ curl --proto '=https' --tlsv1.2 -sSfL https://geldata.com/sh | sh -s -- --nigh
 Development
 ===========
 
-Use cargo for building it:
+This repository is set up for Nix + `direnv` development to ensure a pinned Rust toolchain and development dependencies (such as `gel-server`) are active.
 
+### Prerequisites
+
+- [Nix](https://nixos.org/) with [Flakes enabled](https://nixos.wiki/wiki/Flakes)
+- [direnv](https://direnv.net/) (with [nix-direnv](https://github.com/nix-community/nix-direnv) recommended for caching devshell builds)
+
+After cloning the repository, allow `direnv` once to load the environment automatically:
+
+```bash
+direnv allow
 ```
+
+Once allowed, your shell will automatically load the dev environment when entering this directory. You can run standard cargo commands directly:
+
+```bash
 cargo build
 cargo run -- --admin -d tutorial
 cargo test
 ```
 
-This repository is set up for `direnv` + Nix development. After cloning, run
-`direnv allow` once and then prefer commands like `direnv exec . bash -lc 'cargo test'`
-so the pinned toolchain and shell environment are always active.
+Alternatively, if you don't have `direnv` hooked into your shell, you can enter the environment with `nix develop` or `direnv exec . bash`.
 
+If you do not use Nix or direnv, standard `cargo` commands (`cargo build`, `cargo test`) will still work if you have a compatible Rust toolchain installed locally.
 Tests
 =====
 
@@ -73,8 +85,8 @@ When opening pull requests, it is advised to run the following commands
 before doing so:
 
 ```bash
-$ cargo clippy --all-features --workspace --all-targets
-$ cargo fmt
+cargo clippy --all-features --workspace --all-targets
+cargo fmt
 ```
 
 

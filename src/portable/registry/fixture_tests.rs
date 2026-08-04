@@ -86,10 +86,7 @@ async fn conflicting_mirror_excludes_contested_identity() {
         .as_str()
         .expect("version present")
         .to_owned();
-    let contested_slot = target["slot"]
-        .as_str()
-        .expect("slot present")
-        .to_owned();
+    let contested_slot = target["slot"].as_str().expect("slot present").to_owned();
     for installref in target["installrefs"]
         .as_array_mut()
         .expect("installrefs array")

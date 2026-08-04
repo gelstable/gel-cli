@@ -48,15 +48,12 @@ jobs:
         include:
           - name: linux-x64
             runner: blacksmith-8vcpu-ubuntu-2404
-            shell: bash
             command: scripts/ci/test-unix.sh
           - name: macos-arm64
             runner: blacksmith-6vcpu-macos-15
-            shell: bash
             command: scripts/ci/test-unix.sh
           - name: windows-x64
             runner: blacksmith-8vcpu-windows-2025
-            shell: pwsh
             command: scripts/ci/test-windows.ps1
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0

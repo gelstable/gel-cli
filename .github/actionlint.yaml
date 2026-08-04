@@ -1,0 +1,6 @@
+# Registers the three managed Blacksmith custom labels for actionlint; it does not select `runs-on: self-hosted`.
+self-hosted-runner:
+  labels:
+    - blacksmith-8vcpu-ubuntu-2404
+    - blacksmith-6vcpu-macos-15
+    - blacksmith-8vcpu-windows-2025

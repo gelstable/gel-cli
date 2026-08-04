@@ -114,7 +114,24 @@
         "edgedb": "edgedb",
         "fenix": "fenix",
         "flake-parts": "flake-parts",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "tooling-nixpkgs": "tooling-nixpkgs"
+      }
+    },
+    "tooling-nixpkgs": {
+      "locked": {
+        "lastModified": 1785692966,
+        "narHash": "sha256-vUfIeBEfpbAfZ5zjgIkYk7eHBeVfCYVjLbWnMkseYnk=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "643809054d65fdd466a63e3155b8c498cb483c04",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "643809054d65fdd466a63e3155b8c498cb483c04",
+        "type": "github"
       }
     }
   },

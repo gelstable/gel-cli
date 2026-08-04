@@ -47,6 +47,8 @@ cargo test
 Alternatively, if you don't have `direnv` hooked into your shell, you can enter the environment with `nix develop` or `direnv exec . bash`.
 
 If you do not use Nix or direnv, standard `cargo` commands (`cargo build`, `cargo test`) will still work if you have a compatible Rust toolchain installed locally.
+
+
 Tests
 =====
 

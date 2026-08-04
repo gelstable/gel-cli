@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUST_VERSION: "1.88"
+
+jobs:
+  quality:
+    name: quality
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          submodules: recursive
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6691ebadcb18182cc1391d07c9f295f657c593cd # 1.88.0
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - name: Check quality
+        run: |
+          cargo fmt --check
+          cargo clippy --all-features --workspace --all-targets
+          install_root="$RUNNER_TEMP/gel-cli-install"
+          cargo install --locked --path . --root "$install_root"
+          "$install_root/bin/gel" --version
+          scripts/ci/check-action-pins.sh
+          "$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml
+
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: blacksmith-8vcpu-ubuntu-2404
+            shell: bash
+            command: scripts/ci/test-unix.sh
+          - name: macos-arm64
+            runner: blacksmith-6vcpu-macos-15
+            shell: bash
+            command: scripts/ci/test-unix.sh
+          - name: windows-x64
+            runner: blacksmith-8vcpu-windows-2025
+            shell: pwsh
+            command: scripts/ci/test-windows.ps1
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          submodules: recursive
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6691ebadcb18182cc1391d07c9f295f657c593cd # 1.88.0
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Test
+        run: ${{ matrix.command }}

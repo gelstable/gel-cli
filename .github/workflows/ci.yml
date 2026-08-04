@@ -27,6 +27,7 @@ jobs:
         uses: dtolnay/rust-toolchain@6691ebadcb18182cc1391d07c9f295f657c593cd # 1.88.0
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
       - name: Install actionlint
         run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
       - name: Check quality

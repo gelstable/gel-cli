@@ -49,6 +49,7 @@
             (assert tooling_pkgs.knope.version == "0.23.0"; tooling_pkgs.knope)
             (assert tooling_pkgs.cargo-dist.version == "0.32.0"; tooling_pkgs.cargo-dist)
           ];
+          # This pinned cargo-dist package exposes `dist`; the wrapper supplies Cargo's `cargo-dist` plugin name.
           cargo_dist_wrapper = pkgs.writeShellScriptBin "cargo-dist" ''
             exec ${tooling_pkgs.cargo-dist}/bin/dist "$@"
           '';
@@ -58,6 +59,7 @@
             pkgs.gh
             pkgs.jq
             pkgs.python3
+            pkgs.ripgrep
             pkgs.shellcheck
             pkgs.zstd
           ] ++ pkgs.lib.optional (builtins.hasAttr "powershell" pkgs) pkgs.powershell;

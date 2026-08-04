@@ -48,10 +48,6 @@ Alternatively, if you don't have `direnv` hooked into your shell, you can enter 
 
 If you do not use Nix or direnv, standard `cargo` commands (`cargo build`, `cargo test`) will still work if you have a compatible Rust toolchain installed locally.
 
-CI bootstrap status
-===================
-
-The repository is in release freeze until the stable pipeline lands. CI runs server-independent Rust tests on Linux x64, macOS arm64, and Windows x64. Local tools come from `direnv`/Nix, while GitHub Actions installs pinned tools directly. Server-dependent CLI tests are intentionally outside the required bootstrap gate pending a gelstable-controlled fixture.
 
 Tests
 =====

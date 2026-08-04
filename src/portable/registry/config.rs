@@ -175,26 +175,31 @@ mod tests {
 
     #[test]
     fn parses_http_file_and_relative_sources() {
-        let cfg = parse(
-            r#"
-            [registry]
-            sources = [
-              "https://example.com/registry.json",
-              "file:///tmp/registry.json",
-              "./fixtures/registry.json",
-            ]
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.sources[0].to_string(),
-            "https://example.com/registry.json"
-        );
-        assert_eq!(cfg.sources[1].to_string(), "/tmp/registry.json");
-        assert_eq!(
-            cfg.sources[2].to_string(),
-            "/home/me/.config/gel/fixtures/registry.json"
-        );
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config").join("cli.toml");
+        let file_path = temp.path().join("registry.json");
+        let relative_path = config_path.parent().unwrap().join("fixtures/registry.json");
+        let sources = vec![
+            "https://example.com/registry.json".to_owned(),
+            Url::from_file_path(&file_path).unwrap().into(),
+            "./fixtures/registry.json".to_owned(),
+        ];
+
+        let cfg = Config::from_inputs(None, &sources, &config_path, DEFAULT_SOURCE).unwrap();
+
+        assert!(matches!(
+            &cfg.sources[0],
+            RegistrySource::Manifest(Source::Http(url))
+                if url == &Url::parse("https://example.com/registry.json").unwrap()
+        ));
+        assert!(matches!(
+            &cfg.sources[1],
+            RegistrySource::Manifest(Source::File(path)) if path == &file_path
+        ));
+        assert!(matches!(
+            &cfg.sources[2],
+            RegistrySource::Manifest(Source::File(path)) if path == &relative_path
+        ));
     }
 
     #[test]

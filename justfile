@@ -11,8 +11,8 @@ cargo-build:
 clitest *ARGS: cargo-build
   #!/bin/bash
   set -euf -o pipefail
-  CLITEST_VERSION=$(grep 'CLITEST_VERSION:' .github/workflows/new-tests.yml | sed 's/.*CLITEST_VERSION: "=\([^"]*\)"/\1/')
-  cargo install clitest@$CLITEST_VERSION
+  CLITEST_VERSION=0.2.0
+  cargo install "clitest@$CLITEST_VERSION"
   DEBUG_TARGET=`pwd`/target/debug/
 
   ARGS="{{ARGS}}"

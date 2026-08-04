@@ -37,7 +37,7 @@ jobs:
           cargo install --locked --path . --root "$install_root"
           "$install_root/bin/gel" --version
           scripts/ci/check-action-pins.sh .github/workflows/ci.yml
-          "$(go env GOPATH)/bin/actionlint" .github/workflows/ci.yml
+          "$(go env GOPATH)/bin/actionlint" -config-file scripts/ci/actionlint.yaml .github/workflows/ci.yml
 
   test:
     name: test (${{ matrix.name }})

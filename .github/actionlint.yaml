@@ -1,6 +1,5 @@
-# Registers the three managed Blacksmith custom labels for actionlint; it does not select `runs-on: self-hosted`.
+# actionlint does not yet recognize GitHub's standard windows-11-arm preview label.
+# Registering it here affects linting only; the workflow still uses a GitHub-hosted runner.
 self-hosted-runner:
   labels:
-    - blacksmith-8vcpu-ubuntu-2404
-    - blacksmith-6vcpu-macos-15
-    - blacksmith-8vcpu-windows-2025
+    - windows-11-arm

@@ -18,7 +18,7 @@ env:
 jobs:
   quality:
     name: quality
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -48,13 +48,16 @@ jobs:
       matrix:
         include:
           - name: linux-x64
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runner: ubuntu-24.04
             command: scripts/ci/test-unix.sh
           - name: macos-arm64
-            runner: blacksmith-6vcpu-macos-15
+            runner: macos-15
             command: scripts/ci/test-unix.sh
           - name: windows-x64
-            runner: blacksmith-8vcpu-windows-2025
+            runner: windows-2025
+            command: scripts/ci/test-windows.ps1
+          - name: windows-arm64
+            runner: windows-11-arm
             command: scripts/ci/test-windows.ps1
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0

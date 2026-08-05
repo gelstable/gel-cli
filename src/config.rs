@@ -13,7 +13,17 @@ use crate::repl;
 pub struct Config {
     #[serde(skip, default)]
     pub file_name: Option<PathBuf>,
+    #[serde(default)]
     pub shell: ShellConfig,
+    #[serde(default)]
+    pub registry: RegistryConfig,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RegistryConfig {
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, PartialEq, Eq)]
@@ -92,6 +102,32 @@ mod tests {
         std::fs::write(&tempfile, "[shell]\n").unwrap();
         let config = read_config(tempfile).unwrap();
         assert_eq!(config.shell, ShellConfig::default());
+    }
+
+    #[test]
+    fn registry_only_cli_config_keeps_shell_optional() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("cli.toml");
+        std::fs::write(
+            &path,
+            "[registry]\nsources = [\"https://example.com/registry.json\"]\n",
+        )
+        .unwrap();
+
+        let config = read_config(path).unwrap();
+
+        assert_eq!(config.shell, ShellConfig::default());
+    }
+
+    #[test]
+    fn unknown_registry_fields_are_rejected() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("cli.toml");
+        std::fs::write(&path, "[shell]\n[registry]\nunknown = true\n").unwrap();
+
+        let error = read_config(path).unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown"));
     }
 
     #[test]

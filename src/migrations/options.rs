@@ -6,7 +6,7 @@ use clap::ValueHint;
 use crate::branding::BRANDING;
 use crate::migrations;
 use crate::options::ConnectionOptions;
-use crate::portable::repository::Channel;
+use crate::portable::registry::Channel;
 use crate::portable::ver;
 
 use gel_cli_derive::IntoArgs;

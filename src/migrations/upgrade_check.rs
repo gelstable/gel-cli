@@ -19,7 +19,7 @@ use crate::migrations::migration;
 use crate::migrations::options::UpgradeCheck;
 use crate::migrations::timeout;
 use crate::portable::local::InstallInfo;
-use crate::portable::repository::{self, PackageInfo, Query};
+use crate::portable::registry::{self, Query, QuerySelector, ServerPackage};
 use crate::portable::server::install;
 use crate::print::{self, Highlight, msg};
 use crate::process;
@@ -78,18 +78,16 @@ pub fn upgrade_check(_options: &Options, options: &UpgradeCheck) -> anyhow::Resu
 
     use crate::branding::{BRANDING, BRANDING_SERVER};
 
-    let (version, _) = Query::from_options(
-        repository::QueryOptions {
-            nightly: options.to_nightly,
-            stable: false,
-            testing: options.to_testing,
-            version: options.to_version.as_ref(),
-            channel: options.to_channel,
-        },
-        || Ok(Query::stable()),
-    )?;
+    let selector = QuerySelector::from_upgrade_flags(
+        options.to_version.as_ref(),
+        options.to_channel,
+        options.to_nightly,
+        options.to_testing,
+        false,
+    );
+    let (version, _) = Query::from_selector(selector, || Ok(Query::stable()))?;
 
-    let pkg = repository::get_server_package(&version)?
+    let pkg = registry::get_server_package(&version)?
         .with_context(|| format!("no package matching {} found", version.display()))?;
     let info = install::package(&pkg).context(concatcp!("error installing ", BRANDING))?;
 
@@ -127,12 +125,12 @@ pub fn upgrade_check(_options: &Options, options: &UpgradeCheck) -> anyhow::Resu
 }
 
 #[cfg(windows)]
-pub fn to_version(_: &PackageInfo, _: &project::Context) -> anyhow::Result<()> {
+pub fn to_version(_: &ServerPackage, _: &project::Context) -> anyhow::Result<()> {
     unreachable!();
 }
 
 #[cfg(unix)]
-pub fn to_version(pkg: &PackageInfo, project: &project::Context) -> anyhow::Result<()> {
+pub fn to_version(pkg: &ServerPackage, project: &project::Context) -> anyhow::Result<()> {
     use const_format::concatcp;
 
     use crate::branding::BRANDING;

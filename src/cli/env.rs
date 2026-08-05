@@ -1,3 +1,51 @@
+#[cfg(test)]
+use std::ffi::OsString;
+
+#[cfg(test)]
+static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) struct RestoreEnv(Vec<(&'static str, Option<OsString>)>);
+
+#[cfg(test)]
+impl RestoreEnv {
+    pub(crate) fn new(names: &[&'static str]) -> Self {
+        Self(
+            names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn set(&self, name: &'static str, value: &str) {
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RestoreEnv {
+    fn drop(&mut self) {
+        for (name, value) in self.0.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -275,5 +323,23 @@ impl std::ops::Deref for BoolFlag {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkg_root_prefers_gel_environment_name() {
+        let _lock = test_env_lock();
+        let env = RestoreEnv::new(&["GEL_PKG_ROOT", "EDGEDB_PKG_ROOT"]);
+        env.set("GEL_PKG_ROOT", "https://gel.example.test/");
+        env.set("EDGEDB_PKG_ROOT", "https://edgedb.example.test/");
+
+        assert_eq!(
+            Env::pkg_root().unwrap(),
+            Some("https://gel.example.test/".to_owned())
+        );
     }
 }

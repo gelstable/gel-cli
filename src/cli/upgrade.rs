@@ -9,12 +9,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::platform::{binary_path, current_exe, home_dir, tmp_file_path};
 use crate::portable::platform;
-use crate::portable::repository::{self, Channel, download_sync};
+use crate::portable::registry::{
+    self, Channel, CliPackage, Compression, download_cli_package_verified_sync,
+};
 use crate::portable::ver;
 use crate::print::{self, Highlight, msg};
 use crate::process;
-
-const INDEX_TIMEOUT: Duration = Duration::new(60, 0);
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct Command {
@@ -75,10 +75,7 @@ fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
         force = true;
     }
 
-    let pkg = repository::get_platform_cli_packages(channel, target_plat, INDEX_TIMEOUT)?
-        .into_iter()
-        .max_by(|a, b| a.version.cmp(&b.version))
-        .context("cannot find new version")?;
+    let pkg = cli_package(channel, target_plat)?.context("cannot find new version")?;
     if !force && pkg.version <= self_version()? {
         log::info!("Version is identical; no update needed.");
         if !cmd.quiet {
@@ -95,7 +92,7 @@ fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
     let down_path = path.with_extension("download");
     let tmp_path = tmp_file_path(&path);
 
-    download_sync(&down_path, &pkg.url, cmd.quiet)?;
+    download_cli_package_verified_sync(&down_path, &pkg, cmd.quiet)?;
     unpack_file(&down_path, &tmp_path, pkg.compression)?;
 
     let backup_path = path.with_extension("backup");
@@ -129,6 +126,24 @@ fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cli_package(channel: Channel, target_plat: &str) -> anyhow::Result<Option<CliPackage>> {
+    cli_package_with(channel, target_plat, registry::get_platform_cli_packages)
+}
+
+fn cli_package_with<F>(
+    channel: Channel,
+    target_platform: &str,
+    loader: F,
+) -> anyhow::Result<Option<CliPackage>>
+where
+    F: FnOnce(Channel, &str, Duration) -> anyhow::Result<Vec<CliPackage>>,
+{
+    let packages = loader(channel, target_platform, Duration::from_secs(60))?;
+    Ok(packages
+        .into_iter()
+        .max_by(|first, second| first.version.cmp(&second.version)))
+}
+
 pub fn can_upgrade() -> bool {
     _get_upgrade_path().is_ok()
 }
@@ -143,14 +158,10 @@ fn _get_upgrade_path() -> anyhow::Result<PathBuf> {
 }
 
 #[context("error unpacking {:?} -> {:?}", src, tgt)]
-pub fn unpack_file(
-    src: &Path,
-    tgt: &Path,
-    compression: Option<repository::Compression>,
-) -> anyhow::Result<()> {
+pub fn unpack_file(src: &Path, tgt: &Path, compression: Option<Compression>) -> anyhow::Result<()> {
     fs::remove_file(tgt).ok();
     match compression {
-        Some(repository::Compression::Zstd) => {
+        Some(Compression::Zstd) => {
             fs::remove_file(tgt).ok();
             let src_f = fs::File::open(src)?;
 
@@ -187,7 +198,7 @@ pub fn unpack_file(
     }
 }
 
-pub fn channel_of(ver: &str) -> repository::Channel {
+pub fn channel_of(ver: &str) -> Channel {
     if ver.contains("-dev.") {
         Channel::Nightly
     } else if ver.contains('-') {
@@ -197,7 +208,7 @@ pub fn channel_of(ver: &str) -> repository::Channel {
     }
 }
 
-pub fn channel() -> repository::Channel {
+pub fn channel() -> Channel {
     channel_of(env!("CARGO_PKG_VERSION"))
 }
 
@@ -220,4 +231,30 @@ pub fn upgrade_to_arm64() -> anyhow::Result<()> {
         },
         binary_path()?,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_package_propagates_no_healthy_sources_error() {
+        use crate::portable::registry::catalog::{NoHealthySources, SourceReport};
+        use crate::portable::registry::config::RegistrySource;
+        use crate::portable::registry::source::Source;
+
+        let error: anyhow::Error = NoHealthySources::for_test(vec![SourceReport::Unavailable {
+            source: RegistrySource::Manifest(Source::File("missing-registry.json".into())),
+            error: anyhow::anyhow!("simulated unavailable source"),
+        }])
+        .into();
+
+        let returned =
+            cli_package_with(Channel::Stable, "linux", |_channel, _platform, _timeout| {
+                Err(error)
+            })
+            .unwrap_err();
+
+        assert!(returned.downcast_ref::<NoHealthySources>().is_some());
+    }
 }

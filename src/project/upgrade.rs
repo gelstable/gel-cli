@@ -12,7 +12,7 @@ use crate::instance;
 use crate::instance::upgrade;
 use crate::migrations;
 use crate::portable::local::InstanceInfo;
-use crate::portable::repository::{self, Channel, Query};
+use crate::portable::registry::{self, Channel, Query, QuerySelector};
 use crate::portable::ver;
 use crate::portable::windows;
 use crate::print::{self, AsRelativeToCurrentDir, Highlight, msg};
@@ -23,14 +23,14 @@ use crate::question;
 use super::get_stash_path;
 
 pub fn run(options: &Command, opts: &crate::options::Options) -> anyhow::Result<()> {
-    let (query, version_set) = Query::from_options(
-        repository::QueryOptions {
-            nightly: options.to_nightly,
-            stable: options.to_latest,
-            testing: options.to_testing,
-            version: options.to_version.as_ref(),
-            channel: options.to_channel,
-        },
+    let (query, version_set) = Query::from_selector(
+        QuerySelector::from_upgrade_flags(
+            options.to_version.as_ref(),
+            options.to_channel,
+            options.to_nightly,
+            options.to_testing,
+            options.to_latest,
+        ),
         || Ok(Query::stable()),
     )?;
     if version_set {
@@ -117,7 +117,7 @@ pub fn update_toml(
         .project()
         .resolve_schema_dir(&project.location.root)?;
 
-    let pkg = repository::get_server_package(&query)?.with_context(|| {
+    let pkg = registry::get_server_package(&query)?.with_context(|| {
         format!(
             "cannot find package matching {} \
             (Use `{BRANDING_CLI_CMD} server list-versions` to see all available)",
@@ -301,7 +301,7 @@ fn upgrade_local(
     let inst_ver = inst.get_version()?.specific();
 
     let instance_name = inst.instance_name.clone();
-    let pkg = repository::get_server_package(to_version)?.with_context(|| {
+    let pkg = registry::get_server_package(to_version)?.with_context(|| {
         format!(
             "cannot find package matching {} \
             (Use `{BRANDING_CLI_CMD} server list-versions` to see all available)",
@@ -377,7 +377,7 @@ fn upgrade_local(
     } else {
         let mut available_upgrade = None;
         if to_version.channel != Channel::Nightly {
-            if let Some(pkg) = repository::get_server_package(&Query::stable())? {
+            if let Some(pkg) = registry::get_server_package(&Query::stable())? {
                 let sv = pkg.version.specific();
                 if sv > inst_ver {
                     available_upgrade = Some(sv);

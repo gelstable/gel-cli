@@ -9,7 +9,7 @@ use crate::cloud;
 use crate::commands::ExitCode;
 use crate::options::{Options, UI};
 use crate::portable::local;
-use crate::portable::repository::USER_AGENT;
+use crate::portable::registry::USER_AGENT;
 use crate::print::{self, msg};
 
 pub fn show_ui(cmd: &UI, opts: &Options) -> anyhow::Result<()> {

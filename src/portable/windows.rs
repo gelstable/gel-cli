@@ -39,7 +39,7 @@ use crate::platform::{cache_dir, config_dir, tmp_file_path, wsl_dir};
 use crate::portable::exit_codes;
 use crate::portable::local::{InstanceInfo, NonLocalInstance, Paths, write_json};
 use crate::portable::options;
-use crate::portable::repository::{self, PackageHash, PackageInfo, download, download_sync};
+use crate::portable::registry::{self, download_cli_package_verified_sync, download_sync};
 use crate::portable::server;
 use crate::portable::ver;
 use crate::print::{self, Highlight, msg};
@@ -419,42 +419,39 @@ fn download_binary(dest: &Path) -> anyhow::Result<()> {
         .unwrap();
     let platform = format!("{arch}-unknown-linux-musl");
 
-    let pkgs = repository::get_platform_cli_packages(
+    let pkgs = registry::get_platform_cli_packages(
         upgrade::channel(),
         &platform,
-        repository::DEFAULT_TIMEOUT,
+        Duration::from_secs(60),
     )?;
-    let pkg = pkgs.iter().find(|pkg| pkg.version == my_ver);
-    let pkg = if let Some(pkg) = pkg {
-        pkg.clone()
-    } else {
-        let pkg = repository::get_platform_cli_packages(
-            upgrade::channel(),
-            &platform,
-            repository::DEFAULT_TIMEOUT,
-        )?
-        .into_iter()
-        .max_by(|a, b| a.version.cmp(&b.version))
-        .context("cannot find new version")?;
-        if pkg.version < my_ver {
-            return Err(bug::error(format!(
-                "latest version of linux CLI {} \
-                 is older that current windows CLI {}",
-                pkg.version, my_ver
-            )));
-        }
-        log::warn!(
-            "No package matching version {} found. \
+    let pkg = pkgs.iter().find(|pkg| pkg.version == my_ver).cloned();
+    let pkg = match pkg {
+        Some(pkg) => pkg,
+        None => {
+            let pkg = pkgs
+                .into_iter()
+                .max_by(|a, b| a.version.cmp(&b.version))
+                .context("cannot find new version")?;
+            if pkg.version < my_ver {
+                return Err(bug::error(format!(
+                    "latest version of linux CLI {} \
+                 is older than current windows CLI {}",
+                    pkg.version, my_ver
+                )));
+            }
+            log::warn!(
+                "No package matching version {} found. \
                     Using latest version {}.",
-            my_ver,
-            pkg.version
-        );
-        pkg
+                my_ver,
+                pkg.version
+            );
+            pkg
+        }
     };
 
     let down_path = dest.with_extension("download");
     let tmp_path = tmp_file_path(dest);
-    download_sync(&down_path, &pkg.url, false)?;
+    download_cli_package_verified_sync(&down_path, &pkg, false)?;
     upgrade::unpack_file(&down_path, &tmp_path, pkg.compression)?;
     fs_err::rename(&tmp_path, dest)?;
 

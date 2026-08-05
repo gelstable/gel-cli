@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use crate::branding::BRANDING_CLI_CMD;
 use crate::connect::Connection;
-use crate::portable::repository::Query;
+use crate::portable::registry::Query;
 use crate::print::{Highlight, msg};
 use crate::process::{self, IntoArg};
 

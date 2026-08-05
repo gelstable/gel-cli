@@ -30,7 +30,7 @@ use crate::locking::ProjectLock;
 use crate::platform::{bytes_to_path, path_bytes};
 use crate::platform::{config_dir, is_schema_file, symlink_dir, tmp_file_path};
 use crate::portable::local::InstanceInfo;
-use crate::portable::repository::Query;
+use crate::portable::registry::Query;
 use crate::portable::ver;
 use crate::print;
 use crate::print::AsRelativeToCurrentDir;

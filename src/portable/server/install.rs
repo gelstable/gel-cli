@@ -17,10 +17,10 @@ use crate::platform;
 use crate::portable::exit_codes;
 use crate::portable::local::{InstallInfo, write_json};
 use crate::portable::platform::optional_docker_check;
-use crate::portable::repository::Channel;
-use crate::portable::repository::QueryOptions;
-use crate::portable::repository::{PackageHash, PackageInfo, Query, download};
-use crate::portable::repository::{get_server_package, get_specific_package};
+use crate::portable::registry::{
+    self, Channel, PackageHash, Query, QuerySelector, ServerPackage,
+    download_server_package_verified,
+};
 use crate::portable::ver::{self, Build};
 use crate::print::{self, Highlight};
 
@@ -32,16 +32,12 @@ pub fn run(options: &Command) -> anyhow::Result<()> {
         print::error!("`{BRANDING_CLI_CMD} server install` not supported in Docker containers.");
         Err(ExitCode::new(exit_codes::DOCKER_CONTAINER))?;
     }
-    let (query, _) = Query::from_options(
-        QueryOptions {
-            nightly: options.nightly,
-            stable: false,
-            testing: false,
-            channel: options.channel,
-            version: options.version.as_ref(),
-        },
-        || Ok(Query::stable()),
-    )?;
+    let selector = QuerySelector::from_install_flags(
+        options.version.as_ref(),
+        options.channel,
+        options.nightly,
+    );
+    let (query, _) = Query::from_selector(selector, || Ok(Query::stable()))?;
     version(&query)?;
     Ok(())
 }
@@ -59,9 +55,15 @@ pub struct Command {
     pub channel: Option<Channel>,
 }
 
+fn server_package_with<F>(query: &Query, selector: F) -> anyhow::Result<ServerPackage>
+where
+    F: FnOnce(&Query) -> anyhow::Result<Option<ServerPackage>>,
+{
+    selector(query)?.with_context(|| format!("no package matching your criteria found: {query:?}"))
+}
+
 pub fn version(query: &Query) -> anyhow::Result<InstallInfo> {
-    let pkg_info = get_server_package(query)?
-        .with_context(|| format!("no package matching your criteria found: {query:?}"))?;
+    let pkg_info = server_package_with(query, registry::get_server_package)?;
     ver::print_version_hint(&pkg_info.version.specific(), query);
     package(&pkg_info)
 }
@@ -71,13 +73,13 @@ pub fn specific(version: &ver::Specific) -> anyhow::Result<InstallInfo> {
     if target_dir.exists() {
         return InstallInfo::read(&target_dir);
     }
-    let pkg =
-        get_specific_package(version)?.with_context(|| format!("cannot find package {version}"))?;
+    let pkg = registry::get_specific_package(version)?
+        .with_context(|| format!("cannot find package {version}"))?;
     package(&pkg)
 }
 
 #[tokio::main(flavor = "current_thread")]
-pub async fn package(pkg_info: &PackageInfo) -> anyhow::Result<InstallInfo> {
+pub async fn package(pkg_info: &ServerPackage) -> anyhow::Result<InstallInfo> {
     let ver_name = pkg_info.version.specific().to_string();
     let target_dir = platform::portable_dir()?.join(ver_name);
     if target_dir.exists() {
@@ -102,7 +104,7 @@ pub async fn package(pkg_info: &PackageInfo) -> anyhow::Result<InstallInfo> {
     let info = InstallInfo {
         version: pkg_info.version.clone(),
         package_url: pkg_info.url.clone(),
-        package_hash: pkg_info.hash.clone(),
+        package_hash: PackageHash::Blake2b(pkg_info.hash),
         installed_at: SystemTime::now(),
         slot: pkg_info.slot.clone(),
     };
@@ -123,7 +125,7 @@ pub async fn package(pkg_info: &PackageInfo) -> anyhow::Result<InstallInfo> {
 }
 
 #[context("metadata error for {:?}", dir)]
-fn check_metadata(dir: &Path, pkg_info: &PackageInfo) -> anyhow::Result<InstallInfo> {
+fn check_metadata(dir: &Path, pkg_info: &ServerPackage) -> anyhow::Result<InstallInfo> {
     let data = InstallInfo::read(dir)?;
     if data.version != pkg_info.version {
         log::warn!(
@@ -143,22 +145,12 @@ fn check_metadata(dir: &Path, pkg_info: &PackageInfo) -> anyhow::Result<InstallI
 }
 
 #[context("failed to download {}", pkg_info)]
-pub async fn download_package(pkg_info: &PackageInfo) -> anyhow::Result<PathBuf> {
+pub async fn download_package(pkg_info: &ServerPackage) -> anyhow::Result<PathBuf> {
     let cache_dir = platform::cache_dir()?;
     let download_dir = cache_dir.join("downloads");
     fs::create_dir_all(&download_dir)?;
     let cache_path = download_dir.join(pkg_info.cache_file_name());
-    let hash = download(&cache_path, &pkg_info.url, false).await?;
-    match &pkg_info.hash {
-        PackageHash::Blake2b(hex) => {
-            if hash.to_hex()[..] != hex[..] {
-                anyhow::bail!("hash mismatch {} != {}", hash.to_hex(), hex);
-            }
-        }
-        PackageHash::Unknown(val) => {
-            log::warn!("Cannot verify hash, unknown hash format {val:?}");
-        }
-    }
+    download_server_package_verified(&cache_path, pkg_info, false).await?;
     Ok(cache_path)
 }
 
@@ -246,4 +238,22 @@ fn unlink_cache(cache_file: &Path) {
             log::warn!("Failed to remove cache {cache_file:?}: {e}");
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_package_selection_propagates_registry_error() {
+        let query = Query::stable();
+        let result = server_package_with(&query, |_query| {
+            Err(anyhow::anyhow!("no healthy registry sources"))
+        });
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "no healthy registry sources"
+        );
+    }
 }

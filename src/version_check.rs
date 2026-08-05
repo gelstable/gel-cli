@@ -12,7 +12,7 @@ use crate::branding::BRANDING_CLI_CMD;
 use crate::cli;
 use crate::cli::env::Env;
 use crate::platform;
-use crate::portable::repository;
+use crate::portable::registry;
 use crate::portable::ver;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,7 +33,7 @@ fn negative_cache_age() -> Duration {
 }
 
 impl Cache {
-    fn channel_matches(&self, chan: &repository::Channel) -> bool {
+    fn channel_matches(&self, chan: &registry::Channel) -> bool {
         self.version
             .as_ref()
             .map(|v| cli::upgrade::channel_of(&v.to_string()) == *chan)
@@ -120,7 +120,7 @@ fn _check(cache_dir: &Path, strict: bool) -> anyhow::Result<()> {
         }
     }
     let timestamp = SystemTime::now();
-    let pkg = repository::get_cli_packages(channel, Duration::new(1, 0))
+    let pkg = registry::get_cli_packages(channel, Duration::new(1, 0))
         .map_err(|e| log::info!("cli version check failed: {e:#}"))
         .ok()
         .and_then(|pkgs| pkgs.into_iter().map(|pkg| pkg.version).max());

@@ -13,7 +13,7 @@ use crate::branding::MANIFEST_FILE_DISPLAY_NAME;
 use crate::commands::ExitCode;
 use crate::platform::tmp_file_path;
 use crate::portable::exit_codes;
-use crate::portable::repository::{Channel, Query};
+use crate::portable::registry::{Channel, Query};
 use crate::print::{self, Highlight, msg};
 
 #[derive(Debug, Clone, serde::Serialize)]

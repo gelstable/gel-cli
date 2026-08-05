@@ -24,7 +24,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6691ebadcb18182cc1391d07c9f295f657c593cd # 1.88.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
@@ -61,7 +61,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6691ebadcb18182cc1391d07c9f295f657c593cd # 1.88.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Test

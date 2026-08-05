@@ -121,6 +121,7 @@ async fn download_with_idle_timeout(
         hasher.update(&chunk);
         bar.inc(chunk.len() as u64);
     }
+    out.flush().await?;
     bar.finish();
 
     Ok(hasher.finalize())
@@ -192,6 +193,7 @@ async fn download_file(
         hasher.update(&buf[..n]);
         bar.inc(n as u64);
     }
+    out.flush().await?;
     bar.finish();
 
     Ok(hasher.finalize())

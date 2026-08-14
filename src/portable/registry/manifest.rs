@@ -15,10 +15,12 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestIndex {
     channel: Channel,
     platform: String,
-    url: String,
+    #[serde(rename = "ref")]
+    reference: String,
 }
 
 impl Manifest {
@@ -45,7 +47,7 @@ impl Manifest {
         self.indexes
             .iter()
             .filter(|index| index.channel == channel && index.platform == platform)
-            .map(|index| resolve_index_source(manifest_source, &index.url))
+            .map(|index| resolve_index_source(manifest_source, &index.reference))
             .collect()
     }
 }
@@ -85,17 +87,17 @@ mod tests {
                     {
                         "channel": "stable",
                         "platform": "x86_64-unknown-linux-gnu",
-                        "url": "https://example.com/stable-linux.json"
+                        "ref": "https://example.com/stable-linux.json"
                     },
                     {
                         "channel": "testing",
                         "platform": "x86_64-unknown-linux-gnu",
-                        "url": "https://example.com/testing-linux.json"
+                        "ref": "https://example.com/testing-linux.json"
                     },
                     {
                         "channel": "stable",
                         "platform": "aarch64-apple-darwin",
-                        "url": "https://example.com/stable-macos.json"
+                        "ref": "https://example.com/stable-macos.json"
                     }
                 ]
             }"#,
@@ -131,7 +133,7 @@ mod tests {
                     {
                         "channel": "stable",
                         "platform": "x86_64-unknown-linux-gnu",
-                        "url": "indexes/stable.json"
+                        "ref": "indexes/stable.json"
                     }
                 ]
             }"#,
@@ -150,6 +152,40 @@ mod tests {
             indexes,
             vec![Source::File(
                 tmp.path().join("manifests/indexes/stable.json")
+            )]
+        );
+    }
+
+    #[test]
+    fn root_relative_http_indexes_resolve_from_origin() {
+        let manifest_source =
+            Source::Http(Url::parse("https://example.com/manifests/registry.json").unwrap());
+        let manifest = Manifest::from_slice(
+            br#"{
+                "schema_version": 1,
+                "indexes": [
+                    {
+                        "channel": "stable",
+                        "platform": "x86_64-unknown-linux-gnu",
+                        "ref": "/indexes/stable.json"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let indexes = manifest
+            .select_indexes(
+                &manifest_source,
+                Channel::Stable,
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
+
+        assert_eq!(
+            indexes,
+            vec![Source::Http(
+                Url::parse("https://example.com/indexes/stable.json").unwrap()
             )]
         );
     }
@@ -181,7 +217,7 @@ mod tests {
                     {
                         "channel": "stable",
                         "platform": "x86_64-unknown-linux-gnu",
-                        "url": "release:2026/stable.json"
+                        "ref": "release:2026/stable.json"
                     }
                 ]
             }"#,
@@ -213,7 +249,7 @@ mod tests {
                     {
                         "channel": "stable",
                         "platform": "x86_64-unknown-linux-gnu",
-                        "url": "release:2026/stable.json"
+                        "ref": "release:2026/stable.json"
                     }
                 ]
             }"#,
@@ -247,7 +283,7 @@ mod tests {
                     {
                         "channel": "stable",
                         "platform": "x86_64-unknown-linux-gnu",
-                        "url": "ssh://example.com/stable.json"
+                        "ref": "ssh://example.com/stable.json"
                     }
                 ]
             }"#,

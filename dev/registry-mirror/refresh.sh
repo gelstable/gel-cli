@@ -59,7 +59,7 @@ done
     for channel in "${CHANNELS[@]}"; do
       url="${channel}-${platform}.json"
       if [ "$first" -eq 1 ]; then first=0; else echo ','; fi
-      printf '    {"channel": "%s", "platform": "%s", "url": "%s"}' \
+      printf '    {"channel": "%s", "platform": "%s", "ref": "%s"}' \
         "$channel" "$platform" "$url"
     done
   done

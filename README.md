@@ -74,6 +74,26 @@ source, while conflicting mirror records are rejected. Relative paths are
 resolved relative to `cli.toml`; absolute paths and `file://` URLs can be used
 for local manifests.
 
+Manifest documents use `schema_version = 1` and identify each package index with
+`channel`, `platform`, and `ref`:
+
+```json
+{
+  "schema_version": 1,
+  "indexes": [
+    {
+      "channel": "stable",
+      "platform": "x86_64-unknown-linux-gnu",
+      "ref": "indexes/stable-x86_64-unknown-linux-gnu.json"
+    }
+  ]
+}
+```
+
+Index references may be absolute HTTP(S) or `file://` URLs, root-relative or
+document-relative URLs for HTTP manifests, or paths relative to local manifest
+files.
+
 Each configured source is loaded atomically for the requested channel and
 platform. If any selected index from one source is unavailable or invalid, that
 source is rejected without contributing partial package data. Other healthy

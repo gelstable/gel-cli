@@ -791,7 +791,7 @@ mod tests {
                 serde_json::json!({
                     "channel": "stable",
                     "platform": "linux",
-                    "url": url,
+                    "ref": url,
                 })
             })
             .collect::<Vec<_>>();
@@ -970,7 +970,7 @@ mod tests {
                     "indexes": [{
                         "channel": "stable",
                         "platform": "linux",
-                        "url": index_url,
+                        "ref": index_url,
                     }],
                 }))
                 .unwrap(),
@@ -1196,7 +1196,7 @@ mod tests {
         let two = tmp.path().join("two.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"one.json"},{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"two.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"x86_64-unknown-linux-gnu","ref":"one.json"},{"channel":"stable","platform":"x86_64-unknown-linux-gnu","ref":"two.json"}]}"#,
         )
         .unwrap();
         fs_err::write(one, first).unwrap();
@@ -1244,7 +1244,7 @@ mod tests {
         let two = tmp.path().join("two.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"one.json"},{"channel":"stable","platform":"linux","url":"two.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"one.json"},{"channel":"stable","platform":"linux","ref":"two.json"}]}"#,
         )
         .unwrap();
         let body = format!(
@@ -1278,7 +1278,7 @@ mod tests {
         let two = tmp.path().join("two.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"one.json"},{"channel":"stable","platform":"linux","url":"two.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"one.json"},{"channel":"stable","platform":"linux","ref":"two.json"}]}"#,
         )
         .unwrap();
         fs_err::write(
@@ -1321,7 +1321,7 @@ mod tests {
         let two = tmp.path().join("two.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"one.json"},{"channel":"stable","platform":"linux","url":"two.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"one.json"},{"channel":"stable","platform":"linux","ref":"two.json"}]}"#,
         )
         .unwrap();
         let other_hash = format!("b{}", &HASH[1..]);
@@ -1364,7 +1364,7 @@ mod tests {
         let two = tmp.path().join("two.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"one.json"},{"channel":"stable","platform":"linux","url":"two.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"one.json"},{"channel":"stable","platform":"linux","ref":"two.json"}]}"#,
         )
         .unwrap();
         fs_err::write(
@@ -1406,7 +1406,7 @@ mod tests {
         let two = tmp.path().join("two.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"one.json"},{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"two.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"x86_64-unknown-linux-gnu","ref":"one.json"},{"channel":"stable","platform":"x86_64-unknown-linux-gnu","ref":"two.json"}]}"#,
         )
         .unwrap();
         let index = |cli_url: &str, extension_url: &str| {
@@ -1763,7 +1763,7 @@ mod tests {
         let index = tmp.path().join("stable-linux.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"stable-linux.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"stable-linux.json"}]}"#,
         )?;
         fs_err::write(
             &index,
@@ -1831,7 +1831,7 @@ mod tests {
             let manifest = tmp.path().join("registry.json");
             fs_err::write(
                 &manifest,
-                br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"stable-linux.json"}]}"#,
+                br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"stable-linux.json"}]}"#,
             )
             .unwrap();
             fs_err::write(tmp.path().join("stable-linux.json"), server_index(HASH)).unwrap();
@@ -1847,7 +1847,7 @@ mod tests {
                     let first_manifest = tmp.path().join("missing-index-registry.json");
                     fs_err::write(
                         &first_manifest,
-                        br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"missing-index.json"}]}"#,
+                        br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"missing-index.json"}]}"#,
                     )
                     .unwrap();
                     RegistrySource::Manifest(Source::File(first_manifest))
@@ -1856,7 +1856,7 @@ mod tests {
                     let first_manifest = tmp.path().join("network-index-registry.json");
                     fs_err::write(
                         &first_manifest,
-                        br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"http://127.0.0.1:1/missing-index.json"}]}"#,
+                        br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"http://127.0.0.1:1/missing-index.json"}]}"#,
                     )
                     .unwrap();
                     RegistrySource::Manifest(Source::File(first_manifest))
@@ -1893,7 +1893,7 @@ mod tests {
         let index = tmp.path().join("stable-linux.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"x86_64-unknown-linux-gnu","url":"stable-linux.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"x86_64-unknown-linux-gnu","ref":"stable-linux.json"}]}"#,
         )
         .unwrap();
         fs_err::write(
@@ -1989,7 +1989,7 @@ mod tests {
         let broken_index = tmp.path().join("broken-index.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"broken-index.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"broken-index.json"}]}"#,
         )
         .unwrap();
         fs_err::write(&broken_index, b"{not-json").unwrap();
@@ -2050,7 +2050,7 @@ mod tests {
         let manifest = tmp.path().join("registry.json");
         fs_err::write(
             &manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"darwin","url":"stable-darwin.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"darwin","ref":"stable-darwin.json"}]}"#,
         )
         .unwrap();
         let config = Config {
@@ -2076,7 +2076,7 @@ mod tests {
         let malformed_manifest = tmp.path().join("malformed-registry.json");
         fs_err::write(
             &valid_manifest,
-            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","url":"stable-linux.json"}]}"#,
+            br#"{"schema_version":1,"indexes":[{"channel":"stable","platform":"linux","ref":"stable-linux.json"}]}"#,
         )
         .unwrap();
         fs_err::write(

@@ -222,7 +222,7 @@ fn unavailable_source_warns_on_stderr() {
     fs::write(
         bad.path().join("registry.json"),
         format!(
-            r#"{{"schema_version":1,"indexes":[{{"channel":"stable","platform":"{platform}","url":"does-not-exist.json"}}]}}"#,
+            r#"{{"schema_version":1,"indexes":[{{"channel":"stable","platform":"{platform}","ref":"does-not-exist.json"}}]}}"#,
         ),
     )
     .unwrap();

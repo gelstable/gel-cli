@@ -384,9 +384,9 @@ mod tests {
         fs_err::write(
             &manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"stable-linux.json"},
-              {"channel":"testing","platform":"linux","url":"malformed-index.json"},
-              {"channel":"nightly","platform":"linux","url":"nightly-linux.json"}
+              {"channel":"stable","platform":"linux","ref":"stable-linux.json"},
+              {"channel":"testing","platform":"linux","ref":"malformed-index.json"},
+              {"channel":"nightly","platform":"linux","ref":"nightly-linux.json"}
             ]}"#,
         )
         .unwrap();
@@ -424,9 +424,9 @@ mod tests {
         fs_err::write(
             &manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"stable.json"},
-              {"channel":"testing","platform":"linux","url":"testing.json"},
-              {"channel":"nightly","platform":"linux","url":"nightly.json"}
+              {"channel":"stable","platform":"linux","ref":"stable.json"},
+              {"channel":"testing","platform":"linux","ref":"testing.json"},
+              {"channel":"nightly","platform":"linux","ref":"nightly.json"}
             ]}"#,
         )
         .unwrap();
@@ -466,9 +466,9 @@ mod tests {
         fs_err::write(
             &manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"stable.json"},
-              {"channel":"testing","platform":"linux","url":"testing.json"},
-              {"channel":"nightly","platform":"linux","url":"nightly.json"}
+              {"channel":"stable","platform":"linux","ref":"stable.json"},
+              {"channel":"testing","platform":"linux","ref":"testing.json"},
+              {"channel":"nightly","platform":"linux","ref":"nightly.json"}
             ]}"#,
         )
         .unwrap();
@@ -529,9 +529,9 @@ mod tests {
         fs_err::write(
             &manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"stable.json"},
-              {"channel":"testing","platform":"linux","url":"testing.json"},
-              {"channel":"nightly","platform":"linux","url":"nightly.json"}
+              {"channel":"stable","platform":"linux","ref":"stable.json"},
+              {"channel":"testing","platform":"linux","ref":"testing.json"},
+              {"channel":"nightly","platform":"linux","ref":"nightly.json"}
             ]}"#,
         )
         .unwrap();
@@ -589,7 +589,7 @@ mod tests {
         fs_err::write(
             &healthy_manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"stable.json"}
+              {"channel":"stable","platform":"linux","ref":"stable.json"}
             ]}"#,
         )
         .unwrap();
@@ -630,9 +630,9 @@ mod tests {
         fs_err::write(
             &first_manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"first-missing.json"},
-              {"channel":"testing","platform":"linux","url":"first-malformed.json"},
-              {"channel":"nightly","platform":"linux","url":"first-nightly.json"}
+              {"channel":"stable","platform":"linux","ref":"first-missing.json"},
+              {"channel":"testing","platform":"linux","ref":"first-malformed.json"},
+              {"channel":"nightly","platform":"linux","ref":"first-nightly.json"}
             ]}"#,
         )
         .unwrap();
@@ -645,9 +645,9 @@ mod tests {
         fs_err::write(
             &fallback_manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"fallback-stable.json"},
-              {"channel":"testing","platform":"linux","url":"fallback-testing.json"},
-              {"channel":"nightly","platform":"linux","url":"fallback-nightly.json"}
+              {"channel":"stable","platform":"linux","ref":"fallback-stable.json"},
+              {"channel":"testing","platform":"linux","ref":"fallback-testing.json"},
+              {"channel":"nightly","platform":"linux","ref":"fallback-nightly.json"}
             ]}"#,
         )
         .unwrap();
@@ -702,9 +702,9 @@ mod tests {
         fs_err::write(
             &first_manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"first-stable.json"},
-              {"channel":"testing","platform":"linux","url":"first-testing-missing.json"},
-              {"channel":"nightly","platform":"linux","url":"first-nightly.json"}
+              {"channel":"stable","platform":"linux","ref":"first-stable.json"},
+              {"channel":"testing","platform":"linux","ref":"first-testing-missing.json"},
+              {"channel":"nightly","platform":"linux","ref":"first-nightly.json"}
             ]}"#,
         )
         .unwrap();
@@ -721,7 +721,7 @@ mod tests {
         fs_err::write(
             &second_manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"second-stable-missing.json"}
+              {"channel":"stable","platform":"linux","ref":"second-stable-missing.json"}
             ]}"#,
         )
         .unwrap();
@@ -762,16 +762,16 @@ mod tests {
         fs_err::write(
             &first_manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"first-index.json"},
-              {"channel":"testing","platform":"linux","url":"first-index.json"}
+              {"channel":"stable","platform":"linux","ref":"first-index.json"},
+              {"channel":"testing","platform":"linux","ref":"first-index.json"}
             ]}"#,
         )
         .unwrap();
         fs_err::write(
             &second_manifest,
             br#"{"schema_version":1,"indexes":[
-              {"channel":"stable","platform":"linux","url":"second-index.json"},
-              {"channel":"testing","platform":"linux","url":"second-index.json"}
+              {"channel":"stable","platform":"linux","ref":"second-index.json"},
+              {"channel":"testing","platform":"linux","ref":"second-index.json"}
             ]}"#,
         )
         .unwrap();

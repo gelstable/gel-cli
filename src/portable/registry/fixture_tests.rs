@@ -162,7 +162,7 @@ async fn unavailable_source_falls_back_to_faithful() {
     fs::write(
         &bad_manifest,
         format!(
-            r#"{{"schema_version":1,"indexes":[{{"channel":"stable","platform":"{PINNED_PLATFORM}","url":"does-not-exist.json"}}]}}"#,
+            r#"{{"schema_version":1,"indexes":[{{"channel":"stable","platform":"{PINNED_PLATFORM}","ref":"does-not-exist.json"}}]}}"#,
         ),
     )
     .unwrap();

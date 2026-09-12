@@ -110,7 +110,7 @@ fn normalized(exe: &Path) -> String {
 
 fn is_system_bin(exe: &Path) -> bool {
     let path = exe.to_string_lossy().replace('\\', "/");
-    path.starts_with("/usr/bin") || path.starts_with("/bin")
+    path.starts_with("/usr/bin/") || path.starts_with("/bin/")
 }
 
 pub fn detect_from_path(exe: &Path, probe: &dyn OwnershipProbe) -> InstallManager {
@@ -128,6 +128,7 @@ pub fn detect_from_path(exe: &Path, probe: &dyn OwnershipProbe) -> InstallManage
     if path.contains("/opt/homebrew/")
         || path.contains("/usr/local/cellar/")
         || path.contains("/home/linuxbrew/.linuxbrew/")
+        || path.contains("/.linuxbrew/")
     {
         return InstallManager::Homebrew;
     }
@@ -147,7 +148,22 @@ pub fn detect_from_path(exe: &Path, probe: &dyn OwnershipProbe) -> InstallManage
 
 pub fn detect() -> InstallManager {
     match current_exe() {
-        Ok(exe) => detect_from_path(&exe, &SystemProbe),
+        Ok(exe) => {
+            // `current_exe()` returns a fully-resolved path on Linux (it reads
+            // `/proc/self/exe`) but the *symlink* path on macOS (it uses
+            // `_NSGetExecutablePath`). A Homebrew or Nix install on macOS is
+            // invoked through such a symlink, so the raw path alone would
+            // misclassify it as `Direct`. Only pay for a second classification
+            // when the raw path didn't already match a manager and resolving
+            // it actually changes anything.
+            let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+            match detect_from_path(&exe, &SystemProbe) {
+                InstallManager::Direct if resolved != exe => {
+                    detect_from_path(&resolved, &SystemProbe)
+                }
+                managed => managed,
+            }
+        }
         Err(error) => {
             log::debug!("cannot determine the running executable: {error:#}");
             InstallManager::Direct
@@ -220,6 +236,34 @@ mod tests {
         );
     }
 
+    /// `current_exe()` returns the unresolved symlink path on macOS. The
+    /// classification of the *canonical* target of a Homebrew or Nix symlink
+    /// (what `detect()` falls back to when the raw path is `Direct`) has to
+    /// be correct, even though `detect()` itself isn't unit-testable.
+    #[test]
+    fn resolved_homebrew_and_nix_targets_are_classified_correctly() {
+        // Intel macOS Homebrew: /usr/local/bin/gel resolves into the Cellar.
+        assert_eq!(
+            detect("/usr/local/Cellar/gel/7.11.0/bin/gel"),
+            InstallManager::Homebrew
+        );
+        // Nix profile on macOS: ~/.nix-profile/bin/gel resolves into the store.
+        assert_eq!(
+            detect("/nix/store/abc123-gel-cli-7.11.0/bin/gel"),
+            InstallManager::Nix
+        );
+    }
+
+    /// Homebrew on Linux also supports a sudo-less `~/.linuxbrew` prefix,
+    /// distinct from the shared `/home/linuxbrew/.linuxbrew` prefix.
+    #[test]
+    fn linuxbrew_under_home_is_homebrew() {
+        assert_eq!(
+            detect("/home/alice/.linuxbrew/Cellar/gel/1.2/bin/gel"),
+            InstallManager::Homebrew
+        );
+    }
+
     #[test]
     fn winget_package_paths_are_winget() {
         assert_eq!(
@@ -233,6 +277,22 @@ mod tests {
     #[test]
     fn system_bin_without_an_owning_package_is_direct() {
         assert_eq!(detect("/usr/bin/gel"), InstallManager::Direct);
+    }
+
+    /// `is_system_bin` must gate on the directory `/usr/bin/` or `/bin/`, not
+    /// merely a string prefix, or a lookalike directory such as
+    /// `/usr/binary-thing/` would spawn dpkg/rpm/pacman needlessly.
+    #[test]
+    fn lookalike_directory_is_not_a_system_bin() {
+        let probe = StubProbe {
+            dpkg: true,
+            rpm: true,
+            pacman: true,
+        };
+        assert_eq!(
+            detect_from_path(Path::new("/usr/binary-thing/gel"), &probe),
+            InstallManager::Direct
+        );
     }
 
     #[test]

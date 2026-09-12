@@ -7,6 +7,7 @@ use fn_error_context::context;
 use fs_err as fs;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use crate::branding::BRANDING_CLI_CMD;
 use crate::cli::install_manager::{self, InstallManager};
 use crate::platform::{binary_path, current_exe, home_dir, tmp_file_path};
 use crate::portable::platform;
@@ -63,16 +64,23 @@ fn upgrade_action(manager: InstallManager) -> UpgradeAction {
 }
 
 pub fn run(cmd: &Command) -> anyhow::Result<()> {
-    match upgrade_action(install_manager::detect()) {
-        UpgradeAction::Defer(hint) => {
-            msg!("{hint}");
-            Ok(())
-        }
-        UpgradeAction::Proceed => upgrade(cmd, _get_upgrade_path()?),
-    }
+    upgrade(cmd, _get_upgrade_path)
 }
 
-fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
+/// The single chokepoint every byte-writing upgrade path passes through.
+///
+/// The install-manager guard lives here rather than in each caller: a
+/// managed install must never be overwritten in place, not even with
+/// `--force`. `path_fn` is only invoked once that guard has passed, so a
+/// managed install never pays the cost (or risks the error) of resolving an
+/// upgrade path it will not use.
+fn upgrade(cmd: &Command, path_fn: impl FnOnce() -> anyhow::Result<PathBuf>) -> anyhow::Result<()> {
+    if let UpgradeAction::Defer(hint) = upgrade_action(install_manager::detect()) {
+        msg!("{hint}");
+        return Ok(());
+    }
+    let path = path_fn()?;
+
     let cur_channel = channel();
     let channel = if let Some(channel) = cmd.to_channel {
         channel
@@ -175,7 +183,11 @@ fn _get_upgrade_path() -> anyhow::Result<PathBuf> {
     let exe_path = current_exe()?;
     let home = home_dir()?;
     if !exe_path.starts_with(&home) {
-        anyhow::bail!("Only binary installed under {:?} can be upgraded", home);
+        anyhow::bail!(
+            "{exe_path:?} appears to be a system-wide install of {BRANDING_CLI_CMD}, \
+             outside your home directory. Please reinstall it through your system's \
+             package manager, or re-run the {BRANDING_CLI_CMD} install script."
+        );
     }
     Ok(exe_path)
 }
@@ -242,10 +254,6 @@ pub fn self_version() -> anyhow::Result<ver::Semver> {
 }
 
 pub fn upgrade_to_arm64() -> anyhow::Result<()> {
-    if let UpgradeAction::Defer(hint) = upgrade_action(install_manager::detect()) {
-        msg!("{hint}");
-        return Ok(());
-    }
     upgrade(
         &Command {
             verbose: false,
@@ -256,7 +264,7 @@ pub fn upgrade_to_arm64() -> anyhow::Result<()> {
             to_testing: false,
             to_channel: None,
         },
-        binary_path()?,
+        binary_path,
     )
 }
 
@@ -320,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn can_upgrade_is_false_for_a_scoop_install() {
+    fn scoop_installs_are_not_self_managed_and_defer() {
         use std::path::Path;
 
         use crate::cli::install_manager::{OwnershipProbe, detect_from_path};

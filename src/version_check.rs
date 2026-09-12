@@ -242,9 +242,6 @@ mod tests {
     fn direct_installs_keep_the_existing_advice() {
         let message = newer_version_message(&version(), InstallManager::Direct);
         assert!(message.contains("9.9.9"), "{message}");
-        assert!(
-            message.contains("cli upgrade") || !message.contains("brew"),
-            "{message}"
-        );
+        assert!(!message.contains("was installed via"), "{message}");
     }
 }

@@ -7,6 +7,7 @@ use fn_error_context::context;
 use fs_err as fs;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use crate::cli::install_manager::{self, InstallManager};
 use crate::platform::{binary_path, current_exe, home_dir, tmp_file_path};
 use crate::portable::platform;
 use crate::portable::registry::{
@@ -45,8 +46,30 @@ pub struct Command {
     pub to_channel: Option<Channel>,
 }
 
+/// What `cli upgrade` should do given who owns this binary.
+#[derive(Debug)]
+enum UpgradeAction {
+    Proceed,
+    Defer(String),
+}
+
+/// A package-manager-owned binary is never replaced in place, not even with
+/// `--force`: overwriting it corrupts the manager's own record of the install.
+fn upgrade_action(manager: InstallManager) -> UpgradeAction {
+    match manager.upgrade_hint() {
+        Some(hint) => UpgradeAction::Defer(hint),
+        None => UpgradeAction::Proceed,
+    }
+}
+
 pub fn run(cmd: &Command) -> anyhow::Result<()> {
-    upgrade(cmd, _get_upgrade_path()?)
+    match upgrade_action(install_manager::detect()) {
+        UpgradeAction::Defer(hint) => {
+            msg!("{hint}");
+            Ok(())
+        }
+        UpgradeAction::Proceed => upgrade(cmd, _get_upgrade_path()?),
+    }
 }
 
 fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
@@ -145,7 +168,7 @@ where
 }
 
 pub fn can_upgrade() -> bool {
-    _get_upgrade_path().is_ok()
+    install_manager::detect().is_self_managed() && _get_upgrade_path().is_ok()
 }
 
 fn _get_upgrade_path() -> anyhow::Result<PathBuf> {
@@ -219,6 +242,10 @@ pub fn self_version() -> anyhow::Result<ver::Semver> {
 }
 
 pub fn upgrade_to_arm64() -> anyhow::Result<()> {
+    if let UpgradeAction::Defer(hint) = upgrade_action(install_manager::detect()) {
+        msg!("{hint}");
+        return Ok(());
+    }
     upgrade(
         &Command {
             verbose: false,
@@ -256,5 +283,66 @@ mod tests {
             .unwrap_err();
 
         assert!(returned.downcast_ref::<NoHealthySources>().is_some());
+    }
+
+    #[test]
+    fn managed_installs_defer_to_their_package_manager() {
+        use crate::cli::install_manager::InstallManager;
+
+        for manager in [
+            InstallManager::Homebrew,
+            InstallManager::Scoop,
+            InstallManager::WinGet,
+            InstallManager::Nix,
+            InstallManager::Apt,
+            InstallManager::Dnf,
+            InstallManager::Pacman,
+        ] {
+            match upgrade_action(manager) {
+                UpgradeAction::Defer(message) => {
+                    assert!(!message.is_empty(), "{manager:?} needs an instruction");
+                }
+                UpgradeAction::Proceed => {
+                    panic!("{manager:?} must not self-upgrade");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_installs_proceed() {
+        use crate::cli::install_manager::InstallManager;
+
+        assert!(matches!(
+            upgrade_action(InstallManager::Direct),
+            UpgradeAction::Proceed
+        ));
+    }
+
+    #[test]
+    fn can_upgrade_is_false_for_a_scoop_install() {
+        use std::path::Path;
+
+        use crate::cli::install_manager::{OwnershipProbe, detect_from_path};
+
+        struct NoPackages;
+        impl OwnershipProbe for NoPackages {
+            fn dpkg_owns(&self, _exe: &Path) -> bool {
+                false
+            }
+            fn rpm_owns(&self, _exe: &Path) -> bool {
+                false
+            }
+            fn pacman_owns(&self, _exe: &Path) -> bool {
+                false
+            }
+        }
+
+        let manager = detect_from_path(
+            Path::new(r"C:\Users\alice\scoop\apps\gel\current\gel.exe"),
+            &NoPackages,
+        );
+        assert!(!manager.is_self_managed());
+        assert!(matches!(upgrade_action(manager), UpgradeAction::Defer(_)));
     }
 }

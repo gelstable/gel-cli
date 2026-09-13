@@ -46,6 +46,10 @@ github_action_install = []
 github_nightly = []
 portable_tests = []
 gel = []
+# Gates the `tests/install-manager` target, which installs the CLI for real
+# through system package managers. Every scenario in it is also `#[ignore]`d, so
+# enabling the feature compiles the target without running anything.
+install_manager_e2e = []
 
 [dependencies]
 edgeql-parser = {git = "https://github.com/edgedb/edgeql"}

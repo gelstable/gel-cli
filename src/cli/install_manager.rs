@@ -29,7 +29,14 @@ impl InstallManager {
     /// When adding a new variant to the enum, you must also:
     /// 1. Add the variant to this array
     /// 2. Add a match arm in the `slug()` method with its lowercase slug
-    /// The compiler ensures `slug()` is exhaustive; this array must be updated manually.
+    ///
+    /// The compiler ensures `slug()` is exhaustive; this array must be updated
+    /// manually.
+    ///
+    /// Only the slug contract test below reads it — production code always has
+    /// one concrete manager in hand, never the set — so it is compiled out of a
+    /// normal build rather than carried there as dead code.
+    #[cfg(test)]
     pub const ALL: [InstallManager; 8] = [
         InstallManager::Homebrew,
         InstallManager::Scoop,
@@ -480,8 +487,7 @@ mod tests {
         assert_eq!(
             unique_slugs.len(),
             slugs.len(),
-            "duplicate slugs found: {:?}",
-            slugs
+            "duplicate slugs found: {slugs:?}"
         );
     }
 

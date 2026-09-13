@@ -113,6 +113,59 @@ pub fn run(cmd: &mut Command) -> Run {
     }
 }
 
+/// Whether `tool` can be found on `PATH`.
+///
+/// Every scenario in this target drives a package manager that may simply not
+/// exist on the host, and the contract is that it then *skips* rather than
+/// fails. `run` panics when a spawn fails, so availability has to be settled
+/// before the first spawn, not discovered from its error.
+pub fn have(tool: &str) -> bool {
+    which::which(tool).is_ok()
+}
+
+/// Run an external tool and turn a non-zero exit into an error.
+///
+/// [`Run::expect_success`] panics, which is right for an assertion about the
+/// CLI but wrong inside [`Scenario::install`]: a `dpkg-deb` that refuses to
+/// build should surface as "install failed: ..." with both streams attached,
+/// through the same `Result` as every other packaging step.
+pub fn checked(cmd: &mut Command, what: &str) -> anyhow::Result<Run> {
+    let out = run(cmd);
+    anyhow::ensure!(
+        out.success,
+        "{what} failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.stdout,
+        out.stderr,
+    );
+    Ok(out)
+}
+
+/// Spawn without panicking, for [`Scenario::cleanup`].
+///
+/// Cleanup runs from a `Drop` guard, including while a panic is unwinding, and
+/// a second panic there would abort the process and take the original failure's
+/// message with it. `None` means the tool could not be spawned at all.
+pub fn run_quietly(cmd: &mut Command) -> Option<Run> {
+    let output = cmd.output().ok()?;
+    Some(Run {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+/// Report a cleanup command that did not work, and never panic doing it.
+pub fn report_cleanup(cmd: &mut Command, what: &str) {
+    match run_quietly(cmd) {
+        Some(out) if out.success => {}
+        Some(out) => eprintln!(
+            "cleanup: {what} failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.stdout, out.stderr,
+        ),
+        None => eprintln!("cleanup: could not spawn {what}"),
+    }
+}
+
 /// Ask a `gel` binary for one `info --get` value, with the scenario's env applied.
 ///
 /// Querying the binary beats recomputing `dirs` logic in the test: the answer is
@@ -363,9 +416,6 @@ impl Drop for CleanupGuard<'_> {
 /// desynchronise the package manager's own record of the install, and a unit
 /// test on the decision table cannot show that the bytes survived.
 ///
-/// Unused until the managed scenarios land (Tasks 3-4); kept here so those tasks
-/// add a scenario file and nothing else.
-#[allow(dead_code)]
 pub fn assert_managed(scenario: &dyn Scenario) {
     let source = binary_under_test();
     // Constructed before `install` so a failure mid-install still cleans up.

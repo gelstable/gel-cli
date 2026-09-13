@@ -50,3 +50,38 @@ mod scenarios;
 fn e2e_direct() {
     scenarios::direct::run();
 }
+
+/// Debian package: `dpkg -S /usr/bin/gel` answers, so the install is `apt`.
+#[test]
+#[ignore = "installs the CLI for real; run explicitly with --ignored"]
+fn e2e_apt() {
+    scenarios::apt::run();
+}
+
+/// RPM package: `rpm -qf /usr/bin/gel` answers, so the install is `dnf`.
+#[test]
+#[ignore = "installs the CLI for real; run explicitly with --ignored"]
+fn e2e_dnf() {
+    scenarios::dnf::run();
+}
+
+/// Arch package: `pacman -Qo /usr/bin/gel` answers, so the install is `pacman`.
+#[test]
+#[ignore = "installs the CLI for real; run explicitly with --ignored"]
+fn e2e_pacman() {
+    scenarios::pacman::run();
+}
+
+/// Homebrew, on macOS or Linux: a Cellar path linked into the prefix's `bin`.
+#[test]
+#[ignore = "installs the CLI for real; run explicitly with --ignored"]
+fn e2e_homebrew() {
+    scenarios::homebrew::run();
+}
+
+/// Nix, on Linux or macOS: a profile symlink into `/nix/store`.
+#[test]
+#[ignore = "installs the CLI for real; run explicitly with --ignored"]
+fn e2e_nix() {
+    scenarios::nix::run();
+}

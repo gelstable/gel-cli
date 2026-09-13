@@ -54,6 +54,8 @@ def _manifest_with_target(repo_root: Path, target: assets.Target) -> None:
     """Rewrite Cargo.toml in place so asset sources point at this target's dir."""
     manifest = repo_root / "Cargo.toml"
     text = manifest.read_text()
+    if TARGET_PLACEHOLDER not in text:
+        raise ValueError(f"Placeholder {TARGET_PLACEHOLDER} not found in Cargo.toml")
     manifest.write_text(text.replace(TARGET_PLACEHOLDER, target.triple))
 
 

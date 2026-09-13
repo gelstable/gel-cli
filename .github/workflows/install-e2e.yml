@@ -276,21 +276,36 @@ jobs:
     needs: build
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
     runs-on: windows-2025
-    # WinGet is not on the windows-2025 image and bootstrapping
-    # Microsoft.DesktopAppInstaller on a headless runner is its own project, so
-    # this job is expected to skip. It is the one job allowed to: it is kept
-    # wired up so that the day the image gains WinGet, the scenario starts
-    # running and the allowance can be dropped.
+    # WinGet *is* on the windows-2025 image, contrary to what the image README
+    # lists: the first run of this workflow got as far as a real
+    # `winget install`, which then hit the LocalManifestFiles policy below.
+    # The allowance stays for one more round because no `winget install
+    # --manifest` in this scenario has yet succeeded anywhere — the manifest
+    # schema, the `file://` InstallerUrl and the portable install location are
+    # all still unproven — and a scenario nobody has ever seen pass should not
+    # be able to block a merge. Drop it once this job has gone green once.
     continue-on-error: true
     env:
       GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
-      GEL_E2E_ALLOW_SKIP: "1"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Allow installs from a local manifest
+        shell: pwsh
+        # `winget install --manifest` is refused unless this administrator
+        # policy is on; being elevated is not enough on its own. The scenario
+        # itself deliberately will not turn it on — it is machine-wide state
+        # with no way to read back and restore a prior value, so a test must
+        # never do this to someone's real machine, and `winget.rs` skips with
+        # that explanation instead. It is acceptable *here*, and only here,
+        # because this runner is ephemeral and is destroyed when the job ends.
+        run: winget settings --enable LocalManifestFiles
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: install-e2e-windows
           path: dist
       - name: Run e2e_winget
         shell: bash
+        # No GEL_E2E_ALLOW_SKIP: now that the policy is enabled above, a skip
+        # means either WinGet vanished from the image or that step did not
+        # work, and both are things this job should go red for.
         run: bash scripts/ci/run-install-scenario.sh e2e_winget

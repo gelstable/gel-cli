@@ -166,6 +166,61 @@ mod imp {
             self.root.join("shims").join(scenario::EXE_NAME)
         }
 
+        /// The executable `scoop install` actually produced, if any.
+        ///
+        /// Originally this scenario asserted the one path a user runs,
+        /// `<root>\apps\gel\current\gel.exe`. CI showed `scoop install`
+        /// exiting 0 without producing it, and a hard-coded path cannot say
+        /// what it *did* produce — so the executable is now located rather
+        /// than assumed. `current` is still preferred when it is there,
+        /// because that is the path a user's `PATH` resolves to and the one
+        /// the junction branch of detection is about; any other copy under
+        /// `apps\gel` is a good enough answer for the contract, since every
+        /// path under that directory contains `scoop/apps/`.
+        ///
+        /// The walk is depth-limited: `current` is a junction back into a
+        /// sibling version directory, so an unbounded walk would revisit the
+        /// same files, and a future Scoop layout could in principle make that
+        /// a cycle.
+        fn locate_installed(&self) -> Option<PathBuf> {
+            let canonical = self.installed_bin();
+            if canonical.is_file() {
+                return Some(canonical);
+            }
+            let mut found = Vec::new();
+            collect_exes(&self.app_dir(), 4, &mut found);
+            found.sort();
+            found.into_iter().next()
+        }
+
+        /// Everything a human needs to work out where the payload went.
+        ///
+        /// Built only on the failure path, and deliberately verbose: this runs
+        /// on a CI runner that is destroyed minutes later, so whatever is not
+        /// in the log is gone. Scoop's own output is included because the
+        /// scenario captures it — throwing it away was what made the first CI
+        /// failure impossible to diagnose.
+        fn diagnose_missing_install(&self, out: &scenario::Run) -> String {
+            let mut report = format!(
+                "`scoop install` exited 0 but produced no {} anywhere under {}.\n\
+                 --- scoop stdout ---\n{}\n--- scoop stderr ---\n{}\n",
+                scenario::EXE_NAME,
+                self.app_dir().display(),
+                out.stdout,
+                out.stderr,
+            );
+            for (label, dir, depth) in [
+                ("apps/gel (recursive)", self.app_dir(), 6),
+                ("apps", self.root.join("apps"), 1),
+                ("shims", self.root.join("shims"), 1),
+                ("cache", self.root.join("cache"), 1),
+            ] {
+                report.push_str(&format!("--- {label}: {} ---\n", dir.display()));
+                list_tree(&dir, depth, &mut report);
+            }
+            report
+        }
+
         /// Why this scenario cannot prove anything here: the detection rule
         /// would not recognise an install into *this* Scoop root.
         ///
@@ -223,6 +278,52 @@ mod imp {
                 }
             }
             None
+        }
+    }
+
+    /// Collect every `gel.exe` under `dir`, to a bounded depth.
+    fn collect_exes(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = fs_err::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_exes(&path, depth - 1, found);
+            } else if path
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(scenario::EXE_NAME))
+            {
+                found.push(path);
+            }
+        }
+    }
+
+    /// Append a `find`-style listing of `dir` to `report`, to a bounded depth.
+    fn list_tree(dir: &Path, depth: usize, report: &mut String) {
+        let entries = match fs_err::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                report.push_str(&format!("  <cannot read {}: {error}>\n", dir.display()));
+                return;
+            }
+        };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        for path in paths {
+            let is_dir = path.is_dir();
+            let size = fs_err::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            report.push_str(&format!(
+                "  {} {size:>12}  {}\n",
+                if is_dir { "d" } else { "f" },
+                path.display(),
+            ));
+            if is_dir && depth > 1 {
+                list_tree(&path, depth - 1, report);
+            }
         }
     }
 
@@ -297,15 +398,32 @@ mod imp {
             fs_err::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
             self.attempted.store(true, Ordering::SeqCst);
-            scenario::checked(
+            let out = scenario::checked(
                 self.layout.scoop().arg("install").arg(&manifest_path),
                 "`scoop install`",
             )?;
 
-            let installed = self.layout.installed_bin();
+            let installed = self
+                .layout
+                .locate_installed()
+                .ok_or_else(|| anyhow::anyhow!("{}", self.layout.diagnose_missing_install(&out)))?;
+
+            // A mirror of `detect_from_path`'s Scoop rule
+            // (`src/cli/install_manager.rs`), asserted here so that a payload
+            // landing somewhere unexpected fails with *that* sentence rather
+            // than as a puzzling `expected "scoop", got "direct"` later on.
+            // `assert_managed` still makes the real assertion by asking the
+            // installed binary what owns it; this only sharpens the message.
+            let normalised = installed
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_lowercase();
             anyhow::ensure!(
-                installed.is_file(),
-                "`scoop install` succeeded but {} is not a file",
+                normalised.contains("scoop/apps/"),
+                "`scoop install` put the binary at {}, which does not contain the \
+                 two adjacent segments `scoop/apps/` that `detect_from_path` \
+                 matches, so this install would be classified `direct`. Do not \
+                 loosen the rule to accommodate it",
                 installed.display(),
             );
             Ok(installed)

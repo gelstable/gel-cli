@@ -22,16 +22,21 @@
 //! Two host prerequisites, neither of which this scenario will arrange for
 //! itself:
 //!
-//! * WinGet has to be present. It is *not* preinstalled on the `windows-2025`
-//!   GitHub runner image, and bootstrapping `Microsoft.DesktopAppInstaller`
-//!   onto Windows Server is exactly the flakiness this harness is supposed to
-//!   avoid, so in CI this scenario skips. See `run` — the skip is deliberately
-//!   loud, because a quiet one under `continue-on-error: true` reads as a pass.
-//! * `winget install --manifest` is gated on the `LocalManifestFiles` setting
-//!   for a non-elevated user. An elevated shell (which is what a GitHub Windows
-//!   runner gives you) needs nothing; otherwise the host needs
-//!   `winget settings --enable LocalManifestFiles` once, as administrator. A
-//!   host without it fails with WinGet's own message naming that command.
+//! * WinGet has to be present. It *is* on the `windows-2025` GitHub runner
+//!   image, even though the image README does not list it — a first CI run
+//!   settled that by installing through it for real. It is still absent from
+//!   plenty of other Windows hosts (Server SKUs without the App Installer
+//!   package), so `run` still checks and skips loudly.
+//! * `winget install --manifest` is gated behind the `LocalManifestFiles`
+//!   administrator policy. Running elevated is *not* enough — the first CI run
+//!   failed on an elevated runner with "This feature needs to be enabled by
+//!   administrators" — so the host needs
+//!   `winget settings --enable LocalManifestFiles` once, as administrator.
+//!   This scenario reads the policy through `winget settings export` and skips
+//!   rather than flipping it: it is machine-wide state with no reliable way to
+//!   read back a prior value and restore it, so a test must never change it on
+//!   a real machine. The CI job does enable it, in a step whose comment says
+//!   the only reason that is acceptable is that the runner is ephemeral.
 //!
 //! The package identifier is deliberately *not* the real `Gelstable.Gel` that
 //! `InstallManager::WinGet.upgrade_hint()` names. Cleanup uninstalls by
@@ -91,21 +96,23 @@ mod imp {
         if !available() {
             // Opens with the literal `skipping:` because
             // `scripts/ci/run-install-scenario.sh` greps for exactly that to
-            // decide a job tested nothing. This scenario is run with
-            // GEL_E2E_ALLOW_SKIP=1 so the guard is disarmed for it — but the
-            // marker still has to be here, or the day someone arms the guard
-            // (a runner image that gains WinGet) it would silently not fire.
+            // decide a job tested nothing, and fails the job on a hit.
             eprintln!(
                 "skipping: WINGET IS NOT USABLE ON THIS HOST, SO e2e_winget \
                  PROVED NOTHING.\n\
-                 `winget` could not be found on PATH, or could not run. WinGet is \
-                 not part of the `windows-2025` GitHub runner image (that image \
-                 ships Chocolatey, not the Windows Package Manager), and this \
-                 harness deliberately does not bootstrap \
-                 Microsoft.DesktopAppInstaller onto Windows Server.\n\
+                 `winget` is not on PATH, or is a WindowsApps execution alias \
+                 with no App Installer package behind it to run. Note this is \
+                 *not* the expected state on a GitHub `windows-2025` runner: \
+                 WinGet is present there (the image README simply does not list \
+                 it), so seeing this in CI means something regressed, not that \
+                 it was never available.\n\
                  Nothing about WinGet detection was exercised: treat a green \
                  result for this scenario as \"not run\", never as \"passed\"."
             );
+            return;
+        }
+        if let Some(reason) = local_manifests_disabled() {
+            eprintln!("skipping: {reason}");
             return;
         }
         if let Some(reason) = occupied() {
@@ -126,6 +133,47 @@ mod imp {
     fn available() -> bool {
         scenario::have("winget")
             && scenario::run_quietly(winget().arg("--version")).is_some_and(|out| out.success)
+    }
+
+    /// Why `winget install --manifest` would refuse before it is attempted.
+    ///
+    /// `winget settings export` prints the effective settings as JSON,
+    /// including the `adminSettings` block, so the policy can be *read* rather
+    /// than discovered from a failed install — which is the difference between
+    /// a clean skip that names the fix and a panic a developer has to decode.
+    ///
+    /// `None` both when the policy is on and when the question cannot be
+    /// answered at all (no export, unparseable JSON, a WinGet too old to have
+    /// the key). An unreadable setting must not silence the scenario: if the
+    /// install then fails, it fails with WinGet's own message, which names the
+    /// same command this one does.
+    ///
+    /// Deliberately read-only. Enabling the policy is machine-wide state with
+    /// no way to learn what it was before, so the harness will not do it to
+    /// someone's machine; the CI job does it to an ephemeral runner instead.
+    fn local_manifests_disabled() -> Option<String> {
+        let out = scenario::run_quietly(winget().arg("settings").arg("export"))?;
+        if !out.success {
+            return None;
+        }
+        // WinGet may emit a UTF-8 BOM, which `serde_json` rejects.
+        let body = out.stdout.trim_start_matches('\u{feff}').trim();
+        let settings: serde_json::Value = serde_json::from_str(body).ok()?;
+        let enabled = settings
+            .get("adminSettings")?
+            .get("LocalManifestFiles")?
+            .as_bool()?;
+        if enabled {
+            return None;
+        }
+        Some(format!(
+            "`winget install --manifest` is disabled on this host by the \
+             LocalManifestFiles administrator policy, so {PACKAGE_ID} cannot be \
+             installed from the local manifest this scenario builds. Run \
+             `winget settings --enable LocalManifestFiles` in an elevated shell \
+             to allow it — this harness will not change a machine-wide setting \
+             on your behalf"
+        ))
     }
 
     /// A `winget` command with the prompts that would hang a captured stdin

@@ -15,9 +15,6 @@ verify it before use:
 gh attestation verify gel-v7.11.0-x86_64-unknown-linux-musl.tar.gz --owner gelstable
 ```
 
-Native package manager installation is added by the
-[package manager configs plan](docs/superpowers/plans/2026-09-12-native-package-manager-configs.md).
-
 The legacy `curl --proto '=https' --tlsv1.2 -sSfL https://geldata.com/sh | sh`
 installer is no longer a recommended installation path for this fork.
 

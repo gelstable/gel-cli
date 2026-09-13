@@ -85,3 +85,17 @@ fn e2e_homebrew() {
 fn e2e_nix() {
     scenarios::nix::run();
 }
+
+/// Scoop, on Windows: an app directory under the user's home.
+#[test]
+#[ignore = "installs the CLI for real; run explicitly with --ignored"]
+fn e2e_scoop() {
+    scenarios::scoop::run();
+}
+
+/// WinGet, on Windows: a portable package under WinGet's `Packages` root.
+#[test]
+#[ignore = "installs the CLI for real; run explicitly with --ignored"]
+fn e2e_winget() {
+    scenarios::winget::run();
+}

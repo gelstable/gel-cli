@@ -9,6 +9,8 @@ pub mod dnf;
 pub mod homebrew;
 pub mod nix;
 pub mod pacman;
+pub mod scoop;
+pub mod winget;
 
 /// Not a scenario: what apt, dnf and pacman share.
 mod unix_package;

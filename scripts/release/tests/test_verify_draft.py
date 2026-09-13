@@ -1,10 +1,10 @@
 import unittest
 
-from scripts.release import assets, registry_manifest, verify_draft
+from gel_release import assets, registry_manifest, verify_draft
 
 
 def _manifest(version: str) -> dict:
-    from scripts.release import digests
+    from gel_release import digests
 
     entries = {}
     for index, target in enumerate(assets.REGISTRY_TARGETS):
@@ -14,9 +14,7 @@ def _manifest(version: str) -> dict:
         entries[assets.registry_zstd_name(target)] = digests.FileDigest(
             size=5 + index, sha256=f"{index + 9:064x}", blake2b512=f"{index + 9:0128x}"
         )
-    return registry_manifest.build_manifest(
-        version, "2026-09-12T00:00:00+00:00", entries
-    )
+    return registry_manifest.build_manifest(version, "2026-09-12T00:00:00+00:00", entries)
 
 
 class ManifestUrlTests(unittest.TestCase):
@@ -39,9 +37,7 @@ class ManifestUrlTests(unittest.TestCase):
     def test_distribution_asset_reference_is_rejected(self):
         manifest = _manifest("7.11.0")
         manifest["indexes"][0]["packages"][0]["installrefs"][0]["ref"] = (
-            assets.release_download_url(
-                "7.11.0", "gel-v7.11.0-x86_64-unknown-linux-musl.tar.gz"
-            )
+            assets.release_download_url("7.11.0", "gel-v7.11.0-x86_64-unknown-linux-musl.tar.gz")
         )
         with self.assertRaises(verify_draft.DraftVerificationError) as raised:
             verify_draft.check_manifest_urls(manifest, "7.11.0")

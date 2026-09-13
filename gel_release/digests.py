@@ -11,7 +11,7 @@ from .assets import BLAKE2B_SUMS_NAME, SHA256SUMS_NAME
 CHUNK_SIZE = 1024 * 1024
 
 
-class DigestMismatch(Exception):
+class DigestMismatch(ValueError):
     """A file on disk does not match its recorded digest."""
 
 
@@ -68,6 +68,4 @@ def verify_sums(directory: Path, sums_path: Path) -> None:
             raise DigestMismatch(f"{name} listed in {sums_path.name} is missing")
         actual = _select(digest_file(target), algorithm)
         if actual != expected:
-            raise DigestMismatch(
-                f"{name}: expected {algorithm} {expected}, computed {actual}"
-            )
+            raise DigestMismatch(f"{name}: expected {algorithm} {expected}, computed {actual}")

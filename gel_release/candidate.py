@@ -8,17 +8,20 @@ tip of a branch or the latest successful workflow run.
 
 from __future__ import annotations
 
-import argparse
 import json
+import urllib.request
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from . import assets, digests
+from .models import CandidateRecord
 
 SCHEMA_VERSION = 1
 CANDIDATE_PATH = Path("packaging/release-candidate.json")
 
 
-class CandidateMismatch(Exception):
+class CandidateMismatch(ValueError):
     """On-disk assets disagree with the recorded candidate."""
 
 
@@ -61,27 +64,29 @@ def build_record(
     }
 
 
-def dump(record: dict) -> bytes:
+def dump(record: dict | CandidateRecord) -> bytes:
+    if isinstance(record, CandidateRecord):
+        record = record.model_dump(mode="json")
     return (json.dumps(record, indent=2, sort_keys=False) + "\n").encode()
 
 
 def load(path: Path = CANDIDATE_PATH) -> dict:
-    return json.loads(path.read_bytes())
+    return CandidateRecord.model_validate_json(path.read_bytes()).model_dump(mode="json")
 
 
 def verify_record(record: dict, version: str, dist_dir: Path) -> None:
+    try:
+        record = CandidateRecord.model_validate(record).model_dump(mode="json")
+    except ValidationError as error:
+        raise CandidateMismatch(str(error)) from error
     if record["schema_version"] != SCHEMA_VERSION:
-        raise CandidateMismatch(
-            f"unsupported candidate schema_version {record['schema_version']}"
-        )
+        raise CandidateMismatch(f"unsupported candidate schema_version {record['schema_version']}")
     if record["version"] != version:
         raise CandidateMismatch(
             f"candidate records version {record['version']}, expected {version}"
         )
     if record["tag"] != f"v{version}":
-        raise CandidateMismatch(
-            f"candidate records tag {record['tag']}, expected v{version}"
-        )
+        raise CandidateMismatch(f"candidate records tag {record['tag']}, expected v{version}")
 
     recorded = {entry["name"]: entry for entry in record["assets"]}
     expected = assets.expected_assets(version)
@@ -94,9 +99,7 @@ def verify_record(record: dict, version: str, dist_dir: Path) -> None:
     if on_disk != expected:
         missing = sorted(set(expected) - set(on_disk))
         extra = sorted(set(on_disk) - set(expected))
-        raise CandidateMismatch(
-            f"staged directory mismatch; missing={missing} extra={extra}"
-        )
+        raise CandidateMismatch(f"staged directory mismatch; missing={missing} extra={extra}")
 
     for name, entry in recorded.items():
         digest = digests.digest_file(dist_dir / name)
@@ -110,60 +113,53 @@ def verify_record(record: dict, version: str, dist_dir: Path) -> None:
             raise CandidateMismatch(f"{name}: BLAKE2b does not match recorded digest")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
+def write_record(
+    *,
+    version: str,
+    draft_release_id: int,
+    source_sha: str,
+    build_date: str,
+    run_id: int,
+    run_attempt: int,
+    dist_dir: Path,
+    asset_ids_path: Path,
+    out: Path,
+) -> CandidateRecord:
+    asset_ids = {item["name"]: item["id"] for item in json.loads(asset_ids_path.read_bytes())}
+    record = build_record(
+        version=version,
+        tag=f"v{version}",
+        draft_release_id=draft_release_id,
+        source_sha=source_sha,
+        build_date=build_date,
+        workflow_runs=[
+            {
+                "workflow": "release-candidate.yml",
+                "run_id": run_id,
+                "run_attempt": run_attempt,
+            }
+        ],
+        attestation={
+            "predicate_type": "https://slsa.dev/provenance/v1",
+            "subject_count": len(assets.expected_assets(version)),
+        },
+        dist_dir=dist_dir,
+        asset_ids=asset_ids,
+    )
+    validated = CandidateRecord.model_validate(record)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(dump(validated))
+    return validated
 
-    write = sub.add_parser("write")
-    write.add_argument("--version", required=True)
-    write.add_argument("--draft-release-id", required=True, type=int)
-    write.add_argument("--source-sha", required=True)
-    write.add_argument("--build-date", required=True)
-    write.add_argument("--run-id", required=True, type=int)
-    write.add_argument("--run-attempt", required=True, type=int)
-    write.add_argument("--dist-dir", required=True, type=Path)
-    write.add_argument("--asset-ids", required=True, type=Path)
-    write.add_argument("--out", default=CANDIDATE_PATH, type=Path)
 
-    verify = sub.add_parser("verify")
-    verify.add_argument("--version", required=True)
-    verify.add_argument("--dist-dir", required=True, type=Path)
-    verify.add_argument("--record", default=CANDIDATE_PATH, type=Path)
-
-    args = parser.parse_args()
-
-    if args.command == "write":
-        asset_ids = {
-            item["name"]: item["id"] for item in json.loads(args.asset_ids.read_bytes())
-        }
-        record = build_record(
-            version=args.version,
-            tag=f"v{args.version}",
-            draft_release_id=args.draft_release_id,
-            source_sha=args.source_sha,
-            build_date=args.build_date,
-            workflow_runs=[
-                {
-                    "workflow": "release-candidate.yml",
-                    "run_id": args.run_id,
-                    "run_attempt": args.run_attempt,
-                }
-            ],
-            attestation={
-                "predicate_type": "https://slsa.dev/provenance/v1",
-                "subject_count": len(assets.expected_assets(args.version)),
-            },
-            dist_dir=args.dist_dir,
-            asset_ids=asset_ids,
+def verify_public(record: dict, download_dir: Path) -> None:
+    validated = CandidateRecord.model_validate(record)
+    download_dir.mkdir(parents=True, exist_ok=True)
+    for entry in validated.assets:
+        target = download_dir / entry.name
+        urllib.request.urlretrieve(
+            assets.release_download_url(validated.version, entry.name), target
         )
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_bytes(dump(record))
-        print(f"wrote {args.out} for {record['tag']}")
-        return
-
-    verify_record(load(args.record), args.version, args.dist_dir)
-    print(f"candidate record matches {args.dist_dir}")
-
-
-if __name__ == "__main__":
-    main()
+        digest = digests.digest_file(target)
+        if digest.sha256 != entry.sha256 or digest.size != entry.size:
+            raise CandidateMismatch(f"{entry.name}: public bytes differ from candidate")

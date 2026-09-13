@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.release import digests
+from gel_release import digests
 
 
 class DigestFileTests(unittest.TestCase):
@@ -44,9 +44,7 @@ class SumsFileTests(unittest.TestCase):
             self.assertEqual([line.split("  ")[1] for line in lines], ["a.txt", "b.txt"])
             self.assertTrue(out.read_bytes().endswith(b"\n"))
             self.assertNotIn(b"\r", out.read_bytes())
-            self.assertEqual(
-                lines[0].split("  ")[0], hashlib.sha256(b"alpha").hexdigest()
-            )
+            self.assertEqual(lines[0].split("  ")[0], hashlib.sha256(b"alpha").hexdigest())
 
     def test_blake2b_sums_use_128_hex_characters(self):
         with tempfile.TemporaryDirectory() as tmp:

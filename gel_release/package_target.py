@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import gzip
 import shutil
 import stat
@@ -126,29 +125,3 @@ def build_archive(
         return archive
     else:
         raise ValueError(f"unsupported archive extension: {target.archive_ext}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--completions-dir", required=True, type=Path)
-    parser.add_argument("--out-dir", required=True, type=Path)
-    parser.add_argument("--repo-root", default=Path("."), type=Path)
-    args = parser.parse_args()
-
-    target = assets.BY_TRIPLE[args.target]
-    extras = [args.repo_root / name for name in ARCHIVE_EXTRA_FILES]
-
-    if target.registry:
-        for path in build_registry_payload(args.binary, target, args.out_dir):
-            print(path.name)
-    archive = build_archive(
-        args.binary, target, args.version, args.completions_dir, extras, args.out_dir
-    )
-    print(archive.name)
-
-
-if __name__ == "__main__":
-    main()

@@ -7,7 +7,6 @@ packaging-only diff. This module compares complete trees instead.
 
 from __future__ import annotations
 
-import argparse
 import subprocess
 from pathlib import Path
 
@@ -21,7 +20,7 @@ ALLOWLIST = frozenset(
 )
 
 
-class SourceDrift(Exception):
+class SourceDrift(ValueError):
     """Two trees differ outside the allowlist."""
 
 
@@ -77,18 +76,3 @@ def assert_equivalent(base_rev: str, head_rev: str, repo: Path = Path(".")) -> N
             f"{head_rev} is not source-equivalent to {base_rev}:\n"
             + "\n".join(f"  {line}" for line in differences)
         )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", required=True, help="the staged source SHA")
-    parser.add_argument("--head", required=True, help="the prospective or actual merge SHA")
-    parser.add_argument("--repo", default=Path("."), type=Path)
-    args = parser.parse_args()
-
-    assert_equivalent(args.base, args.head, args.repo)
-    print(f"{args.head} is source-equivalent to {args.base} outside the allowlist")
-
-
-if __name__ == "__main__":
-    main()

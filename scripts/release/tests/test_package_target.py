@@ -4,11 +4,11 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
-from unittest import mock
 import zipfile
 from pathlib import Path
+from unittest import mock
 
-from scripts.release import assets, package_target
+from gel_release import assets, package_target
 
 
 def _fake_tree(root: Path) -> tuple[Path, Path, list[Path]]:
@@ -86,9 +86,7 @@ class ArchiveTests(unittest.TestCase):
             names = tar.getnames()
             self.assertEqual(names, sorted(names))
             self.assertIn("gel-v7.11.0-x86_64-unknown-linux-musl/gel", names)
-            self.assertIn(
-                "gel-v7.11.0-x86_64-unknown-linux-musl/completions/gel.bash", names
-            )
+            self.assertIn("gel-v7.11.0-x86_64-unknown-linux-musl/completions/gel.bash", names)
             member = tar.getmember("gel-v7.11.0-x86_64-unknown-linux-musl/gel")
             self.assertEqual(member.mode & 0o777, 0o755)
             self.assertEqual(member.mtime, 0)
@@ -127,9 +125,7 @@ class ArchiveTests(unittest.TestCase):
 
         with mock.patch("gzip.GzipFile", side_effect=RuntimeError("gzip failed")):
             with self.assertRaises(RuntimeError):
-                package_target.build_archive(
-                    binary, target, "7.11.0", completions, extras, out
-                )
+                package_target.build_archive(binary, target, "7.11.0", completions, extras, out)
         self.assertFalse(raw.exists(), "raw tar must be unlinked even if gzipping fails")
 
     def test_unsupported_archive_extension_raises(self):
@@ -150,9 +146,7 @@ class ArchiveTests(unittest.TestCase):
             rpm_arch=None,
         )
         with self.assertRaises(ValueError):
-            package_target.build_archive(
-                binary, bogus_target, "7.11.0", completions, extras, out
-            )
+            package_target.build_archive(binary, bogus_target, "7.11.0", completions, extras, out)
 
 
 if __name__ == "__main__":

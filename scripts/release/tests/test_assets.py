@@ -1,6 +1,6 @@
 import unittest
 
-from scripts.release import assets
+from gel_release import assets
 
 
 class TargetInventoryTests(unittest.TestCase):
@@ -25,12 +25,8 @@ class TargetInventoryTests(unittest.TestCase):
 class AssetNameTests(unittest.TestCase):
     def test_unix_registry_names(self):
         target = assets.BY_TRIPLE["aarch64-apple-darwin"]
-        self.assertEqual(
-            assets.registry_identity_name(target), "gel-cli-aarch64-apple-darwin"
-        )
-        self.assertEqual(
-            assets.registry_zstd_name(target), "gel-cli-aarch64-apple-darwin.zst"
-        )
+        self.assertEqual(assets.registry_identity_name(target), "gel-cli-aarch64-apple-darwin")
+        self.assertEqual(assets.registry_zstd_name(target), "gel-cli-aarch64-apple-darwin.zst")
 
     def test_windows_registry_names_keep_exe_suffix(self):
         target = assets.BY_TRIPLE["x86_64-pc-windows-msvc"]

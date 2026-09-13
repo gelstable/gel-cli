@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.release import source_equivalence
+from gel_release import source_equivalence
 
 
 def _git(repo: Path, *argv: str) -> str:

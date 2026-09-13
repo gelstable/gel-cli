@@ -6,7 +6,6 @@ matrix has already produced target/<triple>/release/gel and the completions.
 
 from __future__ import annotations
 
-import argparse
 import shutil
 import subprocess
 import tempfile
@@ -59,9 +58,7 @@ def _manifest_with_target(repo_root: Path, target: assets.Target) -> None:
     manifest.write_text(text.replace(TARGET_PLACEHOLDER, target.triple))
 
 
-def build(
-    target: assets.Target, version: str, completions_dir: Path, out_dir: Path
-) -> list[Path]:
+def build(target: assets.Target, version: str, completions_dir: Path, out_dir: Path) -> list[Path]:
     _require_linux(target)
     repo_root = Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -88,21 +85,3 @@ def build(
             shutil.move(str(path), str(final))
         produced.append(final)
     return produced
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--completions-dir", required=True, type=Path)
-    parser.add_argument("--out-dir", required=True, type=Path)
-    args = parser.parse_args()
-
-    for path in build(
-        assets.BY_TRIPLE[args.target], args.version, args.completions_dir, args.out_dir
-    ):
-        print(path.name)
-
-
-if __name__ == "__main__":
-    main()

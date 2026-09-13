@@ -7,25 +7,23 @@ stored, not the bytes the build job happened to leave on disk.
 
 from __future__ import annotations
 
-import argparse
 import json
 import subprocess
 from pathlib import Path
 
 from . import assets, candidate, digests, registry_manifest
+from .models import GithubAsset
 
 DISTRIBUTION_SUFFIXES = (".tar.gz", ".zip", ".deb", ".rpm")
 DIGEST_MANIFEST_NAMES = (assets.SHA256SUMS_NAME, assets.BLAKE2B_SUMS_NAME)
 
 
-class DraftVerificationError(Exception):
+class DraftVerificationError(ValueError):
     """The staged release does not match the reviewed candidate."""
 
 
 def _gh_json(*argv: str) -> object:
-    completed = subprocess.run(
-        ["gh", *argv], check=True, capture_output=True, text=True
-    )
+    completed = subprocess.run(["gh", *argv], check=True, capture_output=True, text=True)
     text = completed.stdout.strip()
     if not text:
         return None
@@ -61,12 +59,18 @@ def list_release_assets(
         "--jq",
         "[.[] | {id: .id, name: .name, size: .size}]",
     )
+    if payload is None:
+        return []
+    if not isinstance(payload, list):
+        raise DraftVerificationError("GitHub assets response must be a list")
     flattened: list[dict] = []
     if payload and isinstance(payload[0], list):
         for page in payload:
+            if not isinstance(page, list):
+                raise DraftVerificationError("GitHub paginated assets response is invalid")
             flattened.extend(page)
-        return flattened
-    return list(payload) if payload else []
+        return [item.model_dump() for item in map(GithubAsset.model_validate, flattened)]
+    return [GithubAsset.model_validate(item).model_dump() for item in payload]
 
 
 def download_asset(asset_id: int, destination: Path, repo: str = assets.REPOSITORY) -> None:
@@ -87,9 +91,7 @@ def download_asset(asset_id: int, destination: Path, repo: str = assets.REPOSITO
 
 def verify_attestations(paths: list[Path], repo: str = assets.REPOSITORY) -> None:
     for path in paths:
-        subprocess.run(
-            ["gh", "attestation", "verify", str(path), "--repo", repo], check=True
-        )
+        subprocess.run(["gh", "attestation", "verify", str(path), "--repo", repo], check=True)
 
 
 def check_inventory(listed: list[dict], version: str) -> None:
@@ -127,9 +129,7 @@ def check_manifest_urls(manifest: dict, version: str) -> None:
                 f"isolation invariant violated: gel-registry.json references {name}"
             )
         if name not in permitted:
-            raise DraftVerificationError(
-                f"gel-registry.json references unknown asset {name}"
-            )
+            raise DraftVerificationError(f"gel-registry.json references unknown asset {name}")
 
 
 def verify(
@@ -182,27 +182,4 @@ def verify(
                     )
 
     if verify_attestations_flag:
-        verify_attestations(
-            [download_dir / entry["name"] for entry in record["assets"]], repo
-        )
-
-
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--record", default=candidate.CANDIDATE_PATH, type=Path)
-    parser.add_argument("--download-dir", required=True, type=Path)
-    parser.add_argument("--repo", default=assets.REPOSITORY)
-    parser.add_argument("--skip-attestations", action="store_true")
-    args = parser.parse_args(argv)
-
-    verify(
-        candidate.load(args.record),
-        args.download_dir,
-        args.repo,
-        verify_attestations_flag=not args.skip_attestations,
-    )
-    print("staged candidate verified against the draft release")
-
-
-if __name__ == "__main__":
-    main()
+        verify_attestations([download_dir / entry["name"] for entry in record["assets"]], repo)

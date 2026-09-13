@@ -37,16 +37,13 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        if: steps.gate.outputs.release == 'true'
 
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
         if: steps.gate.outputs.release == 'true'
         with:
           toolchain: "1.88"
-
-      - name: Install jsonschema
-        if: steps.gate.outputs.release == 'true'
-        run: python3 -m pip install --break-system-packages jsonschema==4.23.0
-
       - name: Require a staged candidate
         if: steps.gate.outputs.release == 'true'
         run: |
@@ -67,7 +64,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -m scripts.release.verify_draft \
+          uv run --frozen gel-release verify-draft \
             --record packaging/release-candidate.json \
             --download-dir readback
 
@@ -79,7 +76,7 @@ jobs:
           # committed metadata reviewable: a hand-edited hash fails here.
           version="$(jq -r '.version' packaging/release-candidate.json)"
           build_date="$(jq -r '.build_date' packaging/release-candidate.json)"
-          python3 -m scripts.release.registry_manifest \
+          uv run --frozen gel-release registry-manifest \
             --version "$version" --build-date "$build_date" \
             --dist-dir readback --out /tmp/gel-registry.json
           cmp /tmp/gel-registry.json readback/gel-registry.json
@@ -101,5 +98,5 @@ jobs:
           source_sha="$(jq -r '.source_sha' packaging/release-candidate.json)"
           git fetch --no-tags origin "refs/pull/${{ github.event.pull_request.number }}/merge"
           merge_sha="$(git rev-parse FETCH_HEAD)"
-          python3 -m scripts.release.source_equivalence \
+          uv run --frozen gel-release source-equivalence \
             --base "$source_sha" --head "$merge_sha"

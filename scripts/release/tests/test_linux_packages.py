@@ -5,7 +5,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from scripts.release import assets, linux_packages
+from gel_release import assets, linux_packages
 
 CARGO = tomllib.loads(Path("Cargo.toml").read_text())
 AMD64 = assets.BY_TRIPLE["x86_64-unknown-linux-musl"]
@@ -33,9 +33,7 @@ class CargoMetadataTests(unittest.TestCase):
 
     def test_rpm_and_deb_do_not_depend_on_a_dynamic_libc(self):
         self.assertEqual(CARGO["package"]["metadata"]["deb"]["depends"], "")
-        self.assertEqual(
-            CARGO["package"]["metadata"]["generate-rpm"]["auto-req"], "no"
-        )
+        self.assertEqual(CARGO["package"]["metadata"]["generate-rpm"]["auto-req"], "no")
 
 
 class CommandTests(unittest.TestCase):
@@ -100,16 +98,12 @@ class BuildTests(unittest.TestCase):
 
         original_manifest = Path("Cargo.toml").read_text()
         with (
-            unittest.mock.patch(
-                "tempfile.NamedTemporaryFile", side_effect=spy_named_temp
-            ),
+            unittest.mock.patch("tempfile.NamedTemporaryFile", side_effect=spy_named_temp),
             unittest.mock.patch("subprocess.run", side_effect=fake_run),
             tempfile.TemporaryDirectory() as tmp_out,
         ):
             with self.assertRaises(subprocess.CalledProcessError):
-                linux_packages.build(
-                    AMD64, "7.11.0", Path("target/completions"), Path(tmp_out)
-                )
+                linux_packages.build(AMD64, "7.11.0", Path("target/completions"), Path(tmp_out))
 
         self.assertIsNotNone(manifest_during_run)
         self.assertIn(AMD64.triple, manifest_during_run)
@@ -140,16 +134,12 @@ class BuildTests(unittest.TestCase):
 
         original_manifest = Path("Cargo.toml").read_text()
         with (
-            unittest.mock.patch(
-                "tempfile.NamedTemporaryFile", side_effect=spy_named_temp
-            ),
+            unittest.mock.patch("tempfile.NamedTemporaryFile", side_effect=spy_named_temp),
             unittest.mock.patch("subprocess.run", side_effect=fake_run),
             tempfile.TemporaryDirectory() as tmp_out,
         ):
             out_dir = Path(tmp_out)
-            produced = linux_packages.build(
-                AMD64, "7.11.0", Path("target/completions"), out_dir
-            )
+            produced = linux_packages.build(AMD64, "7.11.0", Path("target/completions"), out_dir)
             self.assertEqual(len(produced), 2)
             self.assertEqual(produced[0], out_dir / assets.deb_name("7.11.0", AMD64))
             self.assertEqual(produced[1], out_dir / assets.rpm_name("7.11.0", AMD64))
@@ -165,4 +155,3 @@ class BuildTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

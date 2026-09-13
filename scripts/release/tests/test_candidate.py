@@ -1,13 +1,11 @@
 import contextlib
 import io
 import json
-import sys
 import tempfile
 import unittest
-import unittest.mock
 from pathlib import Path
 
-from scripts.release import assets, candidate
+from gel_release import assets, candidate, cli
 
 
 def _dist(root: Path, version: str) -> tuple[Path, dict[str, int]]:
@@ -28,9 +26,7 @@ def _record(root: Path, version: str = "7.11.0") -> tuple[dict, Path]:
         draft_release_id=123456789,
         source_sha="a" * 40,
         build_date="2026-09-12T00:00:00+00:00",
-        workflow_runs=[
-            {"workflow": "release-candidate.yml", "run_id": 42, "run_attempt": 1}
-        ],
+        workflow_runs=[{"workflow": "release-candidate.yml", "run_id": 42, "run_attempt": 1}],
         attestation={
             "predicate_type": "https://slsa.dev/provenance/v1",
             "subject_count": 23,
@@ -174,13 +170,11 @@ class CliTests(unittest.TestCase):
             root = Path(tmp)
             dist, ids = _dist(root, "7.11.0")
             asset_ids_path = root / "asset-ids.json"
-            asset_ids_path.write_text(
-                json.dumps([{"name": k, "id": v} for k, v in ids.items()])
-            )
+            asset_ids_path.write_text(json.dumps([{"name": k, "id": v} for k, v in ids.items()]))
             out_record = root / "release-candidate.json"
 
             write_args = [
-                "candidate.py",
+                "candidate",
                 "write",
                 "--version",
                 "7.11.0",
@@ -202,15 +196,13 @@ class CliTests(unittest.TestCase):
                 str(out_record),
             ]
             buf = io.StringIO()
-            with unittest.mock.patch.object(
-                sys, "argv", write_args
-            ), contextlib.redirect_stdout(buf):
-                candidate.main()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(cli.main(write_args), 0)
             self.assertIn("wrote", buf.getvalue())
             self.assertTrue(out_record.is_file())
 
             verify_args = [
-                "candidate.py",
+                "candidate",
                 "verify",
                 "--version",
                 "7.11.0",
@@ -220,10 +212,8 @@ class CliTests(unittest.TestCase):
                 str(out_record),
             ]
             buf = io.StringIO()
-            with unittest.mock.patch.object(
-                sys, "argv", verify_args
-            ), contextlib.redirect_stdout(buf):
-                candidate.main()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(cli.main(verify_args), 0)
             self.assertIn("matches", buf.getvalue())
 
 

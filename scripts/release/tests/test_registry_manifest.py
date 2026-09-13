@@ -2,9 +2,7 @@ import json
 import unittest
 from pathlib import Path
 
-import jsonschema
-
-from scripts.release import assets, digests, registry_manifest
+from gel_release import assets, digests, registry_manifest
 
 FIXTURE = Path("tests/fixtures/registry/release-manifest/gel-registry.json")
 
@@ -45,23 +43,17 @@ class ManifestShapeTests(unittest.TestCase):
 
     def test_installrefs_are_identity_then_zstd(self):
         package = self.manifest["indexes"][0]["packages"][0]
-        self.assertEqual(
-            [ref["encoding"] for ref in package["installrefs"]], ["identity", "zstd"]
-        )
+        self.assertEqual([ref["encoding"] for ref in package["installrefs"]], ["identity", "zstd"])
         self.assertTrue(
             package["installrefs"][0]["ref"].startswith(
                 "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/"
             )
         )
         self.assertTrue(package["installrefs"][1]["ref"].endswith(".zst"))
-        self.assertEqual(
-            package["installrefs"][0]["type"], "application/x-pie-executable"
-        )
+        self.assertEqual(package["installrefs"][0]["type"], "application/x-pie-executable")
 
     def test_verification_digests_are_bare_hex(self):
-        verification = self.manifest["indexes"][0]["packages"][0]["installrefs"][0][
-            "verification"
-        ]
+        verification = self.manifest["indexes"][0]["packages"][0]["installrefs"][0]["verification"]
         self.assertEqual(len(verification["blake2b"]), 128)
         self.assertNotIn(":", verification["blake2b"])
         self.assertEqual(len(verification["sha256"]), 64)
@@ -117,17 +109,13 @@ class IsolationTests(unittest.TestCase):
             size=1, sha256="0" * 64, blake2b512="0" * 128
         )
         with self.assertRaises(ValueError):
-            registry_manifest.build_manifest(
-                "1.2.3", "2026-09-12T00:00:00+00:00", entries
-            )
+            registry_manifest.build_manifest("1.2.3", "2026-09-12T00:00:00+00:00", entries)
 
     def test_missing_registry_asset_is_rejected(self):
         entries = _entries("1.2.3")
         del entries["gel-cli-aarch64-apple-darwin.zst"]
         with self.assertRaises(KeyError):
-            registry_manifest.build_manifest(
-                "1.2.3", "2026-09-12T00:00:00+00:00", entries
-            )
+            registry_manifest.build_manifest("1.2.3", "2026-09-12T00:00:00+00:00", entries)
 
     def test_no_distribution_name_appears_anywhere_in_the_document(self):
         rendered = registry_manifest.dump(
@@ -149,7 +137,7 @@ class GoldenFixtureTests(unittest.TestCase):
         self.assertEqual(
             FIXTURE.read_bytes(),
             rendered,
-            "regenerate with: python3 -m scripts.release.tests.regenerate_fixture",
+            "regenerate with: uv run --frozen python -m scripts.release.tests.regenerate_fixture",
         )
 
     def test_fixture_validates(self):

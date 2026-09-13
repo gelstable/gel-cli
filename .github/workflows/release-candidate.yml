@@ -25,6 +25,8 @@ jobs:
       tag: ${{ steps.identity.outputs.tag }}
       source_sha: ${{ steps.identity.outputs.source_sha }}
       build_date: ${{ steps.identity.outputs.build_date }}
+      build_matrix: ${{ steps.matrix.outputs.build }}
+      smoke_matrix: ${{ steps.matrix.outputs.smoke }}
     steps:
       - name: Refuse any branch but the release branch
         run: |
@@ -38,6 +40,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
         with:
@@ -61,6 +64,12 @@ jobs:
             echo "build_date=$(git show -s --format=%cI "$GITHUB_SHA")"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Derive target matrices
+        id: matrix
+        run: |
+          echo "build=$(uv run --frozen gel-release matrix build)" >> "$GITHUB_OUTPUT"
+          echo "smoke=$(uv run --frozen gel-release matrix smoke)" >> "$GITHUB_OUTPUT"
+
   completions:
     name: completions
     needs: plan
@@ -69,6 +78,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -76,11 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --bin gel
-          python3 -c "
-          from pathlib import Path
-          from scripts.release import package_target
-          package_target.generate_completions(Path('target/debug/gel'), Path('target/completions'))
-          "
+          uv run --frozen gel-release completions --binary target/debug/gel --out-dir target/completions
           ls -l target/completions
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -94,30 +100,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-            linux_packages: true
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-            linux_packages: true
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            linux_packages: false
-          - target: x86_64-apple-darwin
-            runner: macos-15
-            linux_packages: false
-          - target: x86_64-pc-windows-msvc
-            runner: windows-2025
-            linux_packages: false
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            linux_packages: false
+      matrix: ${{ fromJSON(needs.plan.outputs.build_matrix) }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -147,7 +135,7 @@ jobs:
           set -euo pipefail
           binary="target/${{ matrix.target }}/release/gel"
           if [[ -f "$binary.exe" ]]; then binary="$binary.exe"; fi
-          python3 -m scripts.release.package_target \
+          uv run --frozen gel-release package-target \
             --target "${{ matrix.target }}" \
             --version "${{ needs.plan.outputs.version }}" \
             --binary "$binary" \
@@ -165,7 +153,7 @@ jobs:
         if: matrix.linux_packages
         run: |
           set -euo pipefail
-          python3 -m scripts.release.linux_packages \
+          uv run --frozen gel-release linux-packages \
             --target "${{ matrix.target }}" \
             --version "${{ needs.plan.outputs.version }}" \
             --completions-dir target/completions \
@@ -190,44 +178,17 @@ jobs:
       draft_release_id: ${{ steps.draft.outputs.draft_release_id }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
-
-      - name: Install jsonschema
-        run: python3 -m pip install --break-system-packages jsonschema==4.23.0
-
       - name: Generate the registry manifest and digest manifests
         run: |
           set -euo pipefail
-          python3 -m scripts.release.registry_manifest \
-            --version "${{ needs.plan.outputs.version }}" \
-            --build-date "${{ needs.plan.outputs.build_date }}" \
-            --dist-dir dist \
-            --out dist/gel-registry.json
-          python3 -c "
-          from pathlib import Path
-          from scripts.release import assets, digests
-          dist = Path('dist')
-          skip = {assets.SHA256SUMS_NAME, assets.BLAKE2B_SUMS_NAME}
-          digests.write_sums(dist, 'sha256', dist / assets.SHA256SUMS_NAME, skip)
-          digests.write_sums(dist, 'blake2b512', dist / assets.BLAKE2B_SUMS_NAME, skip)
-          "
-
-      - name: Assert the exact expected inventory
-        run: |
-          set -euo pipefail
-          python3 -c "
-          from pathlib import Path
-          from scripts.release import assets
-          expected = assets.expected_assets('${{ needs.plan.outputs.version }}')
-          found = sorted(p.name for p in Path('dist').iterdir() if p.is_file())
-          assert found == expected, f'missing={sorted(set(expected)-set(found))} extra={sorted(set(found)-set(expected))}'
-          print(f'{len(found)} assets staged')
-          "
+          uv run --frozen gel-release assemble-stage --version "${{ needs.plan.outputs.version }}" --build-date "${{ needs.plan.outputs.build_date }}" --dist-dir dist
 
       - name: Assert every archive has the expected layout
         run: |
@@ -292,7 +253,7 @@ jobs:
       - name: Write the candidate record
         run: |
           set -euo pipefail
-          python3 -m scripts.release.candidate write \
+          uv run --frozen gel-release candidate write \
             --version "${{ needs.plan.outputs.version }}" \
             --draft-release-id "${{ steps.draft.outputs.draft_release_id }}" \
             --source-sha "${{ needs.plan.outputs.source_sha }}" \
@@ -320,18 +281,17 @@ jobs:
       attestations: read
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: candidate-record
           path: packaging
-      - name: Install jsonschema
-        run: python3 -m pip install --break-system-packages jsonschema==4.23.0
       - name: Read the candidate back from the API and verify it
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -m scripts.release.verify_draft \
+          uv run --frozen gel-release verify-draft \
             --record packaging/release-candidate.json \
             --download-dir readback
 
@@ -341,18 +301,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-          - target: aarch64-apple-darwin
-            runner: macos-15
-          - target: x86_64-pc-windows-msvc
-            runner: windows-2025
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
+      matrix: ${{ fromJSON(needs.plan.outputs.smoke_matrix) }}
     steps:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -390,7 +339,6 @@ jobs:
           ref: knope/release
           fetch-depth: 0
           token: ${{ secrets.RELEASE_BOT_TOKEN }}
-
       - name: Refuse to overwrite a newer candidate
         run: |
           set -euo pipefail

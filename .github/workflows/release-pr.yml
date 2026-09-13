@@ -26,7 +26,6 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_BOT_TOKEN }}
-
       - name: Check for pending change files
         id: changes
         run: |

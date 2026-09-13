@@ -23,6 +23,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
         with:
@@ -77,6 +78,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
         with:
@@ -86,11 +88,10 @@ jobs:
       - name: Install release tooling
         run: |
           cargo install --locked --version 0.23.0 knope
-          python3 -m pip install --break-system-packages jsonschema==4.23.0
       - name: Check release configuration
         run: |
           PATH="$(go env GOPATH)/bin:$PATH"
           export PATH
           scripts/ci/check-knope-config.sh
-          python3 -m unittest discover -s scripts/release/tests -t .
+          uv run --frozen pytest -q
           scripts/ci/check-release-workflow.sh

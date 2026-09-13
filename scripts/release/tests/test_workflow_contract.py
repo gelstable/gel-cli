@@ -7,7 +7,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.release import assets
 
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 RELEASE_WORKFLOWS = (
@@ -23,18 +22,25 @@ def _text(name: str) -> str:
 
 
 class MatrixContractTests(unittest.TestCase):
-    def test_staging_matrix_lists_every_target_and_its_runner(self):
+    def test_staging_matrix_is_derived_from_cli(self):
         text = _text("release-candidate.yml")
-        for target in assets.TARGETS:
-            self.assertIn(f"target: {target.triple}", text)
-            self.assertIn(f"runner: {target.runner}", text)
+        self.assertIn("gel-release matrix build", text)
 
     def test_smoke_matrix_covers_every_registry_target(self):
         text = _text("release-candidate.yml")
-        smoke = text.split("  smoke:", 1)[1].split("  commit-metadata:", 1)[0]
-        for target in assets.REGISTRY_TARGETS:
-            self.assertIn(target.triple, smoke)
-        self.assertNotIn("x86_64-apple-darwin", smoke)
+        self.assertIn("gel-release matrix smoke", text)
+
+    def test_repository_python_release_behavior_uses_only_cli(self):
+        for name in RELEASE_WORKFLOWS:
+            text = _text(name)
+            self.assertNotIn("python3 -m scripts.release", text, name)
+            self.assertNotIn("python3 -c", text, name)
+            self.assertNotIn("pip install --break-system-packages", text, name)
+
+    def test_release_config_installs_uv_in_its_own_job(self):
+        release_config = _text("ci.yml").split("  release-config:", 1)[1]
+        self.assertIn("astral-sh/setup-uv@", release_config)
+        self.assertIn("uv run --frozen pytest", release_config)
 
 
 class PermissionContractTests(unittest.TestCase):

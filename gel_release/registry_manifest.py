@@ -9,19 +9,16 @@ on the release and ignores every other asset.
 
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 
 import jsonschema
 
 from . import assets, digests
+from .models import ReleaseManifest
 
 SCHEMA_PATH = (
-    Path(__file__).resolve().parent.parent.parent
-    / "packaging"
-    / "schema"
-    / "release-manifest.schema.json"
+    Path(__file__).resolve().parent.parent / "packaging" / "schema" / "release-manifest.schema.json"
 )
 CHANNEL = "stable"
 REVISION = "1"
@@ -54,9 +51,7 @@ def _install_ref(
     }
 
 
-def build_manifest(
-    version: str, build_date: str, entries: dict[str, digests.FileDigest]
-) -> dict:
+def build_manifest(version: str, build_date: str, entries: dict[str, digests.FileDigest]) -> dict:
     permitted = set()
     for target in assets.REGISTRY_TARGETS:
         permitted.add(assets.registry_identity_name(target))
@@ -97,9 +92,7 @@ def build_manifest(
                                 "identity",
                                 entries[identity_name],
                             ),
-                            _install_ref(
-                                version, zstd_name, target, "zstd", entries[zstd_name]
-                            ),
+                            _install_ref(version, zstd_name, target, "zstd", entries[zstd_name]),
                         ],
                         "tags": {},
                     }
@@ -110,38 +103,42 @@ def build_manifest(
 
 
 def validate_manifest(manifest: dict) -> None:
+    ReleaseManifest.model_validate(manifest)
     schema = json.loads(SCHEMA_PATH.read_bytes())
     jsonschema.validate(instance=manifest, schema=schema)
 
 
+def assemble_stage(version: str, build_date: str, dist_dir: Path) -> None:
+    entries = {}
+    for target in assets.REGISTRY_TARGETS:
+        for name in (assets.registry_identity_name(target), assets.registry_zstd_name(target)):
+            path = dist_dir / name
+            if not path.is_file():
+                raise ValueError(f"missing registry asset {name}")
+            entries[name] = digests.digest_file(path)
+    manifest = build_manifest(version, build_date, entries)
+    validate_manifest(manifest)
+    (dist_dir / assets.REGISTRY_MANIFEST_NAME).write_bytes(dump(manifest))
+    skip = {assets.SHA256SUMS_NAME, assets.BLAKE2B_SUMS_NAME}
+    digests.write_sums(dist_dir, "sha256", dist_dir / assets.SHA256SUMS_NAME, skip)
+    digests.write_sums(dist_dir, "blake2b512", dist_dir / assets.BLAKE2B_SUMS_NAME, skip)
+    found = sorted(path.name for path in dist_dir.iterdir() if path.is_file())
+    expected = assets.expected_assets(version)
+    if found != expected:
+        missing = sorted(set(expected) - set(found))
+        extra = sorted(set(found) - set(expected))
+        raise ValueError(f"inventory mismatch; missing={missing} extra={extra}")
+
+
+def write_manifest(version: str, build_date: str, dist_dir: Path, out: Path) -> None:
+    entries = {}
+    for target in assets.REGISTRY_TARGETS:
+        for name in (assets.registry_identity_name(target), assets.registry_zstd_name(target)):
+            entries[name] = digests.digest_file(dist_dir / name)
+    manifest = build_manifest(version, build_date, entries)
+    validate_manifest(manifest)
+    out.write_bytes(dump(manifest))
+
+
 def dump(manifest: dict) -> bytes:
     return (json.dumps(manifest, indent=2, sort_keys=False) + "\n").encode()
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--build-date", required=True)
-    parser.add_argument("--dist-dir", required=True, type=Path)
-    parser.add_argument("--out", required=True, type=Path)
-    args = parser.parse_args()
-
-    entries: dict[str, digests.FileDigest] = {}
-    for target in assets.REGISTRY_TARGETS:
-        for name in (
-            assets.registry_identity_name(target),
-            assets.registry_zstd_name(target),
-        ):
-            path = args.dist_dir / name
-            if not path.is_file():
-                raise SystemExit(f"missing registry asset {name} in {args.dist_dir}")
-            entries[name] = digests.digest_file(path)
-
-    manifest = build_manifest(args.version, args.build_date, entries)
-    validate_manifest(manifest)
-    args.out.write_bytes(dump(manifest))
-    print(f"wrote {args.out} referencing {len(entries)} registry assets")
-
-
-if __name__ == "__main__":
-    main()

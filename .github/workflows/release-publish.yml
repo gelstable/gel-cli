@@ -59,24 +59,22 @@ jobs:
             echo "done=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
+
       - name: Verify source equivalence against the actual merge commit
         if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
         run: |
           set -euo pipefail
           source_sha="$(jq -r '.source_sha' packaging/release-candidate.json)"
-          python3 -m scripts.release.source_equivalence --base "$source_sha" --head "$GITHUB_SHA"
-
-      - name: Install jsonschema
-        if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
-        run: python3 -m pip install --break-system-packages jsonschema==4.23.0
-
+          uv run --frozen gel-release source-equivalence --base "$source_sha" --head "$GITHUB_SHA"
       - name: Verify the reviewed candidate one last time
         if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -m scripts.release.verify_draft \
+          uv run --frozen gel-release verify-draft \
             --record packaging/release-candidate.json \
             --download-dir readback
 
@@ -120,20 +118,8 @@ jobs:
         if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
         run: |
           set -euo pipefail
-          python3 -c "
-          import json, pathlib, urllib.request
-          from scripts.release import assets, digests
-          record = json.loads(pathlib.Path('packaging/release-candidate.json').read_bytes())
-          out = pathlib.Path('public'); out.mkdir()
-          for entry in record['assets']:
-              url = assets.release_download_url(record['version'], entry['name'])
-              target = out / entry['name']
-              urllib.request.urlretrieve(url, target)
-              digest = digests.digest_file(target)
-              assert digest.sha256 == entry['sha256'], f\"{entry['name']}: public bytes differ\"
-              assert digest.size == entry['size'], f\"{entry['name']}: public size differs\"
-          print(f\"verified {len(record['assets'])} public downloads\")
-          "
+          uv run --frozen gel-release verify-public \
+            --record packaging/release-candidate.json --download-dir public
 
       - name: Announce the published release to downstream jobs
         if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'

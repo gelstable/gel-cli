@@ -1,0 +1,153 @@
+name: Release publish
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether a candidate is waiting
+        id: gate
+        run: |
+          set -euo pipefail
+          if [[ ! -f packaging/release-candidate.json ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "No candidate record on master; nothing to publish."
+            exit 0
+          fi
+          tag="$(jq -r '.tag' packaging/release-candidate.json)"
+          release_id="$(jq -r '.draft_release_id' packaging/release-candidate.json)"
+          version="$(jq -r '.version' packaging/release-candidate.json)"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "release_id=$release_id"
+            echo "publish=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Exit successfully if this candidate is already published
+        id: already
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.gate.outputs.release_id }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          draft="$(gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.draft')"
+          if [[ "$draft" == "false" ]]; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG is already published; nothing to do."
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify source equivalence against the actual merge commit
+        if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
+        run: |
+          set -euo pipefail
+          source_sha="$(jq -r '.source_sha' packaging/release-candidate.json)"
+          python3 -m scripts.release.source_equivalence --base "$source_sha" --head "$GITHUB_SHA"
+
+      - name: Install jsonschema
+        if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
+        run: python3 -m pip install --break-system-packages jsonschema
+
+      - name: Verify the reviewed candidate one last time
+        if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -m scripts.release.verify_draft \
+            --record packaging/release-candidate.json \
+            --download-dir readback
+
+      - name: Create the tag at the merge commit
+        if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          existing="$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha' 2>/dev/null || true)"
+          if [[ -n "$existing" ]]; then
+            if [[ "$existing" != "$GITHUB_SHA" ]]; then
+              echo "$TAG already points at $existing, not $GITHUB_SHA; refusing to move it." >&2
+              exit 1
+            fi
+            echo "$TAG already points at the merge commit."
+          else
+            gh api -X POST "/repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" >/dev/null
+            echo "Created $TAG at $GITHUB_SHA."
+          fi
+
+      - name: Publish the existing draft
+        if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.gate.outputs.release_id }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # No asset is rebuilt, repackaged, or replaced here. Only the draft
+          # flag changes; the reviewed bytes are already on the release.
+          gh api -X PATCH "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -f tag_name="$TAG" \
+            -F draft=false \
+            -F make_latest=true >/dev/null
+          echo "Published $TAG."
+
+      - name: Verify the public downloads
+        if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
+        run: |
+          set -euo pipefail
+          python3 -c "
+          import json, pathlib, urllib.request
+          from scripts.release import assets, digests
+          record = json.loads(pathlib.Path('packaging/release-candidate.json').read_bytes())
+          out = pathlib.Path('public'); out.mkdir()
+          for entry in record['assets']:
+              url = assets.release_download_url(record['version'], entry['name'])
+              target = out / entry['name']
+              urllib.request.urlretrieve(url, target)
+              digest = digests.digest_file(target)
+              assert digest.sha256 == entry['sha256'], f\"{entry['name']}: public bytes differ\"
+              assert digest.size == entry['size'], f\"{entry['name']}: public size differs\"
+          print(f\"verified {len(record['assets'])} public downloads\")
+          "
+
+      - name: Announce the published release to downstream jobs
+        if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          VERSION: ${{ steps.gate.outputs.version }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Downstream package-manager jobs are wired to this dispatch rather
+          # than to release:[published], because a bot-published release does
+          # not reliably raise that event. They deduplicate by version and are
+          # retryable without touching the published release.
+          gh api -X POST "/repos/$GITHUB_REPOSITORY/dispatches" \
+            -f event_type=release-published \
+            -f "client_payload[version]=$VERSION" \
+            -f "client_payload[tag]=$TAG"

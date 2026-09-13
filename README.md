@@ -7,17 +7,19 @@ This repository contains the implementation of `gel` command-line tool.
 Install
 =======
 
-Install the latest stable build with:
+Download a release from
+[GitHub Releases](https://github.com/gelstable/gel-cli/releases/latest) and
+verify it before use:
 
-```
-curl --proto '=https' --tlsv1.2 -sSfL https://geldata.com/sh | sh
+```bash
+gh attestation verify gel-v7.11.0-x86_64-unknown-linux-musl.tar.gz --owner gelstable
 ```
 
-Nightly builds can be installed with:
+Native package manager installation is added by the
+[package manager configs plan](docs/superpowers/plans/2026-09-12-native-package-manager-configs.md).
 
-```
-$ curl --proto '=https' --tlsv1.2 -sSfL https://geldata.com/sh | sh -s -- --nightly
-```
+The legacy `curl --proto '=https' --tlsv1.2 -sSfL https://geldata.com/sh | sh`
+installer is no longer a recommended installation path for this fork.
 
 
 Upgrading
@@ -186,3 +188,73 @@ Licensed under either of
 * MIT license (./LICENSE-MIT or http://opensource.org/licenses/MIT)
 
 at your option.
+
+
+Releasing
+=========
+
+Every user-facing pull request adds a change file under `.changeset/`:
+
+```bash
+knope document-change
+```
+
+Its front matter names the package and the bump: `gel-cli: patch`, `gel-cli: minor`,
+or `gel-cli: major`.
+
+1. **Release PR.** Every push to `master` runs `Release PR`, which force-pushes
+   the bot-owned `knope/release` branch with the version bump, `Cargo.lock`
+   update, and `CHANGELOG.md` entry, then dispatches candidate staging. Never
+   commit to `knope/release` by hand.
+2. **Candidate staging.** `Release candidate` builds all six targets, packages
+   the registry executables, archives, `.deb`, `.rpm`, `gel-registry.json`, and
+   both digest manifests, uploads them to an unpublished draft release with build
+   provenance, reads every byte back through the API to verify it, smoke-tests
+   the archived binaries on native runners, and commits
+   `packaging/release-candidate.json` to the release branch.
+3. **Review.** Check the version bump, the changelog, the draft release's assets
+   and provenance, and the recorded candidate identity. The required
+   `Release candidate check / candidate` check re-verifies the draft, regenerates
+   the packaging metadata independently, and proves the prospective merge tree is
+   source-equivalent to the tree that was built.
+4. **Merge.** Merging is the release approval. `Release publish` re-runs the
+   equivalence and asset checks against the actual merge commit, tags it, and
+   flips the reviewed draft to published. Nothing is rebuilt.
+
+**Publication window.** Merge and publication are not atomic. Between the two,
+package manifests on `master` briefly reference downloads that do not exist yet.
+This is the accepted tradeoff for keeping final packaging metadata inside the
+reviewed pull request with no follow-up commit after merge. A publication failure
+surfaces as a failed `Release publish` check on `master`.
+
+**Recovery.** `Release publish` is idempotent and retryable with the same merge
+commit: re-run it. An already-created matching tag and an already-published
+matching release are both treated as completed steps. A tag that resolves to a
+different commit, a missing asset, or a replaced asset stops publication and
+requires maintainer investigation — automation never moves a tag, rebuilds the
+reviewed bytes, or publishes mismatched assets.
+
+Required checks
+---------------
+
+Configure branch protection on `master` to require:
+
+- `CI / quality`
+- `CI / test (linux-x64)`, `CI / test (macos-arm64)`, `CI / test (windows-x64)`,
+  `CI / test (windows-arm64)`
+- `CI / release-config`
+- `Release candidate check / candidate`
+
+Configure each check only after it has reported once on a pull request, so the
+stable check name is known.
+
+Secrets and settings
+--------------------
+
+- `RELEASE_BOT_TOKEN` — a GitHub App installation token or fine-grained PAT
+  scoped to `gelstable/gel-cli` with Contents: read and write and Pull requests:
+  read and write. It deliberately has no `workflows` scope, so release
+  automation cannot modify workflow files.
+- Allow only the release bot to create `v*` tags.
+- Enable GitHub Artifact Attestations; the staging workflow needs
+  `id-token: write` and `attestations: write`.

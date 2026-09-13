@@ -208,11 +208,24 @@ mod imp {
         roots
     }
 
+    /// Where WinGet puts the symlinks a portable package's commands are
+    /// reached through, user scope first — the `Links` sibling of each
+    /// [`portable_roots`] entry.
+    fn link_dirs() -> Vec<PathBuf> {
+        portable_roots()
+            .into_iter()
+            .filter_map(|root| Some(root.parent()?.join("Links")))
+            .collect()
+    }
+
     /// Package directories WinGet has already created for this identifier.
     ///
-    /// The directory name is `<PackageIdentifier>_<source hash>`, and the
-    /// source part is empty for a local manifest, so the prefix is all that can
-    /// be matched on.
+    /// The directory name is `<PackageIdentifier>_<sourceIdentifier>`. For a
+    /// local-manifest install the source part is `_DefaultSource`, so the real
+    /// directory is `GelCliE2E.GelInstallManagerFixture__DefaultSource` —
+    /// note the doubled underscore. The identifier prefix is therefore all
+    /// that can be matched on, and that suffix is also why `cleanup` cannot
+    /// uninstall by `PACKAGE_ID` alone.
     fn package_dirs() -> Vec<PathBuf> {
         let mut found = Vec::new();
         for root in portable_roots() {
@@ -468,6 +481,101 @@ mod imp {
         names.into_iter().next()
     }
 
+    /// Ask WinGet to uninstall the fixture, under every name it might have
+    /// registered it as.
+    ///
+    /// `--id GelCliE2E.GelInstallManagerFixture --exact` — the identifier the
+    /// manifest declares and the obvious thing to try — is *not* what a
+    /// local-manifest portable ends up registered as. The first green CI run
+    /// showed the uninstall answering "No installed package found matching
+    /// input criteria" while the payload sat on disk, because WinGet records
+    /// the installed package under `<PackageIdentifier>_<sourceIdentifier>`.
+    ///
+    /// Rather than hardcode the suffix seen in that log, the candidates are
+    /// derived from the package directories themselves: WinGet names those with
+    /// the same `<Id>_<source>` string it registers, so whatever suffix a given
+    /// WinGet version uses, the directory carries it. The declared identifier
+    /// is still tried first, since that is what a normal source install would
+    /// register as.
+    fn uninstall() {
+        let mut candidates = vec![PACKAGE_ID.to_string()];
+        for dir in package_dirs() {
+            if let Some(name) = dir.file_name().and_then(|name| name.to_str())
+                && name != PACKAGE_ID
+            {
+                candidates.push(name.to_string());
+            }
+        }
+        for id in &candidates {
+            let done = scenario::run_quietly(
+                winget()
+                    .arg("uninstall")
+                    .arg("--id")
+                    .arg(id)
+                    .arg("--exact")
+                    .arg("--disable-interactivity")
+                    .arg("--accept-source-agreements"),
+            )
+            .is_some_and(|out| out.success);
+            if done {
+                return;
+            }
+        }
+        eprintln!(
+            "cleanup: `winget uninstall` matched none of {candidates:?}; \
+             falling back to removing the files directly",
+        );
+    }
+
+    /// Delete anything the install left behind that WinGet did not take away.
+    ///
+    /// This is the only code in this target that deletes outside a tempdir, so
+    /// it is deliberately narrow. Nothing is removed unless it sits directly
+    /// inside one of WinGet's own roots *and* carries this fixture's
+    /// identifier or command alias — both of which are names no human would
+    /// choose. The loud report stays as the fallback for anything that cannot
+    /// be removed, because an unreported leftover is worse than a reported one.
+    fn remove_residue() {
+        let roots = portable_roots();
+        for dir in package_dirs() {
+            let ours = dir
+                .parent()
+                .is_some_and(|parent| roots.contains(&parent.to_path_buf()))
+                && dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(PACKAGE_ID));
+            if !ours {
+                eprintln!(
+                    "cleanup: refusing to remove {}, which is not where this \
+                     scenario's package directory should be",
+                    dir.display(),
+                );
+                continue;
+            }
+            if let Err(error) = fs_err::remove_dir_all(&dir) {
+                eprintln!(
+                    "cleanup: {} still exists after `winget uninstall` and could \
+                     not be removed: {error}",
+                    dir.display(),
+                );
+            }
+        }
+        // The command symlink WinGet puts on PATH. Named by us
+        // (`PortableCommandAlias`), so there is no ambiguity about whose it is.
+        for link in link_dirs() {
+            let alias = link.join(COMMAND_ALIAS);
+            // `symlink_metadata`: the target is already gone by now, so
+            // `exists()` would answer `false` for a symlink that is very much
+            // still there.
+            if fs_err::symlink_metadata(&alias).is_ok()
+                && let Err(error) = fs_err::remove_file(&alias)
+            {
+                eprintln!("cleanup: could not remove {}: {error}", alias.display());
+            }
+        }
+    }
+
     impl Scenario for WinGetScenario {
         fn expected_slug(&self) -> &'static str {
             "winget"
@@ -516,25 +624,12 @@ mod imp {
             if !self.attempted.load(Ordering::SeqCst) {
                 return;
             }
-            scenario::report_cleanup(
-                winget()
-                    .arg("uninstall")
-                    .arg("--id")
-                    .arg(PACKAGE_ID)
-                    .arg("--exact")
-                    .arg("--disable-interactivity")
-                    .arg("--accept-source-agreements"),
-                "`winget uninstall`",
-            );
-            // WinGet removes the package directory itself; a leftover one means
-            // the uninstall did not really happen, and saying so beats leaving a
-            // stray copy of the CLI in the developer's LocalAppData unremarked.
-            for dir in package_dirs() {
-                eprintln!(
-                    "cleanup: {} still exists after `winget uninstall`",
-                    dir.display(),
-                );
-            }
+            uninstall();
+            // WinGet removes the package directory itself when the uninstall
+            // matched. Anything left is residue this scenario created, and
+            // leaving a copy of the CLI in someone's LocalAppData is exactly
+            // what every other scenario here refuses to do.
+            remove_residue();
         }
     }
 }

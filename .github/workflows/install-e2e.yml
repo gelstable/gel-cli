@@ -277,14 +277,11 @@ jobs:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
     runs-on: windows-2025
     # WinGet *is* on the windows-2025 image, contrary to what the image README
-    # lists: the first run of this workflow got as far as a real
-    # `winget install`, which then hit the LocalManifestFiles policy below.
-    # The allowance stays for one more round because no `winget install
-    # --manifest` in this scenario has yet succeeded anywhere — the manifest
-    # schema, the `file://` InstallerUrl and the portable install location are
-    # all still unproven — and a scenario nobody has ever seen pass should not
-    # be able to block a merge. Drop it once this job has gone green once.
-    continue-on-error: true
+    # lists. This job carried `continue-on-error: true` while the scenario had
+    # never succeeded anywhere; it has since passed on a real runner, installing
+    # the fixture as a portable package and detecting it as `winget`, so the
+    # allowance is gone. This is the scenario that took three rounds to land —
+    # hiding a regression in it is the last thing this matrix should do.
     env:
       GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
     steps:

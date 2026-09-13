@@ -1,0 +1,82 @@
+name: Release PR
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.88"
+  KNOPE_VERSION: "0.23.0"
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-24.04
+    if: github.repository == 'gelstable/gel-cli'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+      - name: Check for pending change files
+        id: changes
+        run: |
+          if compgen -G '.changeset/*.md' > /dev/null; then
+            echo "pending=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pending=false" >> "$GITHUB_OUTPUT"
+            echo "No pending change files; nothing to release."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.changes.outputs.pending == 'true'
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install knope
+        if: steps.changes.outputs.pending == 'true'
+        run: cargo install --locked --version "$KNOPE_VERSION" knope
+
+      - name: Prepare the release branch
+        if: steps.changes.outputs.pending == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "gelstable-release"
+          git config user.email "release@gelstable.invalid"
+          git switch -C knope/release
+          knope prepare-release
+          git push --force origin knope/release
+
+      - name: Read the prepared version
+        if: steps.changes.outputs.pending == 'true'
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Prepared $version"
+
+      - name: Dispatch candidate staging
+        if: steps.changes.outputs.pending == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A GITHUB_TOKEN push never triggers a downstream workflow, and the
+          # release bot token deliberately has no workflows scope. Chain the
+          # staging run explicitly instead of relying on the push event.
+          gh workflow run release-candidate.yml --ref knope/release
+          echo "Dispatched staging for ${{ steps.version.outputs.version }}"

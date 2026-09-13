@@ -6,8 +6,7 @@
 //! install still detects as `direct` and still really replaces itself on disk.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::Context;
 use serde_json::json;
@@ -35,7 +34,7 @@ pub fn run() {
 
     scenario::run(
         scenario
-            .gel(&installed)
+            .command(&installed)
             .arg("--no-cli-update-check")
             .arg("--version"),
     )
@@ -43,7 +42,7 @@ pub fn run() {
 
     let detected = scenario::run(
         scenario
-            .gel(&installed)
+            .command(&installed)
             .arg("--no-cli-update-check")
             .arg("info")
             .arg("--get")
@@ -82,13 +81,23 @@ pub fn run() {
     // Deliberately no `--no-cli-update-check`: `cli upgrade` is the path under
     // test here. `main.rs` skips the background version check for this
     // subcommand anyway, so no network call happens.
-    let upgraded = scenario::run(scenario.gel(&installed).arg("cli").arg("upgrade"));
+    let upgraded = scenario::run(scenario.command(&installed).arg("cli").arg("upgrade"));
     upgraded.expect_success("`gel cli upgrade`");
     // `msg!` is `eprintln!` (src/print/color.rs), so the success line is on
     // stderr; stdout carries nothing here.
+    //
+    // The version is part of the assertion on purpose. If the fixture `cli.toml`
+    // were ever not picked up, `Config::from_inputs`
+    // (src/portable/registry/config.rs) falls back to `DEFAULT_PACKAGE_ROOT` —
+    // the real network registry — and a bare "Upgraded to version" would still
+    // match whenever a newer real release exists, having exercised none of the
+    // fixture's hash, size or media-type handling. Only 999.0.0 can come from
+    // the fixture.
+    let expected = format!("Upgraded to version {FIXTURE_VERSION}");
     assert!(
-        upgraded.stderr.contains("Upgraded to version"),
-        "a direct install must really upgrade itself\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        upgraded.stderr.contains(&expected),
+        "a direct install must really upgrade itself, from the fixture registry \
+         (expected {expected:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",
         upgraded.stdout,
         upgraded.stderr,
     );
@@ -100,26 +109,21 @@ pub fn run() {
 
     scenario::run(
         scenario
-            .gel(&installed)
+            .command(&installed)
             .arg("--no-cli-update-check")
             .arg("--version"),
     )
     .expect_success("`gel --version` after the self-upgrade");
 }
 
-struct ConfigBackup {
-    path: PathBuf,
-    /// `None` means there was no `cli.toml` before us, so cleanup deletes ours.
-    previous: Option<Vec<u8>>,
-}
-
 pub struct DirectScenario {
     /// A disposable directory inside the *real* home directory. Everything this
     /// scenario creates lives here and `TempDir::drop` removes it.
     root: tempfile::TempDir,
-    /// Set only when the fixture `cli.toml` had to be written outside `root`;
-    /// interior mutability because `Scenario::cleanup` takes `&self`.
-    config_backup: Mutex<Option<ConfigBackup>>,
+    /// Custody of the `cli.toml` the fixture registry is declared in, held from
+    /// the moment it is written until cleanup puts the old one back. Interior
+    /// mutability because `Scenario::cleanup` takes `&self`.
+    config_file: Mutex<Option<scenario::ConfigFile>>,
 }
 
 impl DirectScenario {
@@ -152,7 +156,7 @@ impl DirectScenario {
             .with_context(|| format!("creating a scenario directory in {}", home.display()))?;
         Ok(DirectScenario {
             root,
-            config_backup: Mutex::new(None),
+            config_file: Mutex::new(None),
         })
     }
 
@@ -162,29 +166,6 @@ impl DirectScenario {
 
     fn install_dir(&self) -> PathBuf {
         self.root().join("bin")
-    }
-
-    /// The environment every `gel` invocation in this scenario runs with.
-    ///
-    /// `HOME` is conspicuously absent — see `DirectScenario::new`. The XDG
-    /// variables move the config, data and cache directories into the scenario
-    /// root on Linux, where `dirs` honours them; on macOS and Windows `dirs`
-    /// ignores them and the CLI uses the real directories, which is what
-    /// `upgrade_half_skip_reason` exists to notice.
-    pub fn env(&self) -> Vec<(&'static str, PathBuf)> {
-        let root = self.root();
-        vec![
-            ("XDG_CONFIG_HOME", root.join("config")),
-            ("XDG_DATA_HOME", root.join("data")),
-            ("XDG_CACHE_HOME", root.join("cache")),
-            ("XDG_BIN_HOME", self.install_dir()),
-        ]
-    }
-
-    fn gel(&self, bin: &Path) -> Command {
-        let mut cmd = scenario::gel(bin);
-        cmd.envs(self.env());
-        cmd
     }
 
     /// Whether writing the fixture `cli.toml` would cost the developer anything.
@@ -202,18 +183,18 @@ impl DirectScenario {
         if config_dir.starts_with(self.root()) {
             return None;
         }
-        let path = config_dir.join("cli.toml");
-        if !path.exists() {
+        if !scenario::ConfigFile::is_occupied(config_dir) {
             return None;
         }
         if std::env::var_os(ALLOW_GLOBAL_CONFIG).is_some_and(|value| value == "1") {
             return None;
         }
         Some(format!(
-            "{} already exists and this platform cannot redirect the CLI config \
-             directory; set {ALLOW_GLOBAL_CONFIG}=1 to let the test back it up, \
-             replace it, and restore it afterwards",
-            path.display(),
+            "{} already holds a {} and this platform cannot redirect the CLI \
+             config directory; set {ALLOW_GLOBAL_CONFIG}=1 to let the test move \
+             it aside and put it back afterwards",
+            config_dir.display(),
+            scenario::CONFIG_FILE,
         ))
     }
 
@@ -281,30 +262,19 @@ impl DirectScenario {
     }
 
     fn write_cli_toml(&self, config_dir: &Path, registry_path: &Path) -> anyhow::Result<()> {
-        fs_err::create_dir_all(config_dir)?;
-        let path = config_dir.join("cli.toml");
-        let previous = match fs_err::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        // Recorded before the write, so cleanup can undo it even if the write or
-        // anything after it panics.
-        *self
-            .config_backup
-            .lock()
-            .expect("config backup mutex poisoned") = Some(ConfigBackup {
-            path: path.clone(),
-            previous,
-        });
-
         // `{:?}` on the path string yields a quoted, escaped TOML basic string,
         // which is what makes Windows backslashes survive.
         let body = format!(
             "[registry]\nsources = [\n  {:?},\n]\n",
             registry_path.display().to_string(),
         );
-        fs_err::write(&path, body)?;
+        // `ConfigFile` moves any existing config to a sibling file and holds the
+        // harness-wide config lock until `restore`.
+        *self
+            .config_file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(scenario::ConfigFile::replace(config_dir, &body)?);
         Ok(())
     }
 }
@@ -314,12 +284,27 @@ impl Scenario for DirectScenario {
         "direct"
     }
 
+    /// `HOME` is conspicuously absent — see `DirectScenario::new`. The XDG
+    /// variables move the config, data and cache directories into the scenario
+    /// root on Linux, where `dirs` honours them; on macOS and Windows `dirs`
+    /// ignores them and the CLI uses the real directories, which is what
+    /// `upgrade_half_skip_reason` exists to notice.
+    fn env(&self) -> Vec<(&'static str, PathBuf)> {
+        let root = self.root();
+        vec![
+            ("XDG_CONFIG_HOME", root.join("config")),
+            ("XDG_DATA_HOME", root.join("data")),
+            ("XDG_CACHE_HOME", root.join("cache")),
+            ("XDG_BIN_HOME", self.install_dir()),
+        ]
+    }
+
     fn install(&self, source: &Path) -> anyhow::Result<PathBuf> {
         let install_dir = self.install_dir();
         let staged = scenario::stage_binary(source, &self.root().join("stage"))?;
 
         let out = scenario::run(
-            self.gel(&staged)
+            self.command(&staged)
                 .arg("--no-cli-update-check")
                 .arg("cli")
                 .arg("install")
@@ -350,24 +335,19 @@ impl Scenario for DirectScenario {
         // `root` — the install tree and the fixture registry — is removed by
         // `TempDir::drop` once this scenario goes out of scope. The only thing
         // that can live outside it is a `cli.toml` in the real config dir.
-        let Ok(mut slot) = self.config_backup.lock() else {
-            return;
-        };
-        let Some(backup) = slot.take() else {
-            return;
-        };
-        let restored = match backup.previous {
-            Some(bytes) => fs_err::write(&backup.path, bytes),
-            None => match fs_err::remove_file(&backup.path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                other => other,
-            },
-        };
-        if let Err(error) = restored {
-            eprintln!(
-                "cleanup: could not restore {}: {error}",
-                backup.path.display(),
-            );
+        //
+        // Recovering from a poisoned lock rather than bailing: cleanup is the
+        // only thing that puts the developer's config back, so it has to run
+        // even when the scenario panicked.
+        let taken = self
+            .config_file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(config) = taken
+            && let Err(error) = config.restore()
+        {
+            eprintln!("cleanup: could not restore the CLI config: {error:#}");
         }
     }
 }

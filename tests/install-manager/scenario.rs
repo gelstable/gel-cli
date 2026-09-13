@@ -9,6 +9,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 
 /// The `gel` binary a scenario installs and then exercises.
 ///
@@ -199,9 +200,38 @@ pub fn cli_media_type(platform: &str) -> &'static str {
 }
 
 /// One way of getting the CLI onto a machine, plus how to take it back off.
+///
+/// Concurrency: libtest runs test functions on parallel threads, and a scenario
+/// is otherwise free to run alongside others. The one piece of shared state is
+/// the CLI's global `cli.toml`, which a scenario must only touch through
+/// [`ConfigFile`] — that type holds a process-wide lock for the whole
+/// replace/restore window, so implementors get the serialisation for free and
+/// must not hand-roll it.
 pub trait Scenario {
     /// What `gel info --get install-manager` must print afterwards.
     fn expected_slug(&self) -> &'static str;
+
+    /// Environment every `gel` invocation for this scenario must carry —
+    /// redirected config/data/cache directories, manager-specific paths, and so
+    /// on. The default is "nothing extra".
+    ///
+    /// This lives on the trait rather than on each implementor because the
+    /// shared bodies below ([`assert_managed`]) spawn the CLI on a scenario's
+    /// behalf, and would otherwise run it with the ambient environment, quietly
+    /// reading and writing the developer's real directories.
+    fn env(&self) -> Vec<(&'static str, PathBuf)> {
+        Vec::new()
+    }
+
+    /// A `gel` command carrying this scenario's environment.
+    ///
+    /// Every spawn in a scenario or in a shared body goes through here; the bare
+    /// [`gel`] function is the plumbing it is built from, not an entry point.
+    fn command(&self, bin: &Path) -> Command {
+        let mut cmd = gel(bin);
+        cmd.envs(self.env());
+        cmd
+    }
 
     /// Package `source` for this manager, install it, and return the path of the
     /// *installed* executable — not `source`, which stays untouched.
@@ -210,6 +240,95 @@ pub trait Scenario {
     /// Undo everything `install` did. Must tolerate being called after a partial
     /// or failed install, and must never panic.
     fn cleanup(&self);
+}
+
+/// Serialises every scenario that has to write the CLI's global `cli.toml`.
+///
+/// Scenarios whose platform cannot redirect the config directory all write the
+/// *same* file, and libtest would happily run two of them at once.
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_config() -> MutexGuard<'static, ()> {
+    // A scenario that panicked mid-write poisons the lock, but the next one
+    // still has to run — and `ConfigFile::replace` repairs whatever the dead run
+    // left behind — so take the guard back instead of propagating the poison.
+    CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub const CONFIG_FILE: &str = "cli.toml";
+/// Sits beside `cli.toml` while a scenario's fixture config is in place.
+pub const CONFIG_BACKUP_FILE: &str = "cli.toml.e2e-bak";
+
+/// Custody of one `cli.toml` for the duration of a scenario.
+///
+/// The displaced file is moved to a sibling on disk rather than held in memory:
+/// a `Vec<u8>` in the test process is lost to Ctrl-C, SIGTERM, a libtest
+/// timeout or `panic = "abort"`, and with it the developer's registry
+/// configuration, leaving nothing to recover from. A file on disk survives all
+/// of those, and the next run puts it back.
+///
+/// Holds [`CONFIG_LOCK`] for its whole lifetime, so two scenarios cannot have
+/// custody of the same file at once.
+pub struct ConfigFile {
+    path: PathBuf,
+    backup: PathBuf,
+    /// Whether a `cli.toml` was there before us and has to come back.
+    had_previous: bool,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl ConfigFile {
+    /// Whether this directory holds configuration belonging to whoever owns the
+    /// machine — either a live `cli.toml` or a backup an interrupted run left.
+    ///
+    /// Callers use this to decide whether replacing the file needs an explicit
+    /// opt-in.
+    pub fn is_occupied(config_dir: &Path) -> bool {
+        config_dir.join(CONFIG_FILE).exists() || config_dir.join(CONFIG_BACKUP_FILE).exists()
+    }
+
+    /// Put `body` in `<config_dir>/cli.toml`, preserving whatever was there.
+    pub fn replace(config_dir: &Path, body: &str) -> anyhow::Result<ConfigFile> {
+        let lock = lock_config();
+        fs_err::create_dir_all(config_dir)?;
+        let path = config_dir.join(CONFIG_FILE);
+        let backup = config_dir.join(CONFIG_BACKUP_FILE);
+
+        // A leftover backup means an earlier run died between replacing the file
+        // and restoring it. The backup is the real config and whatever sits at
+        // `cli.toml` is that run's fixture, so recover before doing anything
+        // else — otherwise this run would "back up" the fixture and the real
+        // config would be gone for good.
+        if backup.exists() {
+            fs_err::remove_file(&path).ok();
+            fs_err::rename(&backup, &path)?;
+        }
+
+        let had_previous = path.exists();
+        if had_previous {
+            // Rename rather than read-then-write: the bytes are never in flight,
+            // so there is no instant at which they exist only in this process.
+            fs_err::rename(&path, &backup)?;
+        }
+        fs_err::write(&path, body)?;
+        Ok(ConfigFile {
+            path,
+            backup,
+            had_previous,
+            _lock: lock,
+        })
+    }
+
+    /// Undo [`ConfigFile::replace`], releasing the lock.
+    pub fn restore(self) -> anyhow::Result<()> {
+        fs_err::remove_file(&self.path).ok();
+        if self.had_previous {
+            fs_err::rename(&self.backup, &self.path)?;
+        }
+        Ok(())
+    }
 }
 
 /// Runs `Scenario::cleanup` on the way out, including when an assertion panics.
@@ -255,12 +374,14 @@ pub fn assert_managed(scenario: &dyn Scenario) {
         .install(&source)
         .unwrap_or_else(|error| panic!("install failed: {error:#}"));
 
-    run(gel(&installed)
+    run(scenario
+        .command(&installed)
         .arg("--no-cli-update-check")
         .arg("--version"))
     .expect_success("installed `gel --version`");
 
-    let detected = run(gel(&installed)
+    let detected = run(scenario
+        .command(&installed)
         .arg("--no-cli-update-check")
         .arg("info")
         .arg("--get")
@@ -276,7 +397,7 @@ pub fn assert_managed(scenario: &dyn Scenario) {
     let before = blake2b_hex(&installed);
 
     for extra in [None, Some("--force")] {
-        let mut cmd = gel(&installed);
+        let mut cmd = scenario.command(&installed);
         // No `--no-cli-update-check`: `cli upgrade` is exactly the path under
         // test, and `main.rs` skips the background version check for it anyway.
         cmd.arg("cli").arg("upgrade");
@@ -310,4 +431,82 @@ pub fn assert_managed(scenario: &dyn Scenario) {
         scenario.expected_slug(),
         installed.display(),
     );
+}
+
+/// Hermetic coverage for the one piece of the harness that can destroy
+/// something the developer cares about.
+///
+/// Not `#[ignore]`d and not a scenario: these install nothing and touch only a
+/// tempdir, so they run under `cargo test --all-features` and guard the
+/// backup/restore contract on every host — including the situations no scenario
+/// reaches here (Windows, and a machine that already has a global `cli.toml`).
+mod config_file_tests {
+    use super::{CONFIG_BACKUP_FILE, CONFIG_FILE, ConfigFile};
+
+    const FIXTURE: &str = "[registry]\nsources = [\"fixture\"]\n";
+    const REAL: &str = "[registry]\nsources = [\"https://packages.example.com/registry.json\"]\n";
+
+    fn read(dir: &std::path::Path, name: &str) -> String {
+        fs_err::read_to_string(dir.join(name)).unwrap()
+    }
+
+    #[test]
+    fn restores_the_file_it_displaced() {
+        let dir = tempfile::tempdir().unwrap();
+        fs_err::write(dir.path().join(CONFIG_FILE), REAL).unwrap();
+
+        let held = ConfigFile::replace(dir.path(), FIXTURE).unwrap();
+        assert_eq!(read(dir.path(), CONFIG_FILE), FIXTURE);
+        assert_eq!(
+            read(dir.path(), CONFIG_BACKUP_FILE),
+            REAL,
+            "the displaced config must be on disk, not only in memory",
+        );
+
+        held.restore().unwrap();
+        assert_eq!(read(dir.path(), CONFIG_FILE), REAL);
+        assert!(!dir.path().join(CONFIG_BACKUP_FILE).exists());
+    }
+
+    #[test]
+    fn removes_a_file_that_was_not_there_before() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let held = ConfigFile::replace(dir.path(), FIXTURE).unwrap();
+        assert_eq!(read(dir.path(), CONFIG_FILE), FIXTURE);
+
+        held.restore().unwrap();
+        assert!(!dir.path().join(CONFIG_FILE).exists());
+        assert!(!dir.path().join(CONFIG_BACKUP_FILE).exists());
+    }
+
+    /// A run killed between replace and restore leaves the real config in the
+    /// backup and a fixture at `cli.toml`. The next run must recover it instead
+    /// of backing the fixture up over it.
+    #[test]
+    fn recovers_a_backup_an_interrupted_run_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        fs_err::write(dir.path().join(CONFIG_BACKUP_FILE), REAL).unwrap();
+        fs_err::write(dir.path().join(CONFIG_FILE), "stale fixture").unwrap();
+
+        let held = ConfigFile::replace(dir.path(), FIXTURE).unwrap();
+        assert_eq!(read(dir.path(), CONFIG_FILE), FIXTURE);
+        assert_eq!(read(dir.path(), CONFIG_BACKUP_FILE), REAL);
+
+        held.restore().unwrap();
+        assert_eq!(read(dir.path(), CONFIG_FILE), REAL);
+    }
+
+    #[test]
+    fn occupied_covers_both_a_live_config_and_a_stale_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!ConfigFile::is_occupied(dir.path()));
+
+        fs_err::write(dir.path().join(CONFIG_BACKUP_FILE), REAL).unwrap();
+        assert!(ConfigFile::is_occupied(dir.path()));
+
+        fs_err::remove_file(dir.path().join(CONFIG_BACKUP_FILE)).unwrap();
+        fs_err::write(dir.path().join(CONFIG_FILE), REAL).unwrap();
+        assert!(ConfigFile::is_occupied(dir.path()));
+    }
 }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import shutil
+import stat
 import subprocess
 import tarfile
 import zipfile
@@ -96,31 +97,35 @@ def build_archive(
 
     if target.archive_ext == "tar.gz":
         raw = out_dir / (assets.archive_stem(version, target) + ".tar")
-        with tarfile.open(raw, "w", format=tarfile.GNU_FORMAT) as tar:
-            for name, source, mode in entries:
-                info = tar.gettarinfo(str(source), arcname=name)
-                info.mode = mode
-                info.mtime = 0
-                info.uid = 0
-                info.gid = 0
-                info.uname = ""
-                info.gname = ""
-                with open(source, "rb") as handle:
-                    tar.addfile(info, handle)
-        with open(raw, "rb") as plain, open(archive, "wb") as out:
-            with gzip.GzipFile(fileobj=out, mode="wb", compresslevel=9, mtime=0) as gz:
-                shutil.copyfileobj(plain, gz)
-        raw.unlink()
+        try:
+            with tarfile.open(raw, "w", format=tarfile.GNU_FORMAT) as tar:
+                for name, source, mode in entries:
+                    info = tar.gettarinfo(str(source), arcname=name)
+                    info.mode = mode
+                    info.mtime = 0
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ""
+                    info.gname = ""
+                    with open(source, "rb") as handle:
+                        tar.addfile(info, handle)
+            with open(raw, "rb") as plain, open(archive, "wb") as out:
+                with gzip.GzipFile(fileobj=out, mode="wb", compresslevel=9, mtime=0) as gz:
+                    shutil.copyfileobj(plain, gz)
+        finally:
+            raw.unlink(missing_ok=True)
         return archive
-
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name, source, mode in entries:
-            info = zipfile.ZipInfo(filename=name, date_time=ZIP_DATE_TIME)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = (mode & 0o7777) << 16
-            info.create_system = 3
-            zf.writestr(info, source.read_bytes())
-    return archive
+    elif target.archive_ext == "zip":
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name, source, mode in entries:
+                info = zipfile.ZipInfo(filename=name, date_time=ZIP_DATE_TIME)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = ((mode & 0o7777) | stat.S_IFREG) << 16
+                info.create_system = 3
+                zf.writestr(info, source.read_bytes())
+        return archive
+    else:
+        raise ValueError(f"unsupported archive extension: {target.archive_ext}")
 
 
 def main() -> None:

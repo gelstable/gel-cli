@@ -1,8 +1,10 @@
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 
@@ -102,11 +104,55 @@ class ArchiveTests(unittest.TestCase):
             self.assertIn("gel-v7.11.0-x86_64-pc-windows-msvc/gel.exe", names)
             info = zf.getinfo("gel-v7.11.0-x86_64-pc-windows-msvc/gel.exe")
             self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
+            self.assertEqual((info.external_attr >> 16) & stat.S_IFREG, stat.S_IFREG)
+            self.assertEqual((info.external_attr >> 16) & 0o777, 0o755)
+
+            comp_info = zf.getinfo("gel-v7.11.0-x86_64-pc-windows-msvc/completions/gel.bash")
+            self.assertEqual((comp_info.external_attr >> 16) & stat.S_IFREG, stat.S_IFREG)
+            self.assertEqual((comp_info.external_attr >> 16) & 0o777, 0o644)
 
     def test_archives_are_byte_deterministic(self):
         first, _ = self._build("aarch64-apple-darwin")
         second, _ = self._build("aarch64-apple-darwin")
         self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_raw_tar_unlinked_on_gzip_failure(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        binary, completions, extras = _fake_tree(root)
+        out = root / "dist"
+        out.mkdir()
+        target = assets.BY_TRIPLE["x86_64-unknown-linux-musl"]
+        raw = out / (assets.archive_stem("7.11.0", target) + ".tar")
+
+        with mock.patch("gzip.GzipFile", side_effect=RuntimeError("gzip failed")):
+            with self.assertRaises(RuntimeError):
+                package_target.build_archive(
+                    binary, target, "7.11.0", completions, extras, out
+                )
+        self.assertFalse(raw.exists(), "raw tar must be unlinked even if gzipping fails")
+
+    def test_unsupported_archive_extension_raises(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        binary, completions, extras = _fake_tree(root)
+        out = root / "dist"
+        out.mkdir()
+        bogus_target = assets.Target(
+            triple="bogus-target",
+            runner="bogus",
+            exe_suffix="",
+            archive_ext="rar",
+            registry=False,
+            media_type="application/octet-stream",
+            arch="bogus",
+            deb_arch=None,
+            rpm_arch=None,
+        )
+        with self.assertRaises(ValueError):
+            package_target.build_archive(
+                binary, bogus_target, "7.11.0", completions, extras, out
+            )
 
 
 if __name__ == "__main__":

@@ -198,7 +198,7 @@ jobs:
           path: dist
 
       - name: Install jsonschema
-        run: python3 -m pip install --break-system-packages jsonschema
+        run: python3 -m pip install --break-system-packages jsonschema==4.23.0
 
       - name: Generate the registry manifest and digest manifests
         run: |
@@ -325,7 +325,7 @@ jobs:
           name: candidate-record
           path: packaging
       - name: Install jsonschema
-        run: python3 -m pip install --break-system-packages jsonschema
+        run: python3 -m pip install --break-system-packages jsonschema==4.23.0
       - name: Read the candidate back from the API and verify it
         env:
           GH_TOKEN: ${{ github.token }}

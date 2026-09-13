@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from scripts.release import assets, candidate
@@ -201,8 +202,9 @@ class CliTests(unittest.TestCase):
                 str(out_record),
             ]
             buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                sys.argv = write_args
+            with unittest.mock.patch.object(
+                sys, "argv", write_args
+            ), contextlib.redirect_stdout(buf):
                 candidate.main()
             self.assertIn("wrote", buf.getvalue())
             self.assertTrue(out_record.is_file())
@@ -218,8 +220,9 @@ class CliTests(unittest.TestCase):
                 str(out_record),
             ]
             buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                sys.argv = verify_args
+            with unittest.mock.patch.object(
+                sys, "argv", verify_args
+            ), contextlib.redirect_stdout(buf):
                 candidate.main()
             self.assertIn("matches", buf.getvalue())
 

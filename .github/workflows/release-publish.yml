@@ -68,7 +68,7 @@ jobs:
 
       - name: Install jsonschema
         if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'
-        run: python3 -m pip install --break-system-packages jsonschema
+        run: python3 -m pip install --break-system-packages jsonschema==4.23.0
 
       - name: Verify the reviewed candidate one last time
         if: steps.gate.outputs.publish == 'true' && steps.already.outputs.done == 'false'

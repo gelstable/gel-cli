@@ -86,7 +86,7 @@ jobs:
       - name: Install release tooling
         run: |
           cargo install --locked --version 0.23.0 knope
-          python3 -m pip install --break-system-packages jsonschema
+          python3 -m pip install --break-system-packages jsonschema==4.23.0
       - name: Check release configuration
         run: |
           PATH="$(go env GOPATH)/bin:$PATH"

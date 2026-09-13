@@ -1,10 +1,15 @@
 import re
+import sys
 import unittest
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from scripts.release import assets
 
-WORKFLOWS = Path(".github/workflows")
+WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 RELEASE_WORKFLOWS = (
     "release-pr.yml",
     "release-candidate.yml",

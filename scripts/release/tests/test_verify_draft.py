@@ -1,7 +1,4 @@
-import json
-import tempfile
 import unittest
-from pathlib import Path
 
 from scripts.release import assets, registry_manifest, verify_draft
 

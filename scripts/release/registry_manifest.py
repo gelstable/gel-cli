@@ -17,14 +17,19 @@ import jsonschema
 
 from . import assets, digests
 
-SCHEMA_PATH = Path("packaging/schema/release-manifest.schema.json")
-SCHEMA_URL = "https://registry.gelstable.com/v1/schema/release-manifest.json"
+SCHEMA_PATH = (
+    Path(__file__).resolve().parent.parent.parent
+    / "packaging"
+    / "schema"
+    / "release-manifest.schema.json"
+)
 CHANNEL = "stable"
 REVISION = "1"
 
 
 def _version_details(version: str) -> dict:
-    major, minor, patch = (int(part) for part in version.split("."))
+    core = version.split("-")[0].split("+")[0]
+    major, minor, patch = (int(part) for part in core.split("."))
     return {
         "major": major,
         "minor": minor,

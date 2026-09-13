@@ -82,6 +82,33 @@ class ManifestShapeTests(unittest.TestCase):
             {"major": 1, "minor": 2, "patch": 3, "prerelease": [], "metadata": []},
         )
 
+    def test_version_details_handles_prerelease_and_dev_versions(self):
+        self.assertEqual(
+            registry_manifest._version_details("7.11.0-rc.1"),
+            {"major": 7, "minor": 11, "patch": 0, "prerelease": [], "metadata": []},
+        )
+        self.assertEqual(
+            registry_manifest._version_details("7.11.0-dev.4121+g874890b"),
+            {"major": 7, "minor": 11, "patch": 0, "prerelease": [], "metadata": []},
+        )
+        self.assertEqual(
+            registry_manifest._version_details("1.0.0+build.123"),
+            {"major": 1, "minor": 0, "patch": 0, "prerelease": [], "metadata": []},
+        )
+
+    def test_build_manifest_with_prerelease_version_validates(self):
+        manifest = registry_manifest.build_manifest(
+            "7.11.0-rc.1", "2026-09-12T00:00:00+00:00", _entries("7.11.0-rc.1")
+        )
+        registry_manifest.validate_manifest(manifest)
+        package = manifest["indexes"][0]["packages"][0]
+        self.assertEqual(package["version"], "7.11.0-rc.1")
+        self.assertEqual(package["version_key"], "7.11.0-rc.1")
+        self.assertEqual(
+            package["version_details"],
+            {"major": 7, "minor": 11, "patch": 0, "prerelease": [], "metadata": []},
+        )
+
 
 class IsolationTests(unittest.TestCase):
     def test_distribution_assets_are_rejected(self):

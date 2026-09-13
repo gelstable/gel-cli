@@ -102,50 +102,117 @@ mod imp {
     /// detection rule cannot recognise.
     struct Layout {
         root: PathBuf,
-        /// The resolved `scoop` entry point — see [`Layout::scoop`].
-        exe: PathBuf,
+        /// Scoop's PowerShell entry point — see [`Layout::scoop`].
+        script: PathBuf,
     }
 
     impl Layout {
         fn probe() -> anyhow::Result<Layout> {
-            // Resolved once, here, rather than at each call site: `which` walks
-            // PATH and PATHEXT, and `cleanup` has nowhere to report a failure.
-            let exe = which::which("scoop").context("cannot resolve `scoop` on PATH")?;
-            if let Some(value) = std::env::var_os("SCOOP").filter(|value| !value.is_empty()) {
-                return Ok(Layout {
-                    root: PathBuf::from(value),
-                    exe,
-                });
-            }
-            let home = dirs::home_dir().context("cannot determine the home directory")?;
-            Ok(Layout {
-                root: home.join("scoop"),
-                exe,
-            })
+            // Presence is still settled through `which`, which is the only
+            // thing that answers "is Scoop on this machine at all". What is
+            // *launched* is the PowerShell entry point below, not what `which`
+            // returns.
+            which::which("scoop").context("cannot resolve `scoop` on PATH")?;
+
+            let root = match std::env::var_os("SCOOP").filter(|value| !value.is_empty()) {
+                Some(value) => PathBuf::from(value),
+                None => dirs::home_dir()
+                    .context("cannot determine the home directory")?
+                    .join("scoop"),
+            };
+
+            // Scoop's real entry point first, its `shims\scoop.ps1` second.
+            // That order is deliberate and the reverse of what "what does PATH
+            // resolve to" would suggest: the shim's body is
+            //
+            //     if ($MyInvocation.ExpectingInput) { $input | & $path @args }
+            //     else { & $path @args }
+            //
+            // and the `$input` branch blocks forever on a stdin that never
+            // reaches EOF. Verified locally against PowerShell 7: with stdin an
+            // open pipe the shim hangs, while the direct script returns
+            // immediately. `scenario::run` uses `Command::output()`, which
+            // gives the child a null stdin, so the shim would in fact be safe
+            // here — but a test that hangs produces no output at all, and one
+            // fewer hop is one fewer thing between the argument and Scoop.
+            let candidates = [
+                root.join("apps")
+                    .join("scoop")
+                    .join("current")
+                    .join("bin")
+                    .join("scoop.ps1"),
+                root.join("shims").join("scoop.ps1"),
+            ];
+            let script = candidates
+                .iter()
+                .find(|path| path.is_file())
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "scoop is on PATH but no scoop.ps1 was found at {} or {}; \
+                         this scenario drives Scoop through PowerShell rather \
+                         than its .cmd shim",
+                        candidates[0].display(),
+                        candidates[1].display(),
+                    )
+                })?;
+
+            Ok(Layout { root, script })
         }
 
-        /// A `scoop` command, spawned through the *resolved* shim path.
+        /// A `scoop` command, driven through PowerShell rather than through
+        /// Scoop's `.cmd` shim. Both halves of that are load-bearing — do not
+        /// "simplify" either away.
         ///
-        /// Spawning the bare name `scoop` does not work on Windows and this
-        /// indirection is the fix — do not "simplify" it away.
-        ///
-        /// Scoop ships no `scoop.exe`: what sits on `PATH` is
-        /// `<root>\shims\scoop.cmd` (plus a `.ps1`). Rust's
+        /// **Why not the bare name.** Scoop ships no `scoop.exe`: what sits on
+        /// `PATH` is `<root>\shims\scoop.cmd` and `scoop.ps1`. Rust's
         /// `std::process::Command` resolves a bare program name by appending
         /// `.exe` and nothing else — it deliberately does not consult
-        /// `PATHEXT` — so the bare name finds nothing and fails to spawn,
-        /// which `scenario::run` turns into a panic. `which::which` *does*
-        /// honour `PATHEXT`, which is why `scenario::have("scoop")` answers
-        /// `true` for a host a bare spawn cannot launch on at all.
+        /// `PATHEXT` — so `Command::new("scoop")` finds nothing and fails to
+        /// spawn. `which::which` *does* honour `PATHEXT`, which is why
+        /// `scenario::have("scoop")` answers `true` for a host a bare spawn
+        /// cannot launch on at all.
         ///
-        /// Handing `Command` the resolved `.cmd` path is what closes the gap:
-        /// std recognises a `.bat`/`.cmd` target and runs it through
-        /// `cmd.exe`, applying the batch-specific argument quoting added in
-        /// the CVE-2024-24576 fix. That is also why this beats writing
-        /// `cmd /C scoop ...` by hand — the quoting of the manifest path would
-        /// otherwise be ours to get right.
+        /// **Why not the `.cmd` either.** Handing `Command` the resolved
+        /// `scoop.cmd` does spawn — std recognises a `.bat`/`.cmd` target and
+        /// runs it through `cmd.exe` — but the batch-specific argument
+        /// escaping added in the CVE-2024-24576 fix is then re-parsed by the
+        /// `cmd.exe` → `scoop.cmd` → PowerShell hop, and the argument does not
+        /// survive it. CI showed exactly that, and the doubled quote is the
+        /// fingerprint:
+        ///
+        /// ```text
+        /// Couldn't find manifest for 'gel.json''.
+        /// ```
+        ///
+        /// An absolute manifest path went in; Scoop saw a bare `gel.json` with
+        /// a stray trailing quote. (Worse, `scoop install` still exited 0,
+        /// which is why the "did a binary appear?" assertion in `install` has
+        /// to stay — a zero exit from Scoop does not mean it did anything.)
+        ///
+        /// **What this does instead.** `powershell.exe` is a real `.exe`, so
+        /// std applies its ordinary MSVCRT argument quoting and no batch layer
+        /// re-parses it. `-File` is the mode that matters: unlike `-Command`,
+        /// PowerShell does not re-interpret what follows as script text, it
+        /// binds the remaining arguments to the script positionally, and
+        /// Scoop's own shim forwards them with `@args` — array splatting, not
+        /// string splicing. So a manifest path containing a space arrives
+        /// intact.
         fn scoop(&self) -> Command {
-            Command::new(&self.exe)
+            let mut cmd = Command::new("powershell.exe");
+            cmd.arg("-NoProfile")
+                .arg("-NonInteractive")
+                // Belt and braces against the `$input` hang described on
+                // `probe`: with no input format there is nothing for a
+                // `$MyInvocation.ExpectingInput` branch to wait on, whichever
+                // of the two entry points was resolved.
+                .arg("-InputFormat")
+                .arg("None")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(&self.script);
+            cmd
         }
 
         /// `<root>\apps\gel`, the directory `scoop uninstall gel` removes.

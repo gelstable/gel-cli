@@ -14,10 +14,13 @@
 //! default-locale YAML) in one directory, installed with
 //! `winget install --manifest <dir>`. The singleton form is deprecated and
 //! newer WinGet builds warn on it; the three-file form is what `winget.run` and
-//! the community repository actually ship. `InstallerUrl` is a `file://` URL
-//! into this scenario's tempdir — WinGet's downloader copies local files rather
-//! than fetching them — and `InstallerSha256` is checked, so a bad copy fails
-//! as a hash mismatch rather than as a broken install.
+//! the community repository actually ship. `InstallerUrl` points at a loopback
+//! HTTP server this scenario runs for the duration of the install (see
+//! [`FileServer`]): WinGet downloads through WinINet, which refuses a `file://`
+//! URL outright, so serving the staged binary over `127.0.0.1` is what lets a
+//! purely local fixture work at all. `InstallerSha256` is the hash of those
+//! same bytes and is checked, so a bad transfer fails as a hash mismatch rather
+//! than as a broken install.
 //!
 //! Two host prerequisites, neither of which this scenario will arrange for
 //! itself:
@@ -59,8 +62,11 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
 
     use sha2::{Digest, Sha256};
+    use warp::Filter;
 
     use crate::scenario::{self, Scenario};
 
@@ -261,6 +267,74 @@ mod imp {
         }
     }
 
+    /// A loopback HTTP server that serves exactly one file.
+    ///
+    /// WinGet's downloader is WinINet, which will not fetch a `file://`
+    /// `InstallerUrl` — the first attempt at this scenario died with
+    /// `InternetOpenUrl() failed. 0x8007007b : The filename, directory name, or
+    /// volume label syntax is incorrect.` after parsing the manifest
+    /// successfully. So the staged binary is served over HTTP instead, and the
+    /// manifest points at `http://127.0.0.1:<port>/gel.exe`.
+    ///
+    /// Bound to `127.0.0.1` on an ephemeral port and serving one path: nothing
+    /// off this machine can reach it, and nothing on it can fetch anything but
+    /// the file this scenario staged. Plain HTTP on purpose — TLS here would
+    /// mean a certificate WinGet has no reason to trust, which is a second
+    /// problem rather than a safety improvement.
+    ///
+    /// The listener is bound *synchronously* by `bind_with_graceful_shutdown`,
+    /// before the port is returned, so there is no window in which the URL
+    /// exists but the socket does not and no sleep is needed before handing the
+    /// URL to WinGet.
+    struct FileServer {
+        runtime: tokio::runtime::Runtime,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        port: u16,
+    }
+
+    impl FileServer {
+        fn start(file: &Path) -> anyhow::Result<FileServer> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()?;
+            let (shutdown, shut_rx) = tokio::sync::oneshot::channel::<()>();
+            let route = warp::path(scenario::EXE_NAME)
+                .and(warp::path::end())
+                .and(warp::fs::file(file.to_path_buf()));
+
+            // `bind_with_graceful_shutdown` needs a reactor in scope to create
+            // its listener, and it creates it before returning the address.
+            let guard = runtime.enter();
+            let (addr, server) =
+                warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async move {
+                    shut_rx.await.ok();
+                });
+            drop(guard);
+            runtime.spawn(server);
+
+            Ok(FileServer {
+                runtime,
+                shutdown,
+                port: addr.port(),
+            })
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}/{}", self.port, scenario::EXE_NAME)
+        }
+
+        /// Signal the graceful shutdown and wait briefly for the runtime.
+        ///
+        /// Bounded rather than unbounded: this runs from a `Drop` guard that
+        /// may be unwinding a panic, and a cleanup that blocks forever would
+        /// swallow the failure it is cleaning up after.
+        fn stop(self) {
+            self.shutdown.send(()).ok();
+            self.runtime.shutdown_timeout(Duration::from_secs(5));
+        }
+    }
+
     pub struct WinGetScenario {
         root: tempfile::TempDir,
         /// Set immediately before `winget install` runs. Immediately *before*,
@@ -268,6 +342,9 @@ mod imp {
         /// package directory and a registry entry to remove — which is only
         /// safe because `occupied` has already established that neither exists.
         attempted: AtomicBool,
+        /// The fixture download server, alive from `install` until `cleanup`.
+        /// Interior mutability because `Scenario::cleanup` takes `&self`.
+        server: Mutex<Option<FileServer>>,
     }
 
     impl WinGetScenario {
@@ -277,6 +354,7 @@ mod imp {
                     .prefix("gel-e2e-winget-")
                     .tempdir()?,
                 attempted: AtomicBool::new(false),
+                server: Mutex::new(None),
             })
         }
 
@@ -285,10 +363,7 @@ mod imp {
         }
 
         /// Write the three YAML files WinGet reads as one manifest.
-        fn write_manifest(&self, installer: &Path) -> anyhow::Result<PathBuf> {
-            let url = url::Url::from_file_path(installer).map_err(|()| {
-                anyhow::anyhow!("cannot build a file URL for {}", installer.display())
-            })?;
+        fn write_manifest(&self, installer: &Path, url: &str) -> anyhow::Result<PathBuf> {
             let digest = Sha256::digest(fs_err::read(installer)?);
             let sha256: String = digest.iter().map(|byte| format!("{byte:02X}")).collect();
 
@@ -318,9 +393,10 @@ mod imp {
                      \x20   PortableCommandAlias: {COMMAND_ALIAS}\n\
                      ManifestType: installer\n\
                      ManifestVersion: {MANIFEST_SCHEMA}\n",
-                    // Quoted, because the URL embeds a Windows path that may
-                    // contain characters a YAML plain scalar would reinterpret.
-                    url = yaml_quoted(url.as_str()),
+                    // Quoted even though a loopback URL is tame: a bare
+                    // `http://...` is a valid YAML plain scalar only by luck of
+                    // the `:` being followed by `/`, and quoting says so.
+                    url = yaml_quoted(url),
                 ),
             )?;
             fs_err::write(
@@ -398,11 +474,17 @@ mod imp {
         }
 
         fn install(&self, source: &Path) -> anyhow::Result<PathBuf> {
-            // The installer WinGet "downloads" is the staged copy, left in the
-            // tempdir; WinGet copies it into its own Packages directory, so the
-            // tempdir going away afterwards takes nothing the install needs.
+            // The installer WinGet downloads is the staged copy, served over
+            // loopback HTTP from the tempdir; WinGet copies it into its own
+            // Packages directory, so the tempdir going away afterwards takes
+            // nothing the install needs.
             let staged = scenario::stage_binary(source, &self.root.path().join("stage"))?;
-            let manifest_dir = self.write_manifest(&staged)?;
+            let server = FileServer::start(&staged)?;
+            let url = server.url();
+            // Parked before the install rather than after, so a failed install
+            // still leaves the server for `cleanup` to shut down.
+            *self.server.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
+            let manifest_dir = self.write_manifest(&staged, &url)?;
 
             self.attempted.store(true, Ordering::SeqCst);
             scenario::checked(
@@ -420,6 +502,17 @@ mod imp {
         }
 
         fn cleanup(&self) {
+            // Before the `attempted` gate: the server is started during
+            // `install` and may well outlive a failure that happened before
+            // `winget install` was ever reached.
+            if let Some(server) = self
+                .server
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                server.stop();
+            }
             if !self.attempted.load(Ordering::SeqCst) {
                 return;
             }

@@ -24,6 +24,24 @@ pub enum InstallManager {
 }
 
 impl InstallManager {
+    /// The stable, lowercase name for this manager.
+    ///
+    /// This is a contract, not a display string: the e2e install matrix asserts
+    /// on these exact values, and `gel info --get install-manager` prints them
+    /// into bug reports. Renaming one is a breaking change.
+    pub fn slug(self) -> &'static str {
+        match self {
+            InstallManager::Homebrew => "homebrew",
+            InstallManager::Scoop => "scoop",
+            InstallManager::WinGet => "winget",
+            InstallManager::Nix => "nix",
+            InstallManager::Apt => "apt",
+            InstallManager::Dnf => "dnf",
+            InstallManager::Pacman => "pacman",
+            InstallManager::Direct => "direct",
+        }
+    }
+
     /// True only when this binary owns itself and may be replaced in place.
     pub fn is_self_managed(self) -> bool {
         matches!(self, InstallManager::Direct)
@@ -423,6 +441,42 @@ mod tests {
                 .upgrade_hint()
                 .unwrap()
                 .contains("system package manager")
+        );
+    }
+
+    #[test]
+    fn slug_is_non_empty_lowercase_and_unique() {
+        let managers = [
+            InstallManager::Homebrew,
+            InstallManager::Scoop,
+            InstallManager::WinGet,
+            InstallManager::Nix,
+            InstallManager::Apt,
+            InstallManager::Dnf,
+            InstallManager::Pacman,
+            InstallManager::Direct,
+        ];
+        assert_eq!(managers.len(), 8);
+
+        let mut slugs = Vec::new();
+        for manager in &managers {
+            let slug = manager.slug();
+            assert!(!slug.is_empty(), "{manager:?} has empty slug");
+            assert_eq!(
+                slug,
+                slug.to_lowercase(),
+                "{manager:?} slug '{slug}' is not lowercase"
+            );
+            slugs.push(slug);
+        }
+
+        // Check uniqueness by comparing lengths
+        let unique_slugs: std::collections::HashSet<_> = slugs.iter().collect();
+        assert_eq!(
+            unique_slugs.len(),
+            slugs.len(),
+            "duplicate slugs found: {:?}",
+            slugs
         );
     }
 }

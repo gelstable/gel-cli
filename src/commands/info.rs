@@ -48,6 +48,9 @@ pub fn specific_info(item: &str) -> Result<(), anyhow::Error> {
                 println!("{}", &dir_to_str(startup_dir()?));
             }
         }
+        "install-manager" => {
+            println!("{}", crate::cli::install_manager::detect().slug());
+        }
         _ => unreachable!(),
     }
     Ok(())
@@ -73,6 +76,10 @@ pub fn info(_options: &Options, info: &Info) -> Result<(), anyhow::Error> {
             Cell::new(&dir_to_str(dir.to_path_buf())),
         ]));
     }
+    table.add_row(Row::new(vec![
+        Cell::new("Install manager"),
+        Cell::new(crate::cli::install_manager::detect().slug()),
+    ]));
     let data_dir = platform::data_dir()?;
     if cfg!(not(windows)) {
         table.add_row(Row::new(vec![

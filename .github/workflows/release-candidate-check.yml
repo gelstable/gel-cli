@@ -1,0 +1,105 @@
+name: Release candidate check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: candidate
+    runs-on: ubuntu-24.04
+    permissions:
+      # Same-repository release pull requests only; a fork PR takes the skip path
+      # below before any credential is used.
+      contents: write
+      attestations: read
+    steps:
+      - name: Decide whether this is a release pull request
+        id: gate
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$HEAD_REPO" == "$REPO" && "$HEAD_REF" == "knope/release" ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "Not a release pull request; nothing to verify."
+          fi
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        if: steps.gate.outputs.release == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
+        if: steps.gate.outputs.release == 'true'
+        with:
+          toolchain: "1.88"
+
+      - name: Install jsonschema
+        if: steps.gate.outputs.release == 'true'
+        run: python3 -m pip install --break-system-packages jsonschema
+
+      - name: Require a staged candidate
+        if: steps.gate.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          test -f packaging/release-candidate.json \
+            || { echo "No staged candidate; dispatch release-candidate.yml on knope/release." >&2; exit 1; }
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
+          recorded="$(jq -r '.version' packaging/release-candidate.json)"
+          if [[ "$version" != "$recorded" ]]; then
+            echo "Cargo.toml is $version but the candidate records $recorded" >&2
+            exit 1
+          fi
+
+      - name: Verify the staged candidate against the draft release
+        if: steps.gate.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -m scripts.release.verify_draft \
+            --record packaging/release-candidate.json \
+            --download-dir readback
+
+      - name: Regenerate packaging metadata from the recorded candidate
+        if: steps.gate.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          # Regenerating independently of the staging run is what makes the
+          # committed metadata reviewable: a hand-edited hash fails here.
+          version="$(jq -r '.version' packaging/release-candidate.json)"
+          build_date="$(jq -r '.build_date' packaging/release-candidate.json)"
+          python3 -m scripts.release.registry_manifest \
+            --version "$version" --build-date "$build_date" \
+            --dist-dir readback --out /tmp/gel-registry.json
+          cmp /tmp/gel-registry.json readback/gel-registry.json
+
+      - name: Require the branch to be current with master
+        if: steps.gate.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          if ! git merge-base --is-ancestor origin/master HEAD; then
+            echo "knope/release is behind master; restage after rebasing." >&2
+            exit 1
+          fi
+
+      - name: Verify source equivalence of the prospective merge tree
+        if: steps.gate.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          source_sha="$(jq -r '.source_sha' packaging/release-candidate.json)"
+          git fetch --no-tags origin "refs/pull/${{ github.event.pull_request.number }}/merge"
+          merge_sha="$(git rev-parse FETCH_HEAD)"
+          python3 -m scripts.release.source_equivalence \
+            --base "$source_sha" --head "$merge_sha"

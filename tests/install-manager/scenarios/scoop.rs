@@ -76,6 +76,10 @@ mod imp {
                 return;
             }
         };
+        if let Some(reason) = layout.undetectable() {
+            eprintln!("skipping: {reason}");
+            return;
+        }
         if let Some(reason) = layout.occupied() {
             eprintln!("skipping: {reason}");
             return;
@@ -92,6 +96,10 @@ mod imp {
     /// install. `dirs::home_dir()` rather than `%USERPROFILE%` because on
     /// Windows `dirs` goes through the Known Folder API, which is the same
     /// thing the CLI under test resolves its own paths with.
+    ///
+    /// A relocated `$env:SCOOP` is honoured here but not necessarily *usable* —
+    /// see [`Layout::undetectable`], which refuses a root the production
+    /// detection rule cannot recognise.
     struct Layout {
         root: PathBuf,
     }
@@ -125,6 +133,46 @@ mod imp {
         /// `<root>\shims\gel.exe`, the launcher Scoop puts on `PATH`.
         fn shim(&self) -> PathBuf {
             self.root.join("shims").join(scenario::EXE_NAME)
+        }
+
+        /// Why this scenario cannot prove anything here: the detection rule
+        /// would not recognise an install into *this* Scoop root.
+        ///
+        /// The rule is `path.contains("scoop/apps/")`
+        /// (`detect_from_path`, `src/cli/install_manager.rs`), and those are two
+        /// adjacent literal segments — so the parent of `apps` has to be named
+        /// `scoop`. That holds for the default root and for any relocated root
+        /// whose last component is still `scoop` (`D:\scoop`, `C:\opt\scoop`),
+        /// but not for one that is renamed: with `$env:SCOOP=D:\tools`, Scoop
+        /// installs to `D:\tools\apps\gel\current\gel.exe`, which normalises to
+        /// `d:/tools/apps/gel/current/gel.exe` and matches nothing, so
+        /// `detect()` returns `Direct`. The canonicalisation fallback in
+        /// `detect()` does not rescue it either: resolving the `current`
+        /// junction only yields `d:/tools/apps/gel/0.0.0/gel.exe`.
+        ///
+        /// That is a real, pre-existing gap in the production heuristic — a
+        /// `cli upgrade` on such an install would overwrite Scoop's app
+        /// directory — but it is a gap in `detect_from_path`, not in this test,
+        /// and loosening the rule to accommodate the test would be exactly
+        /// backwards. So the scenario refuses to run rather than failing red,
+        /// and says why.
+        fn undetectable(&self) -> Option<String> {
+            let named_scoop = self
+                .root
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("scoop"));
+            if named_scoop {
+                return None;
+            }
+            Some(format!(
+                "this host's Scoop root is {}, whose last path component is not \
+                 `scoop`; `detect_from_path` matches the two adjacent segments \
+                 `scoop/apps/`, so an install under this root would be reported \
+                 as `direct` and the scenario would fail rather than prove \
+                 anything. That is a gap in the production heuristic, not in \
+                 this test — do not loosen the rule to make this pass",
+                self.root.display(),
+            ))
         }
 
         /// Why this scenario must not run here: something is already installed

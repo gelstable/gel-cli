@@ -60,11 +60,17 @@ pub fn run() {
     // CLI will read — and that means a `cli.toml`.
     let config_dir = scenario::info_get(&installed, "config-dir", scenario.env());
     if let Some(reason) = scenario.upgrade_half_skip_reason(&config_dir) {
-        eprintln!("skipping the self-upgrade half: {reason}");
+        // The literal `skipping:` is load-bearing, not phrasing:
+        // `scripts/ci/run-install-scenario.sh` greps for exactly that string to
+        // turn "nothing was tested" into a red job. A partial skip is still a
+        // skip — the `direct-*` jobs exist to prove a real self-upgrade — so it
+        // has to carry the marker too, with the "half" said in the human-facing
+        // part rather than folded into the marker.
+        eprintln!("skipping: the self-upgrade half — {reason}");
         return;
     }
     let Some(platform) = scenario::cli_platform() else {
-        eprintln!("skipping the self-upgrade half: no CLI build for this host");
+        eprintln!("skipping: the self-upgrade half — no CLI build for this host");
         return;
     };
 

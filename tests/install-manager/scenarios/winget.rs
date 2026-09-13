@@ -89,9 +89,15 @@ mod imp {
 
     pub fn run() {
         if !available() {
+            // Opens with the literal `skipping:` because
+            // `scripts/ci/run-install-scenario.sh` greps for exactly that to
+            // decide a job tested nothing. This scenario is run with
+            // GEL_E2E_ALLOW_SKIP=1 so the guard is disarmed for it — but the
+            // marker still has to be here, or the day someone arms the guard
+            // (a runner image that gains WinGet) it would silently not fire.
             eprintln!(
-                "SKIPPING e2e_winget: WINGET IS NOT USABLE ON THIS HOST, SO THIS \
-                 SCENARIO PROVED NOTHING.\n\
+                "skipping: WINGET IS NOT USABLE ON THIS HOST, SO e2e_winget \
+                 PROVED NOTHING.\n\
                  `winget` could not be found on PATH, or could not run. WinGet is \
                  not part of the `windows-2025` GitHub runner image (that image \
                  ships Chocolatey, not the Windows Package Manager), and this \

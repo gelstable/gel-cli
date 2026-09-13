@@ -102,19 +102,50 @@ mod imp {
     /// detection rule cannot recognise.
     struct Layout {
         root: PathBuf,
+        /// The resolved `scoop` entry point — see [`Layout::scoop`].
+        exe: PathBuf,
     }
 
     impl Layout {
         fn probe() -> anyhow::Result<Layout> {
+            // Resolved once, here, rather than at each call site: `which` walks
+            // PATH and PATHEXT, and `cleanup` has nowhere to report a failure.
+            let exe = which::which("scoop").context("cannot resolve `scoop` on PATH")?;
             if let Some(value) = std::env::var_os("SCOOP").filter(|value| !value.is_empty()) {
                 return Ok(Layout {
                     root: PathBuf::from(value),
+                    exe,
                 });
             }
             let home = dirs::home_dir().context("cannot determine the home directory")?;
             Ok(Layout {
                 root: home.join("scoop"),
+                exe,
             })
+        }
+
+        /// A `scoop` command, spawned through the *resolved* shim path.
+        ///
+        /// Spawning the bare name `scoop` does not work on Windows and this
+        /// indirection is the fix — do not "simplify" it away.
+        ///
+        /// Scoop ships no `scoop.exe`: what sits on `PATH` is
+        /// `<root>\shims\scoop.cmd` (plus a `.ps1`). Rust's
+        /// `std::process::Command` resolves a bare program name by appending
+        /// `.exe` and nothing else — it deliberately does not consult
+        /// `PATHEXT` — so the bare name finds nothing and fails to spawn,
+        /// which `scenario::run` turns into a panic. `which::which` *does*
+        /// honour `PATHEXT`, which is why `scenario::have("scoop")` answers
+        /// `true` for a host a bare spawn cannot launch on at all.
+        ///
+        /// Handing `Command` the resolved `.cmd` path is what closes the gap:
+        /// std recognises a `.bat`/`.cmd` target and runs it through
+        /// `cmd.exe`, applying the batch-specific argument quoting added in
+        /// the CVE-2024-24576 fix. That is also why this beats writing
+        /// `cmd /C scoop ...` by hand — the quoting of the manifest path would
+        /// otherwise be ours to get right.
+        fn scoop(&self) -> Command {
+            Command::new(&self.exe)
         }
 
         /// `<root>\apps\gel`, the directory `scoop uninstall gel` removes.
@@ -267,7 +298,7 @@ mod imp {
 
             self.attempted.store(true, Ordering::SeqCst);
             scenario::checked(
-                Command::new("scoop").arg("install").arg(&manifest_path),
+                self.layout.scoop().arg("install").arg(&manifest_path),
                 "`scoop install`",
             )?;
 
@@ -285,7 +316,7 @@ mod imp {
                 return;
             }
             scenario::report_cleanup(
-                Command::new("scoop").arg("uninstall").arg(APP),
+                self.layout.scoop().arg("uninstall").arg(APP),
                 "`scoop uninstall gel`",
             );
             // The cached download is keyed by app, version *and* URL, so a
@@ -293,7 +324,7 @@ mod imp {
             // copy of a CLI binary sitting in the developer's Scoop cache, and
             // leaving it there is rude rather than harmless.
             scenario::report_cleanup(
-                Command::new("scoop").arg("cache").arg("rm").arg(APP),
+                self.layout.scoop().arg("cache").arg("rm").arg(APP),
                 "`scoop cache rm gel`",
             );
         }

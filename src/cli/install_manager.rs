@@ -24,6 +24,23 @@ pub enum InstallManager {
 }
 
 impl InstallManager {
+    /// Complete list of all InstallManager variants.
+    ///
+    /// When adding a new variant to the enum, you must also:
+    /// 1. Add the variant to this array
+    /// 2. Add a match arm in the `slug()` method with its lowercase slug
+    /// The compiler ensures `slug()` is exhaustive; this array must be updated manually.
+    pub const ALL: [InstallManager; 8] = [
+        InstallManager::Homebrew,
+        InstallManager::Scoop,
+        InstallManager::WinGet,
+        InstallManager::Nix,
+        InstallManager::Apt,
+        InstallManager::Dnf,
+        InstallManager::Pacman,
+        InstallManager::Direct,
+    ];
+
     /// The stable, lowercase name for this manager.
     ///
     /// This is a contract, not a display string: the e2e install matrix asserts
@@ -446,20 +463,8 @@ mod tests {
 
     #[test]
     fn slug_is_non_empty_lowercase_and_unique() {
-        let managers = [
-            InstallManager::Homebrew,
-            InstallManager::Scoop,
-            InstallManager::WinGet,
-            InstallManager::Nix,
-            InstallManager::Apt,
-            InstallManager::Dnf,
-            InstallManager::Pacman,
-            InstallManager::Direct,
-        ];
-        assert_eq!(managers.len(), 8);
-
         let mut slugs = Vec::new();
-        for manager in &managers {
+        for manager in &InstallManager::ALL {
             let slug = manager.slug();
             assert!(!slug.is_empty(), "{manager:?} has empty slug");
             assert_eq!(
@@ -478,5 +483,19 @@ mod tests {
             "duplicate slugs found: {:?}",
             slugs
         );
+    }
+
+    #[test]
+    fn slug_contract_values_are_exact() {
+        // The e2e test matrix depends on these exact slug values.
+        // Any typo here breaks the contract with the test suite.
+        assert_eq!(InstallManager::Homebrew.slug(), "homebrew");
+        assert_eq!(InstallManager::Scoop.slug(), "scoop");
+        assert_eq!(InstallManager::WinGet.slug(), "winget");
+        assert_eq!(InstallManager::Nix.slug(), "nix");
+        assert_eq!(InstallManager::Apt.slug(), "apt");
+        assert_eq!(InstallManager::Dnf.slug(), "dnf");
+        assert_eq!(InstallManager::Pacman.slug(), "pacman");
+        assert_eq!(InstallManager::Direct.slug(), "direct");
     }
 }

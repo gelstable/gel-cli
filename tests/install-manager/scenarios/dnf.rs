@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scenario::{self, Scenario};
 
-use super::unix_package::{self, PACKAGE, Privilege};
+use super::unix_package::{self, PACKAGE, PackageQuery, Privilege};
 
 /// `%global debug_package %{nil}` and `%define __os_install_post %{nil}` between
 /// them switch off the whole `brp-*` post-install pipeline. Those scripts strip
@@ -63,7 +63,7 @@ fn rpm_arch() -> Option<&'static str> {
 }
 
 pub fn run() {
-    let privilege = match unix_package::precheck(&["rpmbuild", "rpm"]) {
+    let privilege = match unix_package::precheck(&["rpmbuild", "rpm"], PackageQuery::Rpm) {
         Ok(privilege) => privilege,
         Err(reason) => {
             eprintln!("skipping: {reason}");

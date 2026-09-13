@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scenario::{self, Scenario};
 
-use super::unix_package::{self, PACKAGE, Privilege};
+use super::unix_package::{self, PACKAGE, PackageQuery, Privilege};
 
 /// `arch=('any')` is a lie about a prebuilt ELF binary, but a harmless one:
 /// unlike rpm, makepkg does not inspect the payload, and pacman only compares
@@ -42,7 +42,10 @@ package() {
 const BUILD_USER: &str = "nobody";
 
 pub fn run() {
-    let privilege = match unix_package::precheck(&["makepkg", "pacman", "fakeroot", "chmod"]) {
+    let privilege = match unix_package::precheck(
+        &["makepkg", "pacman", "fakeroot", "chmod"],
+        PackageQuery::Pacman,
+    ) {
         Ok(privilege) => privilege,
         Err(reason) => {
             eprintln!("skipping: {reason}");

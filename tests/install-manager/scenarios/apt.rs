@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scenario::{self, Scenario};
 
-use super::unix_package::{self, PACKAGE, Privilege};
+use super::unix_package::{self, PACKAGE, PackageQuery, Privilege};
 
 /// The five fields `dpkg-deb` insists on. `Architecture: all` rather than the
 /// host's: the package carries one prebuilt binary that is only ever installed
@@ -28,13 +28,14 @@ Description: gel CLI install-manager e2e fixture
 ";
 
 pub fn run() {
-    let privilege = match unix_package::precheck(&["dpkg-deb", "dpkg"]) {
-        Ok(privilege) => privilege,
-        Err(reason) => {
-            eprintln!("skipping: {reason}");
-            return;
-        }
-    };
+    let privilege =
+        match unix_package::precheck(&["dpkg-deb", "dpkg", "dpkg-query"], PackageQuery::Dpkg) {
+            Ok(privilege) => privilege,
+            Err(reason) => {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+        };
     let scenario = AptScenario::new(privilege).expect("prepare the apt scenario");
     scenario::assert_managed(&scenario);
 }
@@ -46,6 +47,12 @@ pub struct AptScenario {
     /// never got that far" from "the install ran". Without it, every failure
     /// while *building* the package would also print a confusing `dpkg -r gel`
     /// error about a package that was never installed.
+    ///
+    /// Immediately *before* rather than after, because a `dpkg -i` that fails
+    /// part-way through still leaves a database entry to remove. That is only
+    /// safe because `precheck` has already established that no `gel` package
+    /// exists on this host, so the entry cleanup removes can only be this
+    /// scenario's.
     attempted: AtomicBool,
 }
 

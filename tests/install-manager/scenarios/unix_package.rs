@@ -68,14 +68,70 @@ impl Privilege {
     }
 }
 
+/// How to ask a package database whether it already knows a `gel` package.
+///
+/// A filesystem check is not enough on its own. `cleanup` removes the package
+/// *by name*, so a `gel` package that is already registered — even one owning
+/// some path other than `/usr/bin/gel` — is at risk: `dpkg -i` and `pacman -U`
+/// would replace it and cleanup would then uninstall it, and `rpm -i` would
+/// fail while cleanup uninstalled it anyway. Uninstalling a package the
+/// developer actually wanted is the worst thing this harness could do, so the
+/// database is consulted before anything is built.
+#[derive(Clone, Copy, Debug)]
+pub enum PackageQuery {
+    Dpkg,
+    Rpm,
+    Pacman,
+}
+
+impl PackageQuery {
+    fn is_installed(self) -> bool {
+        match self {
+            // Exit status alone is not enough here: a package that was removed
+            // but not purged still answers 0, with "deinstall ok config-files".
+            // Such a package owns no files and `dpkg -r` would refuse it, so it
+            // is not something this scenario can destroy — and treating it as
+            // "installed" would make every run after the first one on the same
+            // container skip.
+            PackageQuery::Dpkg => {
+                let queried = scenario::run_quietly(
+                    Command::new("dpkg-query")
+                        .arg("-W")
+                        .arg("-f=${Status}")
+                        .arg(PACKAGE),
+                );
+                queried.is_some_and(|out| {
+                    out.success
+                        && out.stdout_trimmed().split_whitespace().next_back() == Some("installed")
+                })
+            }
+            PackageQuery::Rpm => answers("rpm", &["-q", PACKAGE]),
+            PackageQuery::Pacman => answers("pacman", &["-Qi", PACKAGE]),
+        }
+    }
+}
+
+/// Whether a query tool exits 0, which for `rpm -q` and `pacman -Qi` means "yes,
+/// that package is installed".
+fn answers(tool: &str, args: &[&str]) -> bool {
+    let mut cmd = Command::new(tool);
+    cmd.args(args);
+    scenario::run_quietly(&mut cmd).is_some_and(|out| out.success)
+}
+
 /// Decide whether this host can run a distro scenario at all.
 ///
 /// `Err` is a skip reason, not a failure: a laptop without `dpkg` is not a
-/// broken build. The `/usr/bin/gel` check is the one that is about safety
-/// rather than capability — if something is already installed there, this
-/// scenario would package over a real install and then remove it in cleanup,
-/// so it refuses instead.
-pub fn precheck(tools: &[&str]) -> Result<Privilege, String> {
+/// broken build. The last two checks are about safety rather than capability —
+/// an existing `/usr/bin/gel`, or an existing `gel` package under any path at
+/// all, means this scenario would install over something it did not create and
+/// then destroy it in cleanup, so it refuses instead.
+///
+/// Both refusals happen here, before the scenario is constructed and so before
+/// any `attempted` flag can be set. That is what lets each scenario's `cleanup`
+/// remove the package unconditionally once `attempted` is true: the only `gel`
+/// package that can exist at that point is the one this scenario installed.
+pub fn precheck(tools: &[&str], query: PackageQuery) -> Result<Privilege, String> {
     for tool in tools {
         if !scenario::have(tool) {
             return Err(format!("{tool} is not installed on this host"));
@@ -85,6 +141,13 @@ pub fn precheck(tools: &[&str]) -> Result<Privilege, String> {
         return Err(format!(
             "{SYSTEM_BIN} already exists; refusing to package over an install \
              this test did not create"
+        ));
+    }
+    if query.is_installed() {
+        return Err(format!(
+            "a `{PACKAGE}` package is already installed on this host; refusing to \
+             replace a package this test did not create, because cleanup would \
+             then uninstall it"
         ));
     }
     Privilege::current().ok_or_else(|| {

@@ -2,10 +2,12 @@
 //!
 //! A managed install must never be overwritten in place: replacing a Homebrew
 //! cellar file or a Scoop app directory corrupts the manager's own state. The
-//! path rules are a pure function and the three Linux package-database lookups
-//! go through a trait, so the whole decision table is testable on any host.
+//! path rules are a pure function and every question only the host can answer
+//! — the three Linux package databases, and the environment that tells Scoop
+//! where it keeps its apps — goes through a trait, so the whole decision table
+//! is testable on any host.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::branding::BRANDING_CLI_CMD;
@@ -108,14 +110,24 @@ impl InstallManager {
     }
 }
 
-/// Queries the host's package databases.
+/// Asks the host what it knows about ownership.
 ///
 /// Split out from the path rules so detection can be tested without a dpkg,
-/// rpm, or pacman on the machine running the tests.
-pub trait OwnershipProbe {
+/// rpm, or pacman on the machine running the tests — and without a Scoop
+/// install on it either.
+pub trait HostProbe {
     fn dpkg_owns(&self, exe: &Path) -> bool;
     fn rpm_owns(&self, exe: &Path) -> bool;
     fn pacman_owns(&self, exe: &Path) -> bool;
+
+    /// The Scoop install roots this host is configured with, if any.
+    ///
+    /// Resolved the way Scoop resolves them: `$env:SCOOP` for the per-user
+    /// root, `$env:SCOOP_GLOBAL` for the machine-wide one. Their defaults
+    /// (`~\scoop`, `%ProgramData%\scoop`) are deliberately absent — a default
+    /// root's last component is `scoop`, which the literal path rule already
+    /// matches, so there is nothing for them to add here.
+    fn scoop_roots(&self) -> Vec<PathBuf>;
 }
 
 pub struct SystemProbe;
@@ -134,7 +146,7 @@ impl SystemProbe {
     }
 }
 
-impl OwnershipProbe for SystemProbe {
+impl HostProbe for SystemProbe {
     fn dpkg_owns(&self, exe: &Path) -> bool {
         Self::owns("dpkg", &["-S"], exe)
     }
@@ -143,6 +155,14 @@ impl OwnershipProbe for SystemProbe {
     }
     fn pacman_owns(&self, exe: &Path) -> bool {
         Self::owns("pacman", &["-Qo"], exe)
+    }
+    fn scoop_roots(&self) -> Vec<PathBuf> {
+        ["SCOOP", "SCOOP_GLOBAL"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .collect()
     }
 }
 
@@ -155,13 +175,42 @@ fn is_system_bin(exe: &Path) -> bool {
     path.starts_with("/usr/bin/") || path.starts_with("/bin/")
 }
 
-pub fn detect_from_path(exe: &Path, probe: &dyn OwnershipProbe) -> InstallManager {
+/// True when `path` — already [`normalized`] — is a file Scoop installed
+/// under `root`.
+///
+/// Scoop lays every install out as `<root>\apps\<app>\<version>\...`, with a
+/// `current` junction beside the version directories, so an `apps` directory
+/// directly under the configured root is what marks a file as Scoop's.
+/// Claiming the whole root would be too broad: `cache`, `buckets` and
+/// `persist` are Scoop's too but hold nothing the CLI can be running from, and
+/// `<root>\shims\gel.exe` is a launcher that starts the real binary under
+/// `apps` as a child process — so it is that child's path, not the shim's,
+/// that reaches detection.
+fn is_under_scoop_root(path: &str, root: &Path) -> bool {
+    let root = normalized(root);
+    let root = root.trim_end_matches('/');
+    !root.is_empty() && path.starts_with(&format!("{root}/apps/"))
+}
+
+pub fn detect_from_path(exe: &Path, probe: &dyn HostProbe) -> InstallManager {
     let path = normalized(exe);
 
     if path.contains("/nix/store/") {
         return InstallManager::Nix;
     }
-    if path.contains("scoop/apps/") {
+    // Two halves, because a Scoop root can be moved and it can be renamed. The
+    // literal segments catch the default root and any relocated one whose last
+    // component is still `scoop` (`D:\scoop`, `C:\opt\scoop`). A renamed root
+    // leaves nothing in the path to recognise — with `$env:SCOOP=D:\tools` the
+    // binary sits at `D:\tools\apps\gel\current\gel.exe` — so the configured
+    // roots are consulted too. Missing that case would classify a
+    // Scoop-managed install `Direct` and let `cli upgrade` overwrite it.
+    if path.contains("scoop/apps/")
+        || probe
+            .scoop_roots()
+            .iter()
+            .any(|root| is_under_scoop_root(&path, root))
+    {
         return InstallManager::Scoop;
     }
     if path.contains("winget/packages/") {
@@ -215,18 +264,19 @@ pub fn detect() -> InstallManager {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::{InstallManager, OwnershipProbe, detect_from_path};
+    use super::{HostProbe, InstallManager, detect_from_path};
 
     #[derive(Default)]
     struct StubProbe {
         dpkg: bool,
         rpm: bool,
         pacman: bool,
+        scoop_roots: Vec<PathBuf>,
     }
 
-    impl OwnershipProbe for StubProbe {
+    impl HostProbe for StubProbe {
         fn dpkg_owns(&self, _exe: &Path) -> bool {
             self.dpkg
         }
@@ -236,10 +286,24 @@ mod tests {
         fn pacman_owns(&self, _exe: &Path) -> bool {
             self.pacman
         }
+        fn scoop_roots(&self) -> Vec<PathBuf> {
+            self.scoop_roots.clone()
+        }
     }
 
+    /// Detection on a host with no Scoop root configured, which is every host
+    /// that has not set `$env:SCOOP`.
     fn detect(path: &str) -> InstallManager {
         detect_from_path(Path::new(path), &StubProbe::default())
+    }
+
+    /// Detection on a host whose Scoop is configured with these roots.
+    fn detect_under_roots(path: &str, roots: &[&str]) -> InstallManager {
+        let probe = StubProbe {
+            scoop_roots: roots.iter().map(PathBuf::from).collect(),
+            ..StubProbe::default()
+        };
+        detect_from_path(Path::new(path), &probe)
     }
 
     #[test]
@@ -275,6 +339,78 @@ mod tests {
         assert_eq!(
             detect("/c/Users/alice/scoop/apps/gel/current/gel.exe"),
             InstallManager::Scoop
+        );
+    }
+
+    /// A Scoop root that has been *renamed*, not merely relocated: with
+    /// `$env:SCOOP=D:\tools` no `scoop` segment survives in the path, so the
+    /// literal rule has nothing to match. Calling such an install `Direct`
+    /// would let `cli upgrade` overwrite Scoop's app directory — the very
+    /// hazard this module exists to prevent.
+    #[test]
+    fn renamed_scoop_root_from_the_environment_is_scoop() {
+        assert_eq!(
+            detect_under_roots(r"D:\tools\apps\gel\current\gel.exe", &[r"D:\tools"]),
+            InstallManager::Scoop
+        );
+        // What `detect()` retries with after resolving the `current` junction.
+        assert_eq!(
+            detect_under_roots(r"D:\tools\apps\gel\0.0.0\gel.exe", &[r"D:\tools"]),
+            InstallManager::Scoop
+        );
+    }
+
+    /// `scoop install -g` installs under a second, machine-wide root, which is
+    /// configured by its own variable.
+    #[test]
+    fn global_scoop_root_is_scoop() {
+        assert_eq!(
+            detect_under_roots(
+                r"D:\shared\apps\gel\current\gel.exe",
+                &[r"D:\tools", r"D:\shared"],
+            ),
+            InstallManager::Scoop
+        );
+    }
+
+    /// A trailing separator on `$env:SCOOP` is a plausible thing for a user to
+    /// have, and must not leave the match hunting for `d:/tools//apps/`.
+    #[test]
+    fn scoop_root_with_a_trailing_separator_still_matches() {
+        assert_eq!(
+            detect_under_roots(r"D:\tools\apps\gel\current\gel.exe", &[r"D:\tools\"]),
+            InstallManager::Scoop
+        );
+    }
+
+    /// The root names a directory, not a string prefix: a sibling whose name
+    /// merely starts with it is nobody's Scoop install.
+    #[test]
+    fn sibling_of_the_scoop_root_is_not_scoop() {
+        assert_eq!(
+            detect_under_roots(r"D:\toolsmith\apps\gel\current\gel.exe", &[r"D:\tools"]),
+            InstallManager::Direct
+        );
+    }
+
+    /// `apps` has to sit directly under the configured root. Anything deeper is
+    /// some other tree that happens to have an `apps` directory in it.
+    #[test]
+    fn nested_apps_directory_under_the_scoop_root_is_not_scoop() {
+        assert_eq!(
+            detect_under_roots(r"D:\tools\vendor\apps\gel\gel.exe", &[r"D:\tools"]),
+            InstallManager::Direct
+        );
+    }
+
+    /// An empty `$env:SCOOP` is not a root at `/apps/`: the variable is
+    /// filtered out before it ever reaches the path rules, and a stub that
+    /// hands one over anyway must still be refused.
+    #[test]
+    fn an_empty_scoop_root_claims_nothing() {
+        assert_eq!(
+            detect_under_roots("/home/alice/apps/gel/gel", &[""]),
+            InstallManager::Direct
         );
     }
 
@@ -330,6 +466,7 @@ mod tests {
             dpkg: true,
             rpm: true,
             pacman: true,
+            ..StubProbe::default()
         };
         assert_eq!(
             detect_from_path(Path::new("/usr/binary-thing/gel"), &probe),
@@ -379,6 +516,7 @@ mod tests {
             dpkg: true,
             rpm: true,
             pacman: true,
+            ..StubProbe::default()
         };
         assert_eq!(
             detect_from_path(Path::new("/usr/bin/gel"), &probe),
@@ -394,6 +532,7 @@ mod tests {
             dpkg: true,
             rpm: true,
             pacman: true,
+            ..StubProbe::default()
         };
         assert_eq!(
             detect_from_path(Path::new("/home/alice/.local/bin/gel"), &probe),

@@ -76,10 +76,6 @@ mod imp {
                 return;
             }
         };
-        if let Some(reason) = layout.undetectable() {
-            eprintln!("skipping: {reason}");
-            return;
-        }
         if let Some(reason) = layout.occupied() {
             eprintln!("skipping: {reason}");
             return;
@@ -97,9 +93,10 @@ mod imp {
     /// Windows `dirs` goes through the Known Folder API, which is the same
     /// thing the CLI under test resolves its own paths with.
     ///
-    /// A relocated `$env:SCOOP` is honoured here but not necessarily *usable* —
-    /// see [`Layout::undetectable`], which refuses a root the production
-    /// detection rule cannot recognise.
+    /// A relocated or renamed `$env:SCOOP` is honoured here and is usable:
+    /// `detect_from_path` reads the same variable, and `scenario::run` does not
+    /// strip it from the child's environment, so the binary under test resolves
+    /// the same root this does.
     struct Layout {
         root: PathBuf,
         /// Scoop's PowerShell entry point — see [`Layout::scoop`].
@@ -221,8 +218,8 @@ mod imp {
         }
 
         /// What a user actually runs. `current` is a junction Scoop repoints at
-        /// the installed version directory; both spellings contain
-        /// `scoop/apps/`, so it does not matter which one `current_exe()`
+        /// the installed version directory; both spellings sit under
+        /// `<root>\apps`, so it does not matter which one `current_exe()`
         /// reports.
         fn installed_bin(&self) -> PathBuf {
             self.app_dir().join("current").join(scenario::EXE_NAME)
@@ -231,6 +228,23 @@ mod imp {
         /// `<root>\shims\gel.exe`, the launcher Scoop puts on `PATH`.
         fn shim(&self) -> PathBuf {
             self.root.join("shims").join(scenario::EXE_NAME)
+        }
+
+        /// A mirror of `detect_from_path`'s Scoop rule
+        /// (`src/cli/install_manager.rs`), in both its halves: the literal
+        /// `scoop/apps/` segments, which catch a default or merely relocated
+        /// root, and `<root>\apps`, which is what catches a renamed one.
+        ///
+        /// Kept faithful to the production rule rather than convenient to this
+        /// test: if an install lands somewhere neither half matches, the honest
+        /// answer is that detection would call it `direct`, and this scenario
+        /// should say so rather than widen until it passes.
+        fn detection_would_match(&self, installed: &Path) -> bool {
+            let normalise = |path: &Path| path.to_string_lossy().replace('\\', "/").to_lowercase();
+            let installed = normalise(installed);
+            let root = normalise(&self.root);
+            installed.contains("scoop/apps/")
+                || installed.starts_with(&format!("{}/apps/", root.trim_end_matches('/')))
         }
 
         /// The executable `scoop install` actually produced, if any.
@@ -243,7 +257,7 @@ mod imp {
         /// because that is the path a user's `PATH` resolves to and the one
         /// the junction branch of detection is about; any other copy under
         /// `apps\gel` is a good enough answer for the contract, since every
-        /// path under that directory contains `scoop/apps/`.
+        /// path under that directory is one detection recognises.
         ///
         /// The walk is depth-limited: `current` is a junction back into a
         /// sibling version directory, so an unbounded walk would revisit the
@@ -286,46 +300,6 @@ mod imp {
                 list_tree(&dir, depth, &mut report);
             }
             report
-        }
-
-        /// Why this scenario cannot prove anything here: the detection rule
-        /// would not recognise an install into *this* Scoop root.
-        ///
-        /// The rule is `path.contains("scoop/apps/")`
-        /// (`detect_from_path`, `src/cli/install_manager.rs`), and those are two
-        /// adjacent literal segments — so the parent of `apps` has to be named
-        /// `scoop`. That holds for the default root and for any relocated root
-        /// whose last component is still `scoop` (`D:\scoop`, `C:\opt\scoop`),
-        /// but not for one that is renamed: with `$env:SCOOP=D:\tools`, Scoop
-        /// installs to `D:\tools\apps\gel\current\gel.exe`, which normalises to
-        /// `d:/tools/apps/gel/current/gel.exe` and matches nothing, so
-        /// `detect()` returns `Direct`. The canonicalisation fallback in
-        /// `detect()` does not rescue it either: resolving the `current`
-        /// junction only yields `d:/tools/apps/gel/0.0.0/gel.exe`.
-        ///
-        /// That is a real, pre-existing gap in the production heuristic — a
-        /// `cli upgrade` on such an install would overwrite Scoop's app
-        /// directory — but it is a gap in `detect_from_path`, not in this test,
-        /// and loosening the rule to accommodate the test would be exactly
-        /// backwards. So the scenario refuses to run rather than failing red,
-        /// and says why.
-        fn undetectable(&self) -> Option<String> {
-            let named_scoop = self
-                .root
-                .file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("scoop"));
-            if named_scoop {
-                return None;
-            }
-            Some(format!(
-                "this host's Scoop root is {}, whose last path component is not \
-                 `scoop`; `detect_from_path` matches the two adjacent segments \
-                 `scoop/apps/`, so an install under this root would be reported \
-                 as `direct` and the scenario would fail rather than prove \
-                 anything. That is a gap in the production heuristic, not in \
-                 this test — do not loosen the rule to make this pass",
-                self.root.display(),
-            ))
         }
 
         /// Why this scenario must not run here: something is already installed
@@ -481,17 +455,14 @@ mod imp {
             // than as a puzzling `expected "scoop", got "direct"` later on.
             // `assert_managed` still makes the real assertion by asking the
             // installed binary what owns it; this only sharpens the message.
-            let normalised = installed
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_lowercase();
             anyhow::ensure!(
-                normalised.contains("scoop/apps/"),
-                "`scoop install` put the binary at {}, which does not contain the \
-                 two adjacent segments `scoop/apps/` that `detect_from_path` \
-                 matches, so this install would be classified `direct`. Do not \
-                 loosen the rule to accommodate it",
+                self.layout.detection_would_match(&installed),
+                "`scoop install` put the binary at {}, which neither contains the \
+                 two adjacent segments `scoop/apps/` nor sits under {}, so this \
+                 install would be classified `direct`. Do not loosen the rule to \
+                 accommodate it",
                 installed.display(),
+                self.layout.root.join("apps").display(),
             );
             Ok(installed)
         }

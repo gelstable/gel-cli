@@ -329,12 +329,14 @@ mod tests {
 
     #[test]
     fn scoop_installs_are_not_self_managed_and_defer() {
-        use std::path::Path;
+        use std::path::{Path, PathBuf};
 
-        use crate::cli::install_manager::{OwnershipProbe, detect_from_path};
+        use crate::cli::install_manager::{HostProbe, detect_from_path};
 
-        struct NoPackages;
-        impl OwnershipProbe for NoPackages {
+        /// A host with no package database and no configured Scoop root, so
+        /// each path below is classified on its own merits.
+        struct BareHost;
+        impl HostProbe for BareHost {
             fn dpkg_owns(&self, _exe: &Path) -> bool {
                 false
             }
@@ -344,11 +346,14 @@ mod tests {
             fn pacman_owns(&self, _exe: &Path) -> bool {
                 false
             }
+            fn scoop_roots(&self) -> Vec<PathBuf> {
+                Vec::new()
+            }
         }
 
         let manager = detect_from_path(
             Path::new(r"C:\Users\alice\scoop\apps\gel\current\gel.exe"),
-            &NoPackages,
+            &BareHost,
         );
         assert!(!manager.is_self_managed());
         assert!(matches!(upgrade_action(manager), UpgradeAction::Defer(_)));

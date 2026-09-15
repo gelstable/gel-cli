@@ -20,6 +20,26 @@ $ curl --proto '=https' --tlsv1.2 -sSfL https://geldata.com/sh | sh -s -- --nigh
 ```
 
 
+Upgrading
+=========
+
+`gel cli upgrade` replaces the binary in place only when `gel` installed itself.
+When the binary is owned by a package manager, it prints that manager's upgrade
+command and exits without touching anything:
+
+| Install source | What `gel cli upgrade` prints |
+| --- | --- |
+| Homebrew | `brew upgrade gel` |
+| Scoop | `scoop update gel` |
+| WinGet | `winget upgrade Gelstable.Gel` |
+| Nix | `nix profile upgrade gel-cli` |
+| apt, dnf, pacman | update through your system package manager |
+
+`--force` does not override this. Overwriting a file a package manager owns
+corrupts its record of the install, which is worse than refusing. The background
+version check reports the same instruction when a newer release exists.
+
+
 Development
 ===========
 

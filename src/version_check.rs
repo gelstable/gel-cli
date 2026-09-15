@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::branding::BRANDING_CLI_CMD;
 use crate::cli;
 use crate::cli::env::Env;
+use crate::cli::install_manager::{self, InstallManager};
 use crate::platform;
 use crate::portable::registry;
 use crate::portable::ver;
@@ -54,21 +55,25 @@ fn write_cache(dir: &Path, data: &Cache) -> anyhow::Result<()> {
     Ok(serde_json::to_writer_pretty(writer, data)?)
 }
 
-fn newer_warning(ver: &ver::Semver) {
-    if cli::upgrade::can_upgrade() {
-        eprintln!(
-            "Newer version of {BRANDING_CLI_CMD} tool exists {} (current {}). \
-                To upgrade run `{BRANDING_CLI_CMD} cli upgrade`",
-            ver,
-            env!("CARGO_PKG_VERSION")
-        );
-    } else {
-        eprintln!(
-            "Newer version of {BRANDING_CLI_CMD} tool exists {} (current {})",
-            ver,
-            env!("CARGO_PKG_VERSION")
+fn newer_version_message(ver: &ver::Semver, manager: InstallManager) -> String {
+    let current = env!("CARGO_PKG_VERSION");
+    if let Some(hint) = manager.upgrade_hint() {
+        return format!(
+            "Newer version of {BRANDING_CLI_CMD} tool exists {ver} (current {current}). {hint}"
         );
     }
+    if cli::upgrade::can_upgrade() {
+        format!(
+            "Newer version of {BRANDING_CLI_CMD} tool exists {ver} (current {current}). \
+             To upgrade run `{BRANDING_CLI_CMD} cli upgrade`"
+        )
+    } else {
+        format!("Newer version of {BRANDING_CLI_CMD} tool exists {ver} (current {current})")
+    }
+}
+
+fn newer_warning(ver: &ver::Semver) {
+    eprintln!("{}", newer_version_message(ver, install_manager::detect()));
 }
 
 /// Check the modification and creation time of the CLI binary. If either of
@@ -197,4 +202,46 @@ pub fn check(no_version_check_opt: bool) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newer_version_message;
+    use crate::cli::install_manager::InstallManager;
+    use crate::portable::ver;
+
+    fn version() -> ver::Semver {
+        "9.9.9".parse().expect("valid semver")
+    }
+
+    #[test]
+    fn managed_installs_get_their_native_instruction() {
+        let message = newer_version_message(&version(), InstallManager::Homebrew);
+        assert!(message.contains("9.9.9"), "{message}");
+        assert!(message.contains(env!("CARGO_PKG_VERSION")), "{message}");
+        assert!(message.contains("brew upgrade gel"), "{message}");
+        assert!(!message.contains("cli upgrade"), "{message}");
+    }
+
+    #[test]
+    fn every_managed_variant_mentions_its_manager() {
+        for (manager, needle) in [
+            (InstallManager::Scoop, "scoop update gel"),
+            (InstallManager::WinGet, "winget upgrade Gelstable.Gel"),
+            (InstallManager::Nix, "nix profile upgrade gel-cli"),
+            (InstallManager::Apt, "system package manager"),
+            (InstallManager::Dnf, "system package manager"),
+            (InstallManager::Pacman, "system package manager"),
+        ] {
+            let message = newer_version_message(&version(), manager);
+            assert!(message.contains(needle), "{manager:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn direct_installs_keep_the_existing_advice() {
+        let message = newer_version_message(&version(), InstallManager::Direct);
+        assert!(message.contains("9.9.9"), "{message}");
+        assert!(!message.contains("was installed via"), "{message}");
+    }
 }

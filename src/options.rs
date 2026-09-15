@@ -569,6 +569,7 @@ pub struct Info {
         "cache-dir",
         "data-dir",
         "service-dir",
+        "install-manager",
     ])]
     /// Get specific value:
     ///
@@ -577,6 +578,7 @@ pub struct Info {
     /// * `cache-dir` -- Base cache directory
     /// * `data-dir` -- Base data directory (except on Windows)
     /// * `service-dir` -- Directory where supervisor/startup files are placed
+    /// * `install-manager` -- Package manager that owns this CLI binary, or `direct`
     pub get: Option<String>,
 }
 

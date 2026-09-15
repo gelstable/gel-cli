@@ -3,6 +3,7 @@ use crate::portable;
 pub mod env;
 pub mod gen_completions;
 pub mod install;
+pub mod install_manager;
 pub mod logo;
 pub mod upgrade;
 

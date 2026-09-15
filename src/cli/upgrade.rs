@@ -7,6 +7,8 @@ use fn_error_context::context;
 use fs_err as fs;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use crate::branding::BRANDING_CLI_CMD;
+use crate::cli::install_manager::{self, InstallManager};
 use crate::platform::{binary_path, current_exe, home_dir, tmp_file_path};
 use crate::portable::platform;
 use crate::portable::registry::{
@@ -45,11 +47,40 @@ pub struct Command {
     pub to_channel: Option<Channel>,
 }
 
-pub fn run(cmd: &Command) -> anyhow::Result<()> {
-    upgrade(cmd, _get_upgrade_path()?)
+/// What `cli upgrade` should do given who owns this binary.
+#[derive(Debug)]
+enum UpgradeAction {
+    Proceed,
+    Defer(String),
 }
 
-fn upgrade(cmd: &Command, path: PathBuf) -> anyhow::Result<()> {
+/// A package-manager-owned binary is never replaced in place, not even with
+/// `--force`: overwriting it corrupts the manager's own record of the install.
+fn upgrade_action(manager: InstallManager) -> UpgradeAction {
+    match manager.upgrade_hint() {
+        Some(hint) => UpgradeAction::Defer(hint),
+        None => UpgradeAction::Proceed,
+    }
+}
+
+pub fn run(cmd: &Command) -> anyhow::Result<()> {
+    upgrade(cmd, _get_upgrade_path)
+}
+
+/// The single chokepoint every byte-writing upgrade path passes through.
+///
+/// The install-manager guard lives here rather than in each caller: a
+/// managed install must never be overwritten in place, not even with
+/// `--force`. `path_fn` is only invoked once that guard has passed, so a
+/// managed install never pays the cost (or risks the error) of resolving an
+/// upgrade path it will not use.
+fn upgrade(cmd: &Command, path_fn: impl FnOnce() -> anyhow::Result<PathBuf>) -> anyhow::Result<()> {
+    if let UpgradeAction::Defer(hint) = upgrade_action(install_manager::detect()) {
+        msg!("{hint}");
+        return Ok(());
+    }
+    let path = path_fn()?;
+
     let cur_channel = channel();
     let channel = if let Some(channel) = cmd.to_channel {
         channel
@@ -145,14 +176,18 @@ where
 }
 
 pub fn can_upgrade() -> bool {
-    _get_upgrade_path().is_ok()
+    install_manager::detect().is_self_managed() && _get_upgrade_path().is_ok()
 }
 
 fn _get_upgrade_path() -> anyhow::Result<PathBuf> {
     let exe_path = current_exe()?;
     let home = home_dir()?;
     if !exe_path.starts_with(&home) {
-        anyhow::bail!("Only binary installed under {:?} can be upgraded", home);
+        anyhow::bail!(
+            "{exe_path:?} appears to be a system-wide install of {BRANDING_CLI_CMD}, \
+             outside your home directory. Please reinstall it through your system's \
+             package manager, or re-run the {BRANDING_CLI_CMD} install script."
+        );
     }
     Ok(exe_path)
 }
@@ -229,7 +264,7 @@ pub fn upgrade_to_arm64() -> anyhow::Result<()> {
             to_testing: false,
             to_channel: None,
         },
-        binary_path()?,
+        binary_path,
     )
 }
 
@@ -256,5 +291,71 @@ mod tests {
             .unwrap_err();
 
         assert!(returned.downcast_ref::<NoHealthySources>().is_some());
+    }
+
+    #[test]
+    fn managed_installs_defer_to_their_package_manager() {
+        use crate::cli::install_manager::InstallManager;
+
+        for manager in [
+            InstallManager::Homebrew,
+            InstallManager::Scoop,
+            InstallManager::WinGet,
+            InstallManager::Nix,
+            InstallManager::Apt,
+            InstallManager::Dnf,
+            InstallManager::Pacman,
+        ] {
+            match upgrade_action(manager) {
+                UpgradeAction::Defer(message) => {
+                    assert!(!message.is_empty(), "{manager:?} needs an instruction");
+                }
+                UpgradeAction::Proceed => {
+                    panic!("{manager:?} must not self-upgrade");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_installs_proceed() {
+        use crate::cli::install_manager::InstallManager;
+
+        assert!(matches!(
+            upgrade_action(InstallManager::Direct),
+            UpgradeAction::Proceed
+        ));
+    }
+
+    #[test]
+    fn scoop_installs_are_not_self_managed_and_defer() {
+        use std::path::{Path, PathBuf};
+
+        use crate::cli::install_manager::{HostProbe, detect_from_path};
+
+        /// A host with no package database and no configured Scoop root, so
+        /// each path below is classified on its own merits.
+        struct BareHost;
+        impl HostProbe for BareHost {
+            fn dpkg_owns(&self, _exe: &Path) -> bool {
+                false
+            }
+            fn rpm_owns(&self, _exe: &Path) -> bool {
+                false
+            }
+            fn pacman_owns(&self, _exe: &Path) -> bool {
+                false
+            }
+            fn scoop_roots(&self) -> Vec<PathBuf> {
+                Vec::new()
+            }
+        }
+
+        let manager = detect_from_path(
+            Path::new(r"C:\Users\alice\scoop\apps\gel\current\gel.exe"),
+            &BareHost,
+        );
+        assert!(!manager.is_self_managed());
+        assert!(matches!(upgrade_action(manager), UpgradeAction::Defer(_)));
     }
 }

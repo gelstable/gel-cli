@@ -1,0 +1,308 @@
+# Install-manager end-to-end matrix.
+#
+# These scenarios install the CLI for real through real package managers, so
+# they are expensive and destructive to their runner. They are not part of `CI`:
+# on a pull request they run only when it carries the `ci:install` label, and
+# `labeled`/`unlabeled` are trigger types so that adding the label starts a run.
+#
+# Two guards in scripts/ci/run-install-scenario.sh keep the matrix honest — a
+# scenario that skips because its manager went missing, and an `--exact` filter
+# that matches no test, both look like a pass to libtest and both fail here.
+name: Install e2e
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUST_VERSION: "1.88"
+
+jobs:
+  # One build per OS, fanned out to the scenario jobs as an artifact. The
+  # scenario jobs then need neither a Rust toolchain nor a compile, which is
+  # what makes the container jobs (fedora, arch) cheap and what lets Windows
+  # scenarios run without paying for a second Windows build.
+  build:
+    name: build (${{ matrix.name }})
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runner: ubuntu-24.04
+            exe: ""
+          - name: macos
+            runner: macos-15
+            exe: ""
+          - name: windows
+            runner: windows-2025
+            exe: .exe
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          submodules: recursive
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Build gel and the install-manager test binary
+        shell: bash
+        env:
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          # `cargo test --test install-manager` does NOT build the `gel` bin,
+          # and the scenarios install that bin. Same feature set on both so the
+          # second command does not rebuild what the first just built.
+          cargo build --features install_manager_e2e --bin gel
+          cargo test --features install_manager_e2e --test install-manager --no-run \
+            --message-format=json > "$RUNNER_TEMP/cargo-test.json"
+          test_bin="$(jq -r '
+            select(.reason == "compiler-artifact"
+                   and .target.name == "install-manager"
+                   and (.target.kind | index("test")) != null
+                   and .executable != null)
+            | .executable' "$RUNNER_TEMP/cargo-test.json" | tail -n 1)"
+          if [ -z "$test_bin" ] || [ "$test_bin" = "null" ]; then
+            echo "no compiled install-manager test binary in the cargo JSON" >&2
+            exit 1
+          fi
+          if command -v cygpath >/dev/null 2>&1; then
+            test_bin="$(cygpath -u "$test_bin")"
+          fi
+          mkdir -p dist
+          cp "target/debug/gel$EXE" "dist/gel$EXE"
+          cp "$test_bin" "dist/install-manager$EXE"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: install-e2e-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  direct-linux:
+    name: direct (linux)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-linux
+          path: dist
+      - name: Run e2e_direct
+        run: scripts/ci/run-install-scenario.sh e2e_direct
+
+  direct-macos:
+    name: direct (macos)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: macos-15
+    # Outside Linux/XDG the scenario cannot redirect the config dir, so it needs
+    # explicit permission to replace the runner's `cli.toml`.
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-macos
+          path: dist
+      - name: Run e2e_direct
+        run: scripts/ci/run-install-scenario.sh e2e_direct
+
+  direct-windows:
+    name: direct (windows)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: windows-2025
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-windows
+          path: dist
+      - name: Run e2e_direct
+        shell: bash
+        run: bash scripts/ci/run-install-scenario.sh e2e_direct
+
+  apt:
+    name: apt (ubuntu)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-linux
+          path: dist
+      - name: Run e2e_apt
+        run: scripts/ci/run-install-scenario.sh e2e_apt
+
+  dnf:
+    name: dnf (fedora)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: ubuntu-24.04
+    # The Linux artifact is built on ubuntu-24.04 (glibc 2.39) and runs here on
+    # a newer glibc; glibc is forward compatible, and the CLI links TLS through
+    # rustls rather than the system OpenSSL, so there is no other shared library
+    # to match.
+    container: fedora:41
+    steps:
+      - name: Install container dependencies
+        run: dnf -y install git rpm-build tar
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-linux
+          path: dist
+      - name: Run e2e_dnf
+        run: scripts/ci/run-install-scenario.sh e2e_dnf
+
+  pacman:
+    name: pacman (arch)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - name: Install container dependencies
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-linux
+          path: dist
+      - name: Run e2e_pacman
+        run: scripts/ci/run-install-scenario.sh e2e_pacman
+
+  homebrew-linux:
+    name: homebrew (linux)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-linux
+          path: dist
+      - name: Run e2e_homebrew
+        # Linuxbrew is preinstalled on ubuntu-24.04 but is not on PATH, and the
+        # scenario skips (which this workflow treats as a failure) when `brew`
+        # cannot be found.
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          scripts/ci/run-install-scenario.sh e2e_homebrew
+
+  homebrew-macos:
+    name: homebrew (macos)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: macos-15
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-macos
+          path: dist
+      - name: Run e2e_homebrew
+        run: scripts/ci/run-install-scenario.sh e2e_homebrew
+
+  nix:
+    name: nix (linux)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-linux
+          path: dist
+      - name: Run e2e_nix
+        run: scripts/ci/run-install-scenario.sh e2e_nix
+
+  scoop:
+    name: scoop (windows)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: windows-2025
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Scoop
+        shell: pwsh
+        # The runner's user is elevated, which Scoop's installer refuses by
+        # default; `-RunAsAdmin` is the supported opt-in.
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          Invoke-RestMethod -Uri https://get.scoop.sh -OutFile "$env:RUNNER_TEMP\install-scoop.ps1"
+          & "$env:RUNNER_TEMP\install-scoop.ps1" -RunAsAdmin
+          "$env:USERPROFILE\scoop\shims" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-windows
+          path: dist
+      - name: Run e2e_scoop
+        shell: bash
+        run: bash scripts/ci/run-install-scenario.sh e2e_scoop
+
+  winget:
+    name: winget (windows)
+    needs: build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:install')
+    runs-on: windows-2025
+    # WinGet *is* on the windows-2025 image, contrary to what the image README
+    # lists. This job carried `continue-on-error: true` while the scenario had
+    # never succeeded anywhere; it has since passed on a real runner, installing
+    # the fixture as a portable package and detecting it as `winget`, so the
+    # allowance is gone. This is the scenario that took three rounds to land —
+    # hiding a regression in it is the last thing this matrix should do.
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Allow installs from a local manifest
+        shell: pwsh
+        # `winget install --manifest` is refused unless this administrator
+        # policy is on; being elevated is not enough on its own. The scenario
+        # itself deliberately will not turn it on — it is machine-wide state
+        # with no way to read back and restore a prior value, so a test must
+        # never do this to someone's real machine, and `winget.rs` skips with
+        # that explanation instead. It is acceptable *here*, and only here,
+        # because this runner is ephemeral and is destroyed when the job ends.
+        run: winget settings --enable LocalManifestFiles
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-windows
+          path: dist
+      - name: Run e2e_winget
+        shell: bash
+        # No GEL_E2E_ALLOW_SKIP: now that the policy is enabled above, a skip
+        # means either WinGet vanished from the image or that step did not
+        # work, and both are things this job should go red for.
+        run: bash scripts/ci/run-install-scenario.sh e2e_winget

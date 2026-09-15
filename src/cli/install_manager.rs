@@ -167,7 +167,25 @@ impl HostProbe for SystemProbe {
 }
 
 fn normalized(exe: &Path) -> String {
-    exe.to_string_lossy().replace('\\', "/").to_lowercase()
+    let path = exe.to_string_lossy().replace('\\', "/").to_lowercase();
+    // Windows verbatim paths (`\\?\D:\...`, or `\\?\UNC\server\share\...` for a
+    // network path) are what `fs::canonicalize` hands back, and `detect()`
+    // re-runs detection on a canonicalized path. `dunce` strips the prefix at
+    // that call site, but only when the path can be spelled without it — an
+    // over-long or genuinely verbatim path keeps it — and `detect_from_path` is
+    // public besides. Strip it here so no rule below has to know about it: the
+    // `contains` rules happen to survive the prefix, but `is_under_scoop_root`
+    // anchors at the start of the string and would never match one.
+    match path.strip_prefix("//?/") {
+        Some(rest) => match rest.strip_prefix("unc/") {
+            // `\\?\UNC\server\share` is `\\server\share` written out, so the
+            // leading separators have to go back or a root under that share
+            // stops matching.
+            Some(share) => format!("//{share}"),
+            None => rest.to_string(),
+        },
+        None => path,
+    }
 }
 
 fn is_system_bin(exe: &Path) -> bool {
@@ -247,7 +265,12 @@ pub fn detect() -> InstallManager {
             // misclassify it as `Direct`. Only pay for a second classification
             // when the raw path didn't already match a manager and resolving
             // it actually changes anything.
-            let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+            //
+            // `dunce` rather than `std::fs`, as everywhere else in this crate:
+            // the std version returns a verbatim `\\?\` path on Windows, which
+            // would make `resolved != exe` true for every install on that
+            // platform and so buy the second classification every time.
+            let resolved = dunce::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
             match detect_from_path(&exe, &SystemProbe) {
                 InstallManager::Direct if resolved != exe => {
                     detect_from_path(&resolved, &SystemProbe)
@@ -411,6 +434,37 @@ mod tests {
         assert_eq!(
             detect_under_roots("/home/alice/apps/gel/gel", &[""]),
             InstallManager::Direct
+        );
+    }
+
+    /// `fs::canonicalize` returns a verbatim path on Windows, and that is the
+    /// spelling `detect()` re-runs detection on after resolving a `current`
+    /// junction. Every rule but one is a `contains` and survives the prefix;
+    /// the configured-root rule anchors at the start of the string, so the
+    /// prefix is stripped before any rule sees it.
+    #[test]
+    fn verbatim_paths_are_classified_like_their_plain_spelling() {
+        assert_eq!(
+            detect_under_roots(r"\\?\D:\tools\apps\gel\0.0.0\gel.exe", &[r"D:\tools"]),
+            InstallManager::Scoop
+        );
+        assert_eq!(
+            detect(r"\\?\C:\Users\alice\scoop\apps\gel\current\gel.exe"),
+            InstallManager::Scoop
+        );
+    }
+
+    /// A verbatim UNC path spells the share as two ordinary segments after
+    /// `UNC\`, so stripping the prefix has to put the leading separators back
+    /// or a root on that share stops matching.
+    #[test]
+    fn verbatim_unc_paths_keep_their_share_root() {
+        assert_eq!(
+            detect_under_roots(
+                r"\\?\UNC\build\tools\apps\gel\current\gel.exe",
+                &[r"\\build\tools"],
+            ),
+            InstallManager::Scoop
         );
     }
 

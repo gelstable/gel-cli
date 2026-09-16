@@ -16,6 +16,7 @@ from . import (
     linux_packages,
     package_target,
     registry_manifest,
+    release_state,
     source_equivalence,
     verify_draft,
 )
@@ -24,6 +25,9 @@ from . import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gel-release")
     commands = parser.add_subparsers(dest="command", required=True)
+    identity = commands.add_parser("pr-identity")
+    identity.add_argument("--pr-json", required=True, type=Path)
+    identity.add_argument("--repo", required=True)
     matrix = commands.add_parser("matrix")
     matrix.add_argument("kind", choices=("build", "smoke"))
     channel = commands.add_parser("channel")
@@ -99,7 +103,13 @@ def _matrix(kind: str) -> dict[str, list[dict[str, object]]]:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
-        if args.command == "matrix":
+        if args.command == "pr-identity":
+            identity = release_state.validate_pr(
+                json.loads(args.pr_json.read_bytes()),
+                args.repo,
+            )
+            print(json.dumps(identity.as_dict(), separators=(",", ":"), sort_keys=True))
+        elif args.command == "matrix":
             print(json.dumps(_matrix(args.kind), separators=(",", ":")))
         elif args.command == "channel":
             print(registry_manifest.release_channel(args.version))

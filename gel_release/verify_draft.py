@@ -17,6 +17,7 @@ from .models import GithubAsset
 
 DISTRIBUTION_SUFFIXES = (".tar.gz", ".zip", ".deb", ".rpm")
 DIGEST_MANIFEST_NAMES = (assets.SHA256SUMS_NAME, assets.BLAKE2B_SUMS_NAME)
+SHA1_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 class DraftVerificationError(ValueError):
@@ -81,29 +82,65 @@ def get_release(release_id: str, repo: str = assets.REPOSITORY) -> dict:
     return payload
 
 
-def check_release_identity(release: dict, record: dict) -> None:
+def _tag_object(payload: object, context: str) -> tuple[str, str]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("object"), dict):
+        raise DraftVerificationError(f"GitHub {context} response has no tag object")
+    object_data = payload["object"]
+    object_type = object_data.get("type")
+    object_sha = object_data.get("sha")
+    if not isinstance(object_type, str) or not isinstance(object_sha, str):
+        raise DraftVerificationError(f"GitHub {context} response has an invalid tag object")
+    if not SHA1_PATTERN.fullmatch(object_sha):
+        raise DraftVerificationError(f"GitHub {context} response has an invalid object SHA")
+    return object_type, object_sha
+
+
+def resolve_tag_commit(tag: str, repo: str = assets.REPOSITORY) -> str | None:
+    try:
+        payload = _gh_json("api", f"/repos/{repo}/git/ref/tags/{tag}")
+    except subprocess.CalledProcessError:
+        # Candidate drafts are verified before publication, so their tag may
+        # not exist yet. Attestation verification remains the source proof.
+        return None
+
+    object_type, object_sha = _tag_object(payload, f"tag ref {tag}")
+    seen: set[str] = set()
+    for _ in range(8):
+        if object_sha in seen:
+            raise DraftVerificationError(f"tag {tag} contains a dereference cycle")
+        seen.add(object_sha)
+        if object_type == "commit":
+            return object_sha
+        if object_type != "tag":
+            raise DraftVerificationError(
+                f"tag {tag} resolves to unsupported Git object type {object_type!r}"
+            )
+        try:
+            payload = _gh_json("api", f"/repos/{repo}/git/tags/{object_sha}")
+        except subprocess.CalledProcessError as error:
+            raise DraftVerificationError(
+                f"annotated tag object {object_sha} for {tag} could not be resolved"
+            ) from error
+        object_type, object_sha = _tag_object(payload, f"annotated tag {object_sha}")
+    raise DraftVerificationError(f"tag {tag} has too many annotated tag layers")
+
+
+def check_release_identity(
+    release: dict, record: dict, repo: str = assets.REPOSITORY
+) -> str | None:
     expected_tag = record["tag"]
     actual_tag = release.get("tag_name")
     if actual_tag != expected_tag:
         raise DraftVerificationError(
             f"draft release tag {actual_tag!r} does not match candidate tag {expected_tag!r}"
         )
-
-    expected_source = record["source_sha"]
-    target_commitish = release.get("target_commitish")
-    if isinstance(target_commitish, str) and re.fullmatch(r"[0-9a-fA-F]{40}", target_commitish):
-        if target_commitish.lower() != expected_source.lower():
-            raise DraftVerificationError(
-                "draft release target commit does not match candidate source "
-                f"{expected_source}"
-            )
-        return
-
-    body = release.get("body")
-    if not isinstance(body, str) or f"Candidate staged from {expected_source}" not in body:
+    resolved = resolve_tag_commit(expected_tag, repo)
+    if resolved is not None and resolved.lower() != record["source_sha"].lower():
         raise DraftVerificationError(
-            f"draft release does not identify candidate source {expected_source}"
+            f"tag {expected_tag} resolves to {resolved}, expected candidate source "
+            f"{record['source_sha']}"
         )
+    return resolved
 
 
 def download_asset(asset_id: int, destination: Path, repo: str = assets.REPOSITORY) -> None:
@@ -206,7 +243,12 @@ def verify(
 ) -> None:
     version = record["version"]
     release = get_release(str(record["draft_release_id"]), repo)
-    check_release_identity(release, record)
+    tag_commit = check_release_identity(release, record, repo)
+    if tag_commit is None and not verify_attestations_flag:
+        raise DraftVerificationError(
+            f"tag {record['tag']} is not created; source cannot be checked with "
+            "attestation verification disabled"
+        )
     listed = list_release_assets(str(record["draft_release_id"]), repo)
     check_inventory(listed, version)
 

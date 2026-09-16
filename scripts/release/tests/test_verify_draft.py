@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,35 +91,87 @@ class InventoryTests(unittest.TestCase):
 class ReleaseIdentityTests(unittest.TestCase):
     RECORD = {"tag": "v7.11.0", "source_sha": "a" * 40}
 
+    RELEASE = {
+        "tag_name": "v7.11.0",
+        "target_commitish": "master",
+        "body": "Candidate staged from " + RECORD["source_sha"] + ".",
+    }
+
     def test_release_tag_must_match_candidate(self):
         with self.assertRaisesRegex(verify_draft.DraftVerificationError, "tag"):
             verify_draft.check_release_identity(
-                {"tag_name": "v7.12.0", "target_commitish": "a" * 40, "body": ""},
+                {**self.RELEASE, "tag_name": "v7.12.0"},
                 self.RECORD,
             )
 
-    def test_release_source_must_match_candidate(self):
+    @mock.patch(
+        "gel_release.verify_draft._gh_json",
+        return_value={"object": {"type": "commit", "sha": "b" * 40}},
+    )
+    def test_release_source_must_match_candidate(self, gh_json):
         with self.assertRaisesRegex(verify_draft.DraftVerificationError, "source"):
-            verify_draft.check_release_identity(
-                {"tag_name": "v7.11.0", "target_commitish": "b" * 40, "body": ""},
-                self.RECORD,
-            )
+            verify_draft.check_release_identity(self.RELEASE, self.RECORD)
 
-    def test_release_body_source_proof_is_accepted_for_draft(self):
-        verify_draft.check_release_identity(
-            {
-                "tag_name": "v7.11.0",
-                "target_commitish": "master",
-                "body": "Candidate staged from " + self.RECORD["source_sha"] + ".",
-            },
-            self.RECORD,
+    @mock.patch(
+        "gel_release.verify_draft._gh_json",
+        return_value={"object": {"type": "commit", "sha": "a" * 40}},
+    )
+    def test_lightweight_tag_source_matches_candidate(self, gh_json):
+        resolved = verify_draft.check_release_identity(self.RELEASE, self.RECORD)
+        self.assertEqual(resolved, "a" * 40)
+        gh_json.assert_called_once_with(
+            "api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0"
         )
 
-    def test_release_target_commit_source_proof_is_accepted(self):
-        verify_draft.check_release_identity(
-            {"tag_name": "v7.11.0", "target_commitish": "a" * 40, "body": ""},
-            self.RECORD,
+    @mock.patch(
+        "gel_release.verify_draft._gh_json",
+        side_effect=[
+            {"object": {"type": "tag", "sha": "c" * 40}},
+            {"object": {"type": "commit", "sha": "a" * 40}},
+        ],
+    )
+    def test_annotated_tag_is_dereferenced_to_matching_commit(self, gh_json):
+        resolved = verify_draft.check_release_identity(self.RELEASE, self.RECORD)
+        self.assertEqual(resolved, "a" * 40)
+        self.assertEqual(
+            [call.args for call in gh_json.call_args_list],
+            [
+                ("api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0"),
+                ("api", "/repos/gelstable/gel-cli/git/tags/" + "c" * 40),
+            ],
         )
+
+    @mock.patch(
+        "gel_release.verify_draft._gh_json",
+        side_effect=[
+            {"object": {"type": "tag", "sha": "c" * 40}},
+            {"object": {"type": "commit", "sha": "b" * 40}},
+        ],
+    )
+    def test_annotated_tag_source_mismatch_is_rejected(self, gh_json):
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "source"):
+            verify_draft.check_release_identity(self.RELEASE, self.RECORD)
+
+    @mock.patch(
+        "gel_release.verify_draft._gh_json",
+        side_effect=subprocess.CalledProcessError(1, ["gh", "api"]),
+    )
+    def test_uncreated_draft_tag_is_not_proven_by_release_body(self, gh_json):
+        resolved = verify_draft.check_release_identity(self.RELEASE, self.RECORD)
+        self.assertIsNone(resolved)
+        gh_json.assert_called_once_with(
+            "api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0"
+        )
+
+    @mock.patch("gel_release.verify_draft.resolve_tag_commit", return_value=None)
+    @mock.patch("gel_release.verify_draft.get_release", return_value=RELEASE)
+    def test_skip_attestations_rejects_uncreated_draft_tag(self, get_release, resolve_tag):
+        record = {**self.RECORD, "version": "7.11.0", "draft_release_id": 1}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(verify_draft.DraftVerificationError, "not created"):
+                verify_draft.verify(
+                    record, Path(tmp), verify_attestations_flag=False
+                )
 
 
 class ManifestDigestTests(unittest.TestCase):

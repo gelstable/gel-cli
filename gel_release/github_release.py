@@ -10,6 +10,7 @@ Git plumbing, leaving the prepared stable branch unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -32,6 +33,7 @@ _PREVIEW_VERSION = re.compile(
     r"^(?P<base>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
     r"-(?P<phase>alpha|beta|rc)\.(?P<number>[1-9][0-9]*)$"
 )
+_STABLE_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
 _PHASE_LABELS = {"alpha": "prerelease:alpha", "beta": "prerelease:beta", "rc": "prerelease:rc"}
 _AUTHORIZED_PERMISSIONS = frozenset({"write", "maintain", "admin"})
 
@@ -189,12 +191,19 @@ def assert_live_identity(
         raise ValueError("live release PR has no base repository")
     live = release_state.validate_pr(dict(live_pr), repository)
 
+    # A preview identity carries the selected prerelease version while the
+    # generated PR keeps its planned plain stable version.  Compare the
+    # prepared PR metadata to that plain base; stable candidates compare the
+    # version unchanged.
+    prepared_version = expected.version
+    if expected.phase is not None:
+        prepared_version = expected.version.split("-", 1)[0]
     checks: tuple[tuple[str, object, object], ...] = (
         ("PR number", live.number, expected.pr_number),
         ("release line", live.base_ref, expected.line),
         ("base SHA", live.base_sha, expected.base_sha),
         ("source SHA", live.head_sha, expected.source_sha),
-        ("prepared version", _prepared_version(live_pr), expected.version),
+        ("prepared version", _prepared_version(live_pr), prepared_version),
         ("source snapshot", _source_snapshot(live_pr), expected.source_snapshot),
         ("phase", release_state.phase_from_labels(_labels(live_pr)), expected.phase),
     )
@@ -695,6 +704,816 @@ def phase_authorized(timeline: list[dict], phase: str, permissions: Mapping[str,
 # Keep the verb used by workflow callers discoverable without making a second
 # implementation that could drift from ``phase_authorized``.
 authorize_phase = phase_authorized
+
+
+def _gh_json(*args: str) -> object:
+    """Run ``gh`` and decode its JSON output.
+
+    Publication is deliberately kept at the GitHub API edge.  Keeping this
+    small wrapper in the module also gives the publication tests a single
+    mutation boundary to replace, while the workflow uses the exact same
+    code path against GitHub.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["gh", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = (
+            error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+        )
+        raise ValueError(f"gh {' '.join(args)} failed: {detail}") from error
+    output = completed.stdout.strip()
+    if not output:
+        return None
+    decoder = json.JSONDecoder()
+    values: list[object] = []
+    position = 0
+    try:
+        while position < len(output):
+            while position < len(output) and output[position].isspace():
+                position += 1
+            if position >= len(output):
+                break
+            value, position = decoder.raw_decode(output, position)
+            values.append(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"gh {' '.join(args)} returned invalid JSON: {error}") from error
+    return values[0] if len(values) == 1 else values
+
+
+def _gh_mutate(
+    method: str,
+    path: str,
+    fields: Mapping[str, object] | None = None,
+) -> object:
+    """Apply one explicit GitHub API mutation.
+
+    The publication functions call this only for creating an immutable tag or
+    changing an existing draft's publication state.  In particular, there is
+    no upload, delete, replacement, or force-update operation here.
+    """
+
+    if not isinstance(method, str) or not method:
+        raise ValueError(f"invalid GitHub API method {method!r}")
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError(f"invalid GitHub API path {path!r}")
+    argv = ["api", "-X", method, path]
+    for name, value in (fields or {}).items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"invalid GitHub API field name {name!r}")
+        if isinstance(value, bool):
+            argv.extend(["-F", f"{name}={'true' if value else 'false'}"])
+        elif isinstance(value, int):
+            argv.extend(["-F", f"{name}={value}"])
+        elif isinstance(value, str):
+            argv.extend(["-f", f"{name}={value}"])
+        else:
+            raise ValueError(f"GitHub API field {name!r} has unsupported value {value!r}")
+    return _gh_json(*argv)
+
+
+def _record_identity(
+    record: CandidateRecord | Mapping[str, object],
+) -> tuple[CandidateRecord, dict[str, object]]:
+    """Return a validated record and its wire-compatible candidate identity."""
+
+    try:
+        validated = candidate.validate_record(record)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"candidate record is invalid: {error}") from error
+    identity = {
+        "line": validated.line,
+        "pr_number": validated.pr_number,
+        "base_sha": validated.base_sha,
+        "source_sha": validated.source_sha,
+        "build_sha": validated.build_sha,
+        "source_snapshot": validated.source_snapshot,
+        "phase": validated.phase,
+        "version": validated.version,
+        "channel": "testing" if validated.phase is not None else "stable",
+    }
+    return validated, identity
+
+
+def _assert_record_identity(
+    record: CandidateRecord | Mapping[str, object],
+    expected: CandidateIdentity,
+) -> CandidateRecord:
+    validated, actual = _record_identity(record)
+    if actual != expected.as_dict():
+        differences = [
+            f"{name}={actual[name]!r} (expected {wanted!r})"
+            for name, wanted in expected.as_dict().items()
+            if actual.get(name) != wanted
+        ]
+        raise ValueError(
+            "candidate record identity does not match selected identity: " + ", ".join(differences)
+        )
+    return validated
+
+
+def _release_asset_bytes(release: Mapping[str, object], name: str) -> bytes | None:
+    """Read fixture/API-wrapper bytes when a release payload carries them."""
+
+    containers = ("asset_bytes", "assets_bytes", "bytes")
+    for container_name in containers:
+        container = release.get(container_name)
+        if isinstance(container, Mapping) and name in container:
+            value = container[name]
+            if isinstance(value, bytes):
+                return value
+            if isinstance(value, bytearray):
+                return bytes(value)
+            if isinstance(value, str):
+                return value.encode()
+            if isinstance(value, Path):
+                try:
+                    return value.read_bytes()
+                except OSError as error:
+                    raise ValueError(f"could not read release asset {name}: {error}") from error
+            raise ValueError(f"release asset {name} has unsupported inline bytes")
+    listed = release.get("assets")
+    if isinstance(listed, Mapping) and name in listed:
+        value = listed[name]
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, bytearray):
+            return bytes(value)
+        if isinstance(value, str):
+            return value.encode()
+        if isinstance(value, Path):
+            try:
+                return value.read_bytes()
+            except OSError as error:
+                raise ValueError(f"could not read release asset {name}: {error}") from error
+        raise ValueError(f"release asset {name} has unsupported inline bytes")
+    if isinstance(listed, list):
+        for item in listed:
+            if not isinstance(item, Mapping) or item.get("name") != name:
+                continue
+            for key in ("bytes", "content", "data"):
+                value = item.get(key)
+                if isinstance(value, bytes):
+                    return value
+                if isinstance(value, bytearray):
+                    return bytes(value)
+                if isinstance(value, str):
+                    return value.encode()
+            path = item.get("path")
+            if isinstance(path, (str, Path)):
+                try:
+                    return Path(path).read_bytes()
+                except OSError as error:
+                    raise ValueError(f"could not read release asset {name}: {error}") from error
+    return None
+
+
+def _assert_release_shape(
+    release: Mapping[str, object],
+    expected: CandidateIdentity,
+    record: CandidateRecord,
+    *,
+    allow_published: bool,
+) -> bool:
+    """Validate release identity, state, and any API-listed asset metadata."""
+
+    if not isinstance(release, Mapping):
+        raise ValueError("GitHub release is not an object")
+    release_id = release.get("id")
+    if isinstance(release_id, bool) or not isinstance(release_id, int):
+        raise ValueError("GitHub release has no valid release id")
+    if release_id != record.draft_release_id:
+        raise ValueError(
+            f"release id {release_id} does not match candidate draft {record.draft_release_id}"
+        )
+    if release.get("tag_name") != expected.tag or release.get("name") != expected.tag:
+        raise ValueError(f"release tag/name does not match candidate {expected.tag}")
+    draft = release.get("draft")
+    if not isinstance(draft, bool):
+        raise ValueError(f"release {expected.tag} has no valid draft state")
+    if not draft and not allow_published:
+        raise ValueError(f"release {expected.tag} is already published")
+    expected_prerelease = expected.phase is not None
+    if release.get("prerelease") is not expected_prerelease:
+        raise ValueError(
+            f"release {expected.tag} prerelease state {release.get('prerelease')!r} "
+            f"does not match candidate phase {expected.phase!r}"
+        )
+    payload = _body_identity(release)
+    if payload is None:
+        # Some GitHub API adapters expose the persisted record under
+        # ``candidate``/``record`` instead of serializing the identity into
+        # the release body.  Normalize those forms at this boundary while
+        # keeping the exact CandidateIdentity comparison below.
+        for key in ("identity", "candidate", "record", "metadata"):
+            value = release.get(key)
+            if not isinstance(value, Mapping):
+                continue
+            nested = value.get("candidate_identity")
+            payload = nested if isinstance(nested, Mapping) else value
+            if "schema_version" in payload:
+                try:
+                    _, payload = _record_identity(payload)
+                except ValueError as error:
+                    raise ValueError(
+                        f"release {expected.tag} candidate record is invalid"
+                    ) from error
+            break
+    if payload is None:
+        raise ValueError(f"release {expected.tag} has no candidate identity")
+    if "schema_version" in payload:
+        try:
+            _, payload = _record_identity(payload)
+        except ValueError as error:
+            raise ValueError(f"release {expected.tag} candidate record is invalid") from error
+    try:
+        release_identity = CandidateIdentity.from_dict(payload)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"release {expected.tag} has an invalid candidate identity") from error
+    if release_identity.as_dict() != expected.as_dict():
+        raise ValueError(
+            f"release {expected.tag} candidate identity does not match selected identity"
+        )
+
+    listed = release.get("assets")
+    if listed is not None:
+        if not isinstance(listed, list):
+            raise ValueError(f"release {expected.tag} assets are not a list")
+        normalized: list[dict] = []
+        seen_names: set[str] = set()
+        seen_ids: set[int] = set()
+        for index, item in enumerate(listed):
+            if not isinstance(item, Mapping):
+                raise ValueError(f"release {expected.tag} asset {index} is not an object")
+            name = item.get("name")
+            asset_id = item.get("id")
+            size = item.get("size")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"release {expected.tag} asset {index} has an invalid name")
+            if isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0:
+                raise ValueError(f"release {expected.tag} asset {name} has an invalid id")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise ValueError(f"release {expected.tag} asset {name} has an invalid size")
+            if name in seen_names or asset_id in seen_ids:
+                raise ValueError(f"release {expected.tag} has duplicate asset metadata")
+            seen_names.add(name)
+            seen_ids.add(asset_id)
+            normalized.append({"id": asset_id, "name": name, "size": size})
+        try:
+            verify_draft.check_inventory(normalized, expected.version, phase=expected.phase)
+        except verify_draft.DraftVerificationError as error:
+            raise ValueError(f"release {expected.tag} inventory mismatch: {error}") from error
+        by_name = {item["name"]: item for item in normalized}
+        for entry in record.assets:
+            remote = by_name.get(entry.name)
+            if remote is None:
+                raise ValueError(f"release {expected.tag} is missing recorded asset {entry.name}")
+            if remote["id"] != entry.id or remote["size"] != entry.size:
+                raise ValueError(f"release {expected.tag} asset {entry.name} metadata changed")
+    return draft
+
+
+def _assert_inline_record_bytes(
+    release: Mapping[str, object],
+    record: CandidateRecord,
+    *,
+    required: bool = False,
+) -> bool:
+    """Check a record asset carried inline by tests or an API adapter."""
+
+    name = candidate.record_asset_name(record)
+    actual = _release_asset_bytes(release, name)
+    if actual is None:
+        if required:
+            raise ValueError(f"release {record.tag} has no {name} bytes to verify")
+        return False
+    try:
+        candidate.verify_record_bytes(record, actual)
+    except candidate.CandidateMismatch as error:
+        raise ValueError(f"release {record.tag} candidate bytes changed: {error}") from error
+    return True
+
+
+def _assert_inline_distribution_bytes(
+    release: Mapping[str, object],
+    record: CandidateRecord,
+) -> None:
+    """Check distribution bytes when a fixture or API adapter includes them."""
+
+    for entry in record.assets:
+        actual = _release_asset_bytes(release, entry.name)
+        if actual is None:
+            continue
+        if len(actual) != entry.size:
+            raise ValueError(f"release {record.tag} asset {entry.name} size changed")
+        if hashlib.sha256(actual).hexdigest() != entry.sha256:
+            raise ValueError(f"release {record.tag} asset {entry.name} SHA-256 changed")
+        if hashlib.blake2b(actual, digest_size=64).hexdigest() != entry.blake2b512:
+            raise ValueError(f"release {record.tag} asset {entry.name} BLAKE2b changed")
+
+
+def _verify_draft_before_publication(
+    record: CandidateRecord,
+    expected: CandidateIdentity,
+) -> None:
+    """Read every draft asset through the authenticated API before publishing."""
+
+    with tempfile.TemporaryDirectory(prefix="release-publication-verify-") as directory:
+        try:
+            verify_draft.verify(
+                record,
+                Path(directory),
+                assets.REPOSITORY,
+                True,
+                expected_identity=expected.as_dict(),
+            )
+        except verify_draft.DraftVerificationError as error:
+            raise ValueError(f"draft verification failed: {error}") from error
+
+
+def _verify_published_asset_bytes(
+    record: CandidateRecord,
+    release: Mapping[str, object],
+) -> None:
+    """Verify bytes available from an already published release retry."""
+
+    # A published release can be checked via inline fixture bytes, or by its
+    # authenticated asset API when a full API payload is supplied.  Metadata
+    # is still checked by ``_assert_release_shape`` for minimal callers.
+    inline_names: set[str] = set()
+    for entry in record.assets:
+        actual = _release_asset_bytes(release, entry.name)
+        if actual is None:
+            continue
+        inline_names.add(entry.name)
+        if len(actual) != entry.size:
+            raise ValueError(f"published asset {entry.name} size changed")
+        if hashlib.sha256(actual).hexdigest() != entry.sha256:
+            raise ValueError(f"published asset {entry.name} SHA-256 changed")
+        if hashlib.blake2b(actual, digest_size=64).hexdigest() != entry.blake2b512:
+            raise ValueError(f"published asset {entry.name} BLAKE2b changed")
+    if _assert_inline_record_bytes(release, record, required=False):
+        inline_names.add(candidate.record_asset_name(record))
+
+    # A real GitHub release payload lists asset ids but does not include bytes.
+    # Download those bytes through the authenticated API before treating an
+    # already published retry as successful.  Minimal test/API fixtures can
+    # omit ``assets`` and supply only inline bytes or digest metadata.
+    listed = release.get("assets")
+    if not isinstance(listed, list) or not listed:
+        return
+    by_name: dict[str, Mapping[str, object]] = {
+        item["name"]: item
+        for item in listed
+        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    }
+    names = [entry.name for entry in record.assets]
+    if record.phase is not None:
+        names.append(candidate.PREVIEW_RECORD_NAME)
+    with tempfile.TemporaryDirectory(prefix="release-published-verify-") as directory:
+        for name in names:
+            if name in inline_names:
+                continue
+            item = by_name.get(name)
+            asset_id = item.get("id") if item is not None else None
+            if isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0:
+                raise ValueError(f"published release is missing asset id for {name}")
+            path = Path(directory) / name.replace("/", "_")
+            try:
+                verify_draft.download_asset(asset_id, path, assets.REPOSITORY)
+            except (OSError, subprocess.CalledProcessError) as error:
+                raise ValueError(f"could not download published asset {name}: {error}") from error
+            actual = path.read_bytes()
+            if name == candidate.PREVIEW_RECORD_NAME:
+                try:
+                    candidate.verify_record_bytes(record, actual)
+                except candidate.CandidateMismatch as error:
+                    raise ValueError(f"published candidate bytes changed: {error}") from error
+                continue
+            expected = next(entry for entry in record.assets if entry.name == name)
+            if len(actual) != expected.size:
+                raise ValueError(f"published asset {name} size changed")
+            if hashlib.sha256(actual).hexdigest() != expected.sha256:
+                raise ValueError(f"published asset {name} SHA-256 changed")
+            if hashlib.blake2b(actual, digest_size=64).hexdigest() != expected.blake2b512:
+                raise ValueError(f"published asset {name} BLAKE2b changed")
+
+
+def _tag_target(
+    tag: str,
+    release: Mapping[str, object],
+) -> str | None:
+    """Return an existing tag commit, with fixture fields taking precedence."""
+
+    for key in ("tag_target", "tag_sha", "target_sha"):
+        if key in release:
+            value = release[key]
+            if value is None:
+                return None
+            if not isinstance(value, str) or _GIT_SHA.fullmatch(value) is None:
+                raise ValueError(f"release tag {tag} has an invalid target {value!r}")
+            return value
+    target_commitish = release.get("target_commitish")
+    if isinstance(target_commitish, str) and _GIT_SHA.fullmatch(target_commitish) is not None:
+        return target_commitish
+    tag_data = release.get("tag")
+    if isinstance(tag_data, Mapping):
+        tag_object = tag_data.get("object")
+        object_sha = tag_object.get("sha") if isinstance(tag_object, Mapping) else None
+        if isinstance(object_sha, str) and _GIT_SHA.fullmatch(object_sha) is not None:
+            return object_sha
+    try:
+        return verify_draft.resolve_tag_commit(tag, assets.REPOSITORY)
+    except verify_draft.DraftVerificationError as error:
+        raise ValueError(f"could not verify tag {tag}: {error}") from error
+
+
+def _ensure_tag(tag: str, target: str, release: Mapping[str, object]) -> None:
+    existing = _tag_target(tag, release)
+    if existing is not None:
+        if existing.lower() != target.lower():
+            raise ValueError(f"tag {tag} points at {existing}, expected immutable target {target}")
+        return
+    _gh_mutate(
+        "POST",
+        f"/repos/{assets.REPOSITORY}/git/refs",
+        {"ref": f"refs/tags/{tag}", "sha": target},
+    )
+
+
+def _publish_release(
+    record: CandidateRecord,
+    *,
+    prerelease: bool,
+    make_latest: bool,
+) -> None:
+    _gh_mutate(
+        "PATCH",
+        f"/repos/{assets.REPOSITORY}/releases/{record.draft_release_id}",
+        {
+            "tag_name": record.tag,
+            "draft": False,
+            "prerelease": prerelease,
+            "make_latest": make_latest,
+        },
+    )
+
+
+def _preview_authorized(live_pr: Mapping[str, object], phase: str) -> None:
+    """Require fresh phase authority supplied by the workflow/API adapter."""
+
+    for key in ("phase_authorized", "authorized"):
+        if key in live_pr:
+            if live_pr[key] is not True:
+                raise ValueError(f"preview phase {phase} is not authorized by a maintainer")
+            return
+    timeline = live_pr.get("timeline", live_pr.get("phase_timeline"))
+    permissions = live_pr.get("permissions", live_pr.get("phase_permissions"))
+    if isinstance(timeline, list) and isinstance(permissions, Mapping):
+        if not phase_authorized(timeline, phase, permissions):
+            raise ValueError(f"preview phase {phase} is not authorized by a maintainer")
+        return
+    raise ValueError(f"preview phase {phase} has no fresh authorization proof")
+
+
+def publish_preview(
+    identity: CandidateIdentity | Mapping[str, object],
+    record: CandidateRecord | Mapping[str, object],
+    live_pr: Mapping[str, object],
+    release: Mapping[str, object],
+) -> None:
+    """Publish an already verified preview draft after fresh identity checks.
+
+    The build workflow owns all distribution bytes.  This function only
+    checks those bytes and the live PR/release state, creates the immutable
+    version tag at ``build_sha`` when needed, and flips the existing draft to
+    a prerelease.  A matching published release is an idempotent success.
+    """
+
+    expected = _coerce_identity(identity)
+    if expected.phase is None:
+        raise ValueError("preview publication requires an active phase")
+    if expected.build_sha == expected.source_sha:
+        raise ValueError("preview publication requires a derived build SHA")
+    validated = _assert_record_identity(record, expected)
+    if not isinstance(live_pr, Mapping):
+        raise ValueError("live release PR is not an object")
+    if not isinstance(release, Mapping):
+        raise ValueError("GitHub release is not an object")
+    try:
+        assert_live_identity(expected, dict(live_pr))
+    except ValueError as error:
+        raise ValueError(f"preview live identity rejected: {error}") from error
+    _preview_authorized(live_pr, expected.phase)
+    draft = _assert_release_shape(release, expected, validated, allow_published=True)
+    _assert_inline_record_bytes(release, validated, required=False)
+    _assert_inline_distribution_bytes(release, validated)
+
+    target = _tag_target(expected.tag, release)
+    if target is not None and target.lower() != expected.build_sha.lower():
+        raise ValueError(
+            f"preview tag {expected.tag} points at {target}, expected build SHA "
+            f"{expected.build_sha}"
+        )
+    if not draft:
+        _verify_published_asset_bytes(validated, release)
+        print(
+            f"release publication line={expected.line} pr={expected.pr_number} "
+            f"phase={expected.phase} "
+            f"source_sha={expected.source_sha} version={expected.version} "
+            f"draft_release_id={validated.draft_release_id} already published"
+        )
+        return
+
+    # Draft API readback is the final byte/draft gate before either mutation.
+    _verify_draft_before_publication(validated, expected)
+    _ensure_tag(expected.tag, expected.build_sha, release)
+    _publish_release(validated, prerelease=True, make_latest=False)
+    print(
+        f"release publication line={expected.line} pr={expected.pr_number} phase={expected.phase} "
+        f"source_sha={expected.source_sha} version={expected.version} "
+        f"draft_release_id={validated.draft_release_id} published"
+    )
+
+
+def _merged_pr_from_release(
+    record: CandidateRecord,
+    release: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    for key in ("merged_pr", "pull_request", "merge_pr", "pr"):
+        if key not in release:
+            continue
+        value = release[key]
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise ValueError(f"release {record.tag} has an invalid merged PR payload")
+        return value
+    try:
+        payload = _gh_json(
+            "api",
+            f"/repos/{assets.REPOSITORY}/pulls/{record.pr_number}",
+        )
+    except ValueError as error:
+        raise ValueError(f"could not fetch merged PR #{record.pr_number}: {error}") from error
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"merged PR #{record.pr_number} response is not an object")
+    return payload
+
+
+def _matching_merge_pr(
+    record: CandidateRecord,
+    line_push_sha: str,
+    merged_pr: Mapping[str, object] | None,
+) -> bool:
+    """Check whether this line push is the candidate PR merge.
+
+    A normal backport push returns ``False`` and is a successful no-op.  Once
+    the PR number and merge commit identify this candidate, malformed branch,
+    repository, or head identity is a hard rejection.
+    """
+
+    if merged_pr is None:
+        return False
+    number = merged_pr.get("number")
+    merge_commit = merged_pr.get("merge_commit_sha", merged_pr.get("merge_sha"))
+    if isinstance(number, bool) or number != record.pr_number or merge_commit != line_push_sha:
+        return False
+    base = merged_pr.get("base")
+    head = merged_pr.get("head")
+    if not isinstance(base, Mapping) or not isinstance(head, Mapping):
+        raise ValueError(f"merged PR #{record.pr_number} has incomplete branch identity")
+    if base.get("ref") != record.line:
+        raise ValueError(f"merged PR #{record.pr_number} base does not match {record.line}")
+    base_sha = base.get("sha")
+    if base_sha is not None:
+        if not isinstance(base_sha, str) or _GIT_SHA.fullmatch(base_sha) is None:
+            raise ValueError(f"merged PR #{record.pr_number} has an invalid base SHA")
+        if base_sha != record.base_sha:
+            raise ValueError(
+                f"merged PR #{record.pr_number} base SHA {base_sha} does not match "
+                f"candidate {record.base_sha}"
+            )
+    expected_head = release_state.expected_head(release_state.parse_line(record.line))
+    if head.get("ref") != expected_head:
+        raise ValueError(f"merged PR #{record.pr_number} head does not match {expected_head}")
+    for side, value in (("base", base), ("head", head)):
+        repo = value.get("repo")
+        full_name = repo.get("full_name") if isinstance(repo, Mapping) else None
+        if full_name != assets.REPOSITORY:
+            raise ValueError(f"merged PR #{record.pr_number} has a forked {side} repository")
+    head_sha = head.get("sha")
+    if not isinstance(head_sha, str) or _GIT_SHA.fullmatch(head_sha) is None:
+        raise ValueError(f"merged PR #{record.pr_number} has an invalid head SHA")
+    if head_sha != record.source_sha:
+        # The stable stage commits packaging/release-candidate.json as one
+        # record-only successor of the tested source.  GitHub reports that
+        # successor as the merged PR head, while the record intentionally
+        # retains the original source SHA.  Verify that exact successor when
+        # the local checkout contains it.
+        try:
+            source_equivalence.assert_record_successor(
+                record.source_sha,
+                head_sha,
+                candidate.dump(record),
+                Path("."),
+            )
+        except source_equivalence.SourceDrift as error:
+            raise ValueError(
+                f"merged PR #{record.pr_number} head {head_sha} does not match candidate "
+                f"source {record.source_sha}: {error}"
+            ) from error
+    merged = merged_pr.get("merged")
+    if merged is False or merged_pr.get("state") not in (None, "closed", "merged"):
+        return False
+    if merged is not True and not merged_pr.get("merge_commit_sha"):
+        return False
+    return True
+
+
+def _assert_record_introduced(
+    record: CandidateRecord,
+    line_push_sha: str,
+    release: Mapping[str, object],
+) -> None:
+    """Require the exact record to be newly introduced by the line push."""
+
+    if "record_introduced" in release:
+        if release["record_introduced"] is not True:
+            raise ValueError(f"candidate record was not introduced by push {line_push_sha}")
+        return
+    expected_record = candidate.dump(record)
+    try:
+        source_equivalence.assert_record_present(line_push_sha, expected_record, Path("."))
+        parents = _run_git(Path("."), "rev-list", "--parents", "-n", "1", line_push_sha).split()
+        if len(parents) < 2:
+            raise ValueError(f"line push {line_push_sha} has no parent")
+        changed = _run_git(
+            Path("."),
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            line_push_sha,
+            parents[1],
+        ).splitlines()
+    except (ValueError, source_equivalence.SourceDrift) as error:
+        raise ValueError(
+            f"candidate record was not newly introduced by push {line_push_sha}: {error}"
+        ) from error
+    if source_equivalence.RECORD_PATH not in changed:
+        raise ValueError(
+            f"candidate record was not introduced by push {line_push_sha}; changed={changed}"
+        )
+
+
+def _assert_merge_source(
+    record: CandidateRecord,
+    line_push_sha: str,
+    release: Mapping[str, object],
+) -> None:
+    if "source_equivalent" in release:
+        if release["source_equivalent"] is not True:
+            raise ValueError(f"line push {line_push_sha} changed source bytes")
+        return
+    try:
+        source_equivalence.assert_merge_equivalent(record.source_sha, line_push_sha, Path("."))
+    except source_equivalence.SourceDrift as error:
+        raise ValueError(f"line push {line_push_sha} changed source bytes: {error}") from error
+
+
+def _published_stable_versions(release: Mapping[str, object]) -> list[str]:
+    for key in ("published_stable_versions", "stable_versions"):
+        if key in release:
+            value = release[key]
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(
+                    f"release {release.get('tag_name')} stable version inventory is invalid"
+                )
+            return list(value)
+    for key in ("all_releases", "releases"):
+        value = release.get(key)
+        if value is not None:
+            return _stable_versions_from_payload(value)
+    try:
+        value = _gh_json("api", "--paginate", f"/repos/{assets.REPOSITORY}/releases")
+    except ValueError as error:
+        raise ValueError(
+            f"could not list published releases for latest selection: {error}"
+        ) from error
+    return _stable_versions_from_payload(value)
+
+
+def _stable_versions_from_payload(value: object) -> list[str]:
+    if isinstance(value, Mapping):
+        value = value.get("releases", value.get("items"))
+    if not isinstance(value, list):
+        raise ValueError("published release inventory must be a list")
+    entries: list[object] = []
+    for page in value:
+        if isinstance(page, list):
+            entries.extend(page)
+        else:
+            entries.append(page)
+    versions: list[str] = []
+    for item in entries:
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("draft") is True or item.get("prerelease") is True:
+            continue
+        tag = item.get("tag_name", item.get("version"))
+        if isinstance(tag, str):
+            versions.append(tag[1:] if tag.startswith("v") else tag)
+    return versions
+
+
+def _semver_tuple(value: str) -> tuple[int, int, int] | None:
+    normalized = value[1:] if isinstance(value, str) and value.startswith("v") else value
+    match = _STABLE_VERSION.fullmatch(normalized) if isinstance(normalized, str) else None
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in normalized.split("."))
+    return major, minor, patch
+
+
+def should_make_latest(version: str, published_stable_versions: list[str]) -> bool:
+    """Return whether ``version`` is the numeric maximum stable SemVer."""
+
+    selected = _semver_tuple(version)
+    if selected is None:
+        raise ValueError(f"latest selection requires a plain stable SemVer, got {version!r}")
+    if not isinstance(published_stable_versions, list):
+        raise ValueError("published stable versions must be a list")
+    maximum = selected
+    for value in published_stable_versions:
+        if not isinstance(value, str):
+            raise ValueError("published stable versions must contain strings")
+        parsed = _semver_tuple(value)
+        if parsed is not None and parsed > maximum:
+            maximum = parsed
+    return selected == maximum
+
+
+def publish_stable(
+    record: CandidateRecord | Mapping[str, object],
+    line_push_sha: str,
+    release: Mapping[str, object],
+) -> None:
+    """Publish the reviewed stable draft for the merge that introduced it."""
+
+    validated, identity = _record_identity(record)
+    if validated.phase is not None:
+        raise ValueError(f"stable publication cannot use preview phase {validated.phase!r}")
+    expected = CandidateIdentity.from_dict(identity)
+    if not isinstance(line_push_sha, str) or _GIT_SHA.fullmatch(line_push_sha) is None:
+        raise ValueError(f"invalid release-line push SHA {line_push_sha!r}")
+    if not isinstance(release, Mapping):
+        raise ValueError("GitHub release is not an object")
+
+    merged_pr = _merged_pr_from_release(validated, release)
+    if not _matching_merge_pr(validated, line_push_sha, merged_pr):
+        print(
+            f"release publication line={validated.line} pr={validated.pr_number} phase=stable "
+            f"source_sha={validated.source_sha} version={validated.version} "
+            f"draft_release_id={validated.draft_release_id} "
+            "rejection=no merge-matching candidate record"
+        )
+        return
+    _assert_record_introduced(validated, line_push_sha, release)
+    _assert_merge_source(validated, line_push_sha, release)
+    draft = _assert_release_shape(release, expected, validated, allow_published=True)
+    _assert_inline_distribution_bytes(release, validated)
+    target = _tag_target(validated.tag, release)
+    if target is not None and target.lower() != line_push_sha.lower():
+        raise ValueError(
+            f"stable tag {validated.tag} points at {target}, expected merge {line_push_sha}"
+        )
+
+    if not draft:
+        _verify_published_asset_bytes(validated, release)
+        print(
+            f"release publication line={validated.line} pr={validated.pr_number} phase=stable "
+            f"source_sha={validated.source_sha} version={validated.version} "
+            f"draft_release_id={validated.draft_release_id} already published"
+        )
+        return
+
+    _verify_draft_before_publication(validated, expected)
+    _ensure_tag(validated.tag, line_push_sha, release)
+    make_latest = should_make_latest(validated.version, _published_stable_versions(release))
+    _publish_release(validated, prerelease=False, make_latest=make_latest)
+    print(
+        f"release publication line={validated.line} pr={validated.pr_number} phase=stable "
+        f"source_sha={validated.source_sha} version={validated.version} "
+        f"draft_release_id={validated.draft_release_id} published make_latest={make_latest}"
+    )
 
 
 def _run_git(

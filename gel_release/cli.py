@@ -499,6 +499,22 @@ def _parser() -> argparse.ArgumentParser:
     )
     preview_version.add_argument("--tags-json", required=True, type=Path)
     preview_version.add_argument("--published-json", required=True, type=Path)
+    publish_preview = commands.add_parser("publish-preview", aliases=("publish_preview",))
+    publish_preview.add_argument(
+        "--identity-json", "--identity", dest="identity_json", required=True, type=Path
+    )
+    publish_preview.add_argument("--record", required=True, type=Path)
+    publish_preview.add_argument("--live-pr-json", required=True, type=Path)
+    publish_preview.add_argument("--release-json", required=True, type=Path)
+    publish_stable = commands.add_parser("publish-stable", aliases=("publish_stable",))
+    publish_stable.add_argument("--record", required=True, type=Path)
+    publish_stable.add_argument(
+        "--line-push-sha", "--push-sha", dest="line_push_sha", required=True
+    )
+    publish_stable.add_argument("--release-json", required=True, type=Path)
+    latest = commands.add_parser("should-make-latest", aliases=("should_make_latest",))
+    latest.add_argument("--version", required=True)
+    latest.add_argument("--published-json", required=True, type=Path)
     draft = commands.add_parser("verify-draft")
     draft.add_argument("--record", default=candidate.CANDIDATE_PATH, type=Path)
     draft.add_argument("--download-dir", required=True, type=Path)
@@ -571,6 +587,15 @@ def _read_releases(path: Path) -> list[dict]:
         value = value.get("releases")
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         raise ValueError(f"{path} must contain a JSON list of release objects")
+    return value
+
+
+def _read_versions(path: Path) -> list[str]:
+    value = json.loads(path.read_text())
+    if isinstance(value, dict):
+        value = value.get("versions", value.get("published_stable_versions"))
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{path} must contain a JSON list of published version strings")
     return value
 
 
@@ -713,6 +738,30 @@ def main(argv: list[str] | None = None) -> int:
             )
             if selected is not None:
                 print(selected)
+        elif args.command in {"publish-preview", "publish_preview"}:
+            identity = github_release.CandidateIdentity.from_dict(
+                json.loads(args.identity_json.read_bytes())
+            )
+            github_release.publish_preview(
+                identity,
+                candidate.load(args.record),
+                json.loads(args.live_pr_json.read_bytes()),
+                json.loads(args.release_json.read_bytes()),
+            )
+        elif args.command in {"publish-stable", "publish_stable"}:
+            github_release.publish_stable(
+                candidate.load(args.record),
+                args.line_push_sha,
+                json.loads(args.release_json.read_bytes()),
+            )
+        elif args.command in {"should-make-latest", "should_make_latest"}:
+            print(
+                "true"
+                if github_release.should_make_latest(
+                    args.version, _read_versions(args.published_json)
+                )
+                else "false"
+            )
         elif args.command == "verify-draft":
             verify_draft.verify(
                 candidate.load(args.record),

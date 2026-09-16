@@ -676,6 +676,254 @@ class PreviewCommitTests(unittest.TestCase):
             directory.cleanup()
 
 
+class PublicationTests(unittest.TestCase):
+    """Publication rechecks reviewed identity before changing GitHub state."""
+
+    def _preview_identity(self) -> dict[str, object]:
+        return {
+            "line": BASE_REF,
+            "pr_number": 101,
+            "base_sha": BASE_SHA,
+            "source_sha": SOURCE_SHA,
+            "build_sha": "d" * 40,
+            "source_snapshot": SNAPSHOT,
+            "phase": "alpha",
+            "version": "7.1.0-alpha.1",
+            "channel": "testing",
+        }
+
+    def _stable_identity(self) -> dict[str, object]:
+        return {
+            "line": BASE_REF,
+            "pr_number": 101,
+            "base_sha": BASE_SHA,
+            "source_sha": SOURCE_SHA,
+            "build_sha": SOURCE_SHA,
+            "source_snapshot": SNAPSHOT,
+            "phase": None,
+            "version": "7.1.0",
+            "channel": "stable",
+        }
+
+    def _record(self, identity: dict[str, object]) -> CandidateRecord:
+        return CandidateRecord.model_validate(
+            {
+                "schema_version": 2,
+                "line": identity["line"],
+                "pr_number": identity["pr_number"],
+                "phase": identity["phase"],
+                "version": identity["version"],
+                "tag": f"v{identity['version']}",
+                "draft_release_id": 123456,
+                "source_sha": identity["source_sha"],
+                "source_snapshot": identity["source_snapshot"],
+                "build_sha": identity["build_sha"],
+                "base_sha": identity["base_sha"],
+                "build_date": "2026-09-16T00:00:00+00:00",
+                "workflow_runs": [],
+                "attestation": {
+                    "predicate_type": "https://slsa.dev/provenance/v1",
+                    "subject_count": 1,
+                },
+                "assets": [
+                    {
+                        "id": 1,
+                        "name": "candidate.tar.gz",
+                        "size": 1,
+                        "sha256": "0" * 64,
+                        "blake2b512": "0" * 128,
+                    }
+                ],
+            }
+        )
+
+    def _preview_pr(self, **overrides: object) -> dict:
+        values = _live_pr(
+            labels=["prerelease:alpha"],
+            version="7.1.0",
+            snapshot=SNAPSHOT,
+        )
+        values["phase_authorized"] = True
+        values.update(overrides)
+        return values
+
+    def _release(
+        self,
+        identity: dict[str, object],
+        record: CandidateRecord,
+        *,
+        draft: bool = True,
+        tag_target: str | None = None,
+    ) -> dict:
+        value = {
+            "id": 123456,
+            "tag_name": f"v{identity['version']}",
+            "name": f"v{identity['version']}",
+            "draft": draft,
+            "prerelease": identity["phase"] is not None,
+            "body": github_release.candidate_identity_body(identity),
+            "tag_target": tag_target,
+            "asset_bytes": {"gel-candidate.json": candidate.dump(record)},
+        }
+        return value
+
+    def _stable_release(self, record: CandidateRecord, *, draft: bool = True) -> dict:
+        identity = self._stable_identity()
+        value = self._release(identity, record, draft=draft, tag_target="e" * 40)
+        value["merged_pr"] = {
+            "number": 101,
+            "state": "closed",
+            "merged": True,
+            "merge_commit_sha": "e" * 40,
+            "base": {
+                "ref": BASE_REF,
+                "sha": BASE_SHA,
+                "repo": {"full_name": REPOSITORY},
+            },
+            "head": {
+                "ref": HEAD_REF,
+                "sha": SOURCE_SHA,
+                "repo": {"full_name": REPOSITORY},
+            },
+        }
+        value["record_introduced"] = True
+        value["source_equivalent"] = True
+        value["published_stable_versions"] = ["7.1.0"]
+        return value
+
+    def test_preview_rejects_removed_phase_before_mutation(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record)
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with self.assertRaisesRegex(ValueError, "phase"):
+                github_release.publish_preview(
+                    identity, record, self._preview_pr(labels=[]), release
+                )
+            mutate.assert_not_called()
+
+    def test_preview_rejects_changed_snapshot_and_line_or_pr(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record)
+        for changed in (
+            {"source_snapshot": "e" * 64},
+            {"base": {**self._preview_pr()["base"], "ref": "release/v8.x"}},
+            {"number": 102},
+        ):
+            with self.subTest(changed=changed):
+                live = self._preview_pr(**changed)
+                with self.assertRaisesRegex(ValueError, "snapshot|line|PR|identity"):
+                    github_release.publish_preview(identity, record, live, release)
+
+    def test_preview_rejects_stale_draft_identity(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        stale = self._release(identity, record)
+        stale["body"] = github_release.candidate_identity_body({**identity, "source_sha": "e" * 40})
+        with self.assertRaisesRegex(ValueError, "identity|draft"):
+            github_release.publish_preview(identity, record, self._preview_pr(), stale)
+
+    def test_preview_same_published_snapshot_retry_does_not_mutate(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record, draft=False, tag_target=identity["build_sha"])
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            github_release.publish_preview(identity, record, self._preview_pr(), release)
+            mutate.assert_not_called()
+
+    def test_preview_rejects_immutable_mismatched_existing_tag(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record, tag_target="e" * 40)
+        with self.assertRaisesRegex(ValueError, "tag|commit|target"):
+            github_release.publish_preview(identity, record, self._preview_pr(), release)
+
+    def test_preview_rejects_changed_inline_distribution_bytes(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record)
+        release["asset_bytes"]["candidate.tar.gz"] = b"x"
+        with self.assertRaisesRegex(ValueError, "asset|bytes|SHA"):
+            github_release.publish_preview(identity, record, self._preview_pr(), release)
+
+    def test_preview_creates_derived_commit_tag_and_publishes_existing_draft(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record, tag_target=None)
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with mock.patch.object(verify_draft, "verify"):
+                github_release.publish_preview(identity, record, self._preview_pr(), release)
+        calls = [call.args for call in mutate.call_args_list]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("refs/tags/v7.1.0-alpha.1", str(calls[0]))
+        self.assertIn(identity["build_sha"], str(calls[0]))
+        self.assertIn("make_latest", str(calls[1]))
+        self.assertIn("'draft': False", str(calls[1]))
+
+    def test_stable_backport_without_merge_matching_record_is_a_noop(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        release["merged_pr"]["number"] = 999
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            github_release.publish_stable(record, "e" * 40, release)
+            mutate.assert_not_called()
+
+    def test_stable_valid_merge_creates_tag_at_actual_merge_sha(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        release["tag_target"] = None
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with mock.patch.object(github_release.verify_draft, "verify"):
+                github_release.publish_stable(record, "e" * 40, release)
+        calls = [call.args for call in mutate.call_args_list]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("refs/tags/v7.1.0", str(calls[0]))
+        self.assertIn("e" * 40, str(calls[0]))
+
+    def test_stable_rejects_mismatched_tag_target(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        release["tag_target"] = "f" * 40
+        with self.assertRaisesRegex(ValueError, "tag|target|commit"):
+            github_release.publish_stable(record, "e" * 40, release)
+
+    def test_stable_rejects_moved_merge_base(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        release["merged_pr"]["base"]["sha"] = "f" * 40
+        with self.assertRaisesRegex(ValueError, "base|candidate"):
+            github_release.publish_stable(record, "e" * 40, release)
+
+    def test_stable_rejects_changed_draft_bytes(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        with mock.patch.object(
+            verify_draft,
+            "verify",
+            side_effect=verify_draft.DraftVerificationError("asset bytes changed"),
+        ):
+            with self.assertRaisesRegex(ValueError, "draft|asset|bytes"):
+                github_release.publish_stable(record, "e" * 40, release)
+
+    def test_stable_already_published_matching_retry_is_a_noop(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record, draft=False)
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            github_release.publish_stable(record, "e" * 40, release)
+            mutate.assert_not_called()
+
+    def test_latest_uses_numeric_semver_across_release_lines(self):
+        self.assertFalse(github_release.should_make_latest("7.10.1", ["8.0.0"]))
+        self.assertTrue(github_release.should_make_latest("8.0.1", ["7.10.1", "8.0.0"]))
+
+
 class GithubReleaseCliTests(unittest.TestCase):
     def test_resolve_candidate_cli_prints_all_immutable_identity_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

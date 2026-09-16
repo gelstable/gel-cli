@@ -242,6 +242,44 @@ class WorkflowSafetyContractTests(unittest.TestCase):
             "attestations": "read",
         }
 
+    def test_publication_is_serialized_across_lines_and_uses_read_defaults(self):
+        workflow = _workflow("release-publish.yml")
+        assert workflow["on"]["push"]["branches"] == ["release/v*.x"]
+        assert workflow["on"]["workflow_run"] == {
+            "workflows": ["Release candidate"],
+            "types": ["completed"],
+        }
+        assert workflow["permissions"] == {"contents": "read"}
+        assert workflow["concurrency"] == {
+            "group": "release-publish",
+            "cancel-in-progress": False,
+        }
+
+    def test_publication_rechecks_and_only_patches_existing_releases(self):
+        workflow = _workflow("release-publish.yml")
+        text = _run_text(workflow["jobs"]["publish"])
+        assert "publish_preview" in text
+        assert "publish_stable" in text
+        assert "should_make_latest" in text
+        assert "make_latest" in text
+        assert "verify-draft" in text
+        assert "source-equivalence" in text
+        preview_steps = [
+            step
+            for step in _steps(workflow["jobs"]["publish"])
+            if step.get("name") == "Publish an authorized preview"
+        ]
+        assert preview_steps
+        assert "github.event_name == 'workflow_run'" in str(preview_steps[0].get("if"))
+        for forbidden in (
+            "cargo build",
+            "cargo deb",
+            "generate-rpm",
+            "gh release upload",
+            "gh api -X DELETE",
+        ):
+            assert forbidden not in text
+
 
 class StableMergeWorkflowContractTests(unittest.TestCase):
     def test_stable_gate_runs_for_all_release_pr_state_changes(self):

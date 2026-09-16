@@ -1,10 +1,12 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -242,7 +244,7 @@ class ReleasePrWorkflowTests(unittest.TestCase):
         self.assertIn("live_base_sha", push["run"])
         self.assertIn('live_base_sha" != "$BASE_SHA"', push["run"])
 
-    def test_pr_operation_creates_after_previous_pr_is_merged(self):
+    def test_pr_operation_selects_create_or_refresh_for_open_prs(self):
         create = cli.release_pr_operation(
             [],
             base_ref="release/v7.x",
@@ -264,15 +266,6 @@ class ReleasePrWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(refresh.operation, "refresh")
         self.assertEqual(refresh.number, 101)
-
-        # A merged PR is no longer returned by `gh pr list --state open`, so
-        # the next release must select create again for the same line/head.
-        next_release = cli.release_pr_operation(
-            [],
-            base_ref="release/v7.x",
-            head_ref="knope/release-v7.x",
-        )
-        self.assertEqual(next_release.operation, "create")
 
     def test_pr_operation_rejects_ambiguous_open_prs(self):
         with self.assertRaisesRegex(ValueError, "more than one"):
@@ -327,11 +320,84 @@ class ReleasePrWorkflowTests(unittest.TestCase):
             if step.get("name") == "Create or refresh the release pull request"
         )
         run = pr_step["run"]
-        self.assertIn("gh pr list", run)
-        self.assertIn("--state open", run)
-        self.assertIn("gel-release pr-operation", run)
-        self.assertIn("gh pr create", run)
-        self.assertIn("gh pr edit", run)
+        self.assertIn("gel-release pr-sync", run)
+        self.assertIn('--repo "$GITHUB_REPOSITORY"', run)
+        self.assertIn('--base-ref "$BASE_REF"', run)
+        self.assertIn('--head-ref "$HEAD_REF"', run)
+        self.assertIn('--body-file "$body_file"', run)
+
+    def test_pr_sync_invokes_create_after_open_pr_is_marked_merged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "gh-state.json"
+            log_path = root / "gh-log.jsonl"
+            state_path.write_text(json.dumps({"open": [101], "next": 102}))
+            fake_gh = root / "gh"
+            fake_gh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "state_path = Path(os.environ['FAKE_GH_STATE'])\n"
+                "log_path = Path(os.environ['FAKE_GH_LOG'])\n"
+                "state = json.loads(state_path.read_text())\n"
+                "args = sys.argv[1:]\n"
+                "with log_path.open('a') as log:\n"
+                "    log.write(json.dumps(args) + '\\n')\n"
+                "if args[:2] == ['pr', 'list']:\n"
+                "    print(json.dumps([{'number': n, 'baseRefName': 'release/v7.x', "
+                "'headRefName': 'knope/release-v7.x'} for n in state['open']]))\n"
+                "elif args[:2] == ['pr', 'edit']:\n"
+                "    print('edited')\n"
+                "elif args[:2] == ['pr', 'create']:\n"
+                "    number = state['next']\n"
+                "    state['next'] = number + 1\n"
+                "    state['open'].append(number)\n"
+                "    state_path.write_text(json.dumps(state))\n"
+                "    print(f'https://github.com/gelstable/gel-cli/pull/{number}')\n"
+                "else:\n"
+                "    raise SystemExit(f'unexpected fake gh command: {args!r}')\n"
+            )
+            fake_gh.chmod(0o755)
+            body = root / "body.md"
+            body.write_text("release body\n")
+            environment = {
+                "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                "FAKE_GH_STATE": str(state_path),
+                "FAKE_GH_LOG": str(log_path),
+            }
+            arguments = [
+                "pr-sync",
+                "--repo",
+                "gelstable/gel-cli",
+                "--base-ref",
+                "release/v7.x",
+                "--head-ref",
+                "knope/release-v7.x",
+                "--version",
+                "7.1.0",
+                "--body-file",
+                str(body),
+            ]
+            with mock.patch.dict(os.environ, environment, clear=False):
+                first_output = io.StringIO()
+                with contextlib.redirect_stdout(first_output):
+                    first_status = cli.main(arguments)
+
+                state_path.write_text(json.dumps({"open": [], "next": 102}))
+                second_output = io.StringIO()
+                with contextlib.redirect_stdout(second_output):
+                    second_status = cli.main(arguments)
+
+            calls = [json.loads(line) for line in log_path.read_text().splitlines()]
+
+        self.assertEqual(first_status, 0)
+        self.assertEqual(second_status, 0)
+        self.assertEqual(first_output.getvalue().strip(), "101")
+        self.assertEqual(second_output.getvalue().strip(), "102")
+        self.assertEqual(
+            [call[:2] for call in calls],
+            [["pr", "list"], ["pr", "edit"], ["pr", "list"], ["pr", "create"]],
+        )
 
 
 if __name__ == "__main__":

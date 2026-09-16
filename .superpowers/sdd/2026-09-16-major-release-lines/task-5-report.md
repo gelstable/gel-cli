@@ -158,3 +158,67 @@ knope 0.23.0
 direnv exec . bash -lc 'knope --validate'
 direnv exec . bash -lc 'git diff --check'
 ```
+
+## Review fix round 2
+
+The remaining review gap was that the prior selector test passed an empty list
+twice and the workflow text assertions did not execute either GitHub PR
+operation. The workflow now calls `gel-release pr-sync`, which owns the live
+`gh pr list` selection and the matching `gh pr edit` or `gh pr create` call.
+The executable regression test supplies a fake `gh`, starts with PR 101 open,
+marks it absent to model its merge, and verifies that the next invocation
+creates PR 102.
+
+### Fix RED
+
+The executable regression test failed before the `pr-sync` command existed:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_release_pr.py::ReleasePrWorkflowTests::test_pr_sync_invokes_create_after_open_pr_is_marked_merged -q'
+F                                                                        [100%]
+E       AssertionError: 2 != 0
+----------------------------- Captured stderr call -----------------------------
+validation error: argument command: invalid choice: 'pr-sync' (choose from ...)
+```
+
+### Fix GREEN
+
+The executable PR operation regression passed:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_release_pr.py::ReleasePrWorkflowTests::test_pr_sync_invokes_create_after_open_pr_is_marked_merged -q'
+.                                                                        [100%]
+1 passed in 0.33s
+```
+
+The focused release PR tests passed:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_release_pr.py -q'
+.................                                                        [100%]
+17 passed in 5.32s
+```
+
+The complete release suite passed:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests -q'
+........................................................................ [ 42%]
+........................................................................ [ 84%]
+...........................                                              [100%]
+171 passed in 10.10s
+```
+
+Workflow and Python checks passed:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen ruff format gel_release/cli.py scripts/release/tests/test_release_pr.py'
+1 file reformatted, 1 file left unchanged
+
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen ruff check gel_release/cli.py scripts/release/tests/test_release_pr.py'
+All checks passed!
+
+direnv exec . bash -lc 'actionlint .github/workflows/release-pr.yml'
+direnv exec . bash -lc 'scripts/ci/check-action-pins.sh .github/workflows/release-pr.yml'
+direnv exec . bash -lc 'git diff --check'
+```

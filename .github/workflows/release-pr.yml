@@ -186,36 +186,12 @@ jobs:
 
           The candidate controller stages and verifies the immutable release after this PR is refreshed. Merging this PR authorizes publication of the reviewed stable candidate.
           EOF
-          open_prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
-            --base "$BASE_REF" --head "$HEAD_REF" \
-            --json number,baseRefName,headRefName --limit 2)"
-          printf '%s\n' "$open_prs" > "$RUNNER_TEMP/open-release-prs.json"
-          operation="$(uv run --frozen gel-release pr-operation \
-            --pr-json "$RUNNER_TEMP/open-release-prs.json" \
+          pr_number="$(uv run --frozen gel-release pr-sync \
+            --repo "$GITHUB_REPOSITORY" \
             --base-ref "$BASE_REF" \
-            --head-ref "$HEAD_REF")"
-          case "$(jq -r '.operation' <<<"$operation")" in
-            refresh)
-              pr_number="$(jq -r '.number' <<<"$operation")"
-            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" \
-              --base "$BASE_REF" \
-              --title "chore: prepare release ${VERSION}" \
-              --body-file "$body_file"
-              ;;
-            create)
-              gh pr create --repo "$GITHUB_REPOSITORY" \
-                --base "$BASE_REF" --head "$HEAD_REF" \
-                --title "chore: prepare release ${VERSION}" \
-                --body-file "$body_file" > "$RUNNER_TEMP/pr-url"
-              pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
-                --base "$BASE_REF" --head "$HEAD_REF" --json number --limit 1 \
-                --jq '.[0].number')"
-              ;;
-            *)
-              echo "invalid release PR operation: $operation" >&2
-              exit 1
-              ;;
-          esac
+            --head-ref "$HEAD_REF" \
+            --version "$VERSION" \
+            --body-file "$body_file")"
           if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
             echo "could not resolve the prepared release PR number" >&2
             exit 1

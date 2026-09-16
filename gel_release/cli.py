@@ -117,6 +117,102 @@ def release_pr_operation(
     return ReleasePrOperation(operation="refresh", number=numbers[0])
 
 
+def _gh(*args: str) -> str:
+    """Run a GitHub CLI command and return its trimmed standard output."""
+
+    try:
+        completed = subprocess.run(
+            ["gh", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = (
+            error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+        )
+        raise ValueError(f"gh {' '.join(args)} failed: {detail}") from error
+    return completed.stdout.strip()
+
+
+def sync_release_pr(
+    *,
+    repo: str,
+    base_ref: str,
+    head_ref: str,
+    version: str,
+    body_file: Path,
+) -> int:
+    """Create or refresh the one release PR for a line.
+
+    This owns the GitHub side effect behind ``pr-sync`` so the workflow and
+    an executable regression test use the same create/refresh path. The open
+    PR list is read immediately before selecting the operation; a create
+    result is parsed from ``gh pr create`` rather than queried through a
+    second, race-prone list request.
+    """
+
+    if not body_file.is_file():
+        raise ValueError(f"release PR body file does not exist: {body_file}")
+    open_prs_output = _gh(
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--base",
+        base_ref,
+        "--head",
+        head_ref,
+        "--json",
+        "number,baseRefName,headRefName",
+        "--limit",
+        "2",
+    )
+    try:
+        open_prs = json.loads(open_prs_output)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"gh pr list returned invalid JSON: {error}") from error
+    operation = release_pr_operation(open_prs, base_ref=base_ref, head_ref=head_ref)
+    title = f"chore: prepare release {version}"
+    if operation.operation == "refresh":
+        assert operation.number is not None
+        _gh(
+            "pr",
+            "edit",
+            str(operation.number),
+            "--repo",
+            repo,
+            "--base",
+            base_ref,
+            "--title",
+            title,
+            "--body-file",
+            str(body_file),
+        )
+        return operation.number
+
+    create_output = _gh(
+        "pr",
+        "create",
+        "--repo",
+        repo,
+        "--base",
+        base_ref,
+        "--head",
+        head_ref,
+        "--title",
+        title,
+        "--body-file",
+        str(body_file),
+    )
+    match = re.search(r"/pull/([1-9][0-9]*)\b", create_output)
+    if match is None:
+        raise ValueError(f"gh pr create did not return a pull request URL: {create_output!r}")
+    return int(match.group(1))
+
+
 def _git(repo: Path, *args: str, optional: bool = False) -> str | None:
     """Run a read-only Git command in ``repo`` and return its trimmed output."""
 
@@ -302,6 +398,12 @@ def _parser() -> argparse.ArgumentParser:
     operation.add_argument("--pr-json", required=True, type=Path)
     operation.add_argument("--base-ref", required=True)
     operation.add_argument("--head-ref", required=True)
+    sync = commands.add_parser("pr-sync")
+    sync.add_argument("--repo", required=True)
+    sync.add_argument("--base-ref", required=True)
+    sync.add_argument("--head-ref", required=True)
+    sync.add_argument("--version", required=True)
+    sync.add_argument("--body-file", required=True, type=Path)
     preparation = commands.add_parser("prepare-line")
     preparation.add_argument("--base-ref", required=True)
     preparation.add_argument(
@@ -462,6 +564,16 @@ def main(argv: list[str] | None = None) -> int:
                 head_ref=args.head_ref,
             )
             print(json.dumps(operation.as_dict(), separators=(",", ":"), sort_keys=True))
+        elif args.command == "pr-sync":
+            print(
+                sync_release_pr(
+                    repo=args.repo,
+                    base_ref=args.base_ref,
+                    head_ref=args.head_ref,
+                    version=args.version,
+                    body_file=args.body_file,
+                )
+            )
         elif args.command == "prepare-line":
             result = prepare_line(
                 args.base_ref,

@@ -8,6 +8,7 @@ stored, not the bytes the build job happened to leave on disk.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -73,6 +74,38 @@ def list_release_assets(
     return [GithubAsset.model_validate(item).model_dump() for item in payload]
 
 
+def get_release(release_id: str, repo: str = assets.REPOSITORY) -> dict:
+    payload = _gh_json("api", f"/repos/{repo}/releases/{release_id}")
+    if not isinstance(payload, dict):
+        raise DraftVerificationError("GitHub release response must be an object")
+    return payload
+
+
+def check_release_identity(release: dict, record: dict) -> None:
+    expected_tag = record["tag"]
+    actual_tag = release.get("tag_name")
+    if actual_tag != expected_tag:
+        raise DraftVerificationError(
+            f"draft release tag {actual_tag!r} does not match candidate tag {expected_tag!r}"
+        )
+
+    expected_source = record["source_sha"]
+    target_commitish = release.get("target_commitish")
+    if isinstance(target_commitish, str) and re.fullmatch(r"[0-9a-fA-F]{40}", target_commitish):
+        if target_commitish.lower() != expected_source.lower():
+            raise DraftVerificationError(
+                "draft release target commit does not match candidate source "
+                f"{expected_source}"
+            )
+        return
+
+    body = release.get("body")
+    if not isinstance(body, str) or f"Candidate staged from {expected_source}" not in body:
+        raise DraftVerificationError(
+            f"draft release does not identify candidate source {expected_source}"
+        )
+
+
 def download_asset(asset_id: int, destination: Path, repo: str = assets.REPOSITORY) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with open(destination, "wb") as handle:
@@ -89,9 +122,21 @@ def download_asset(asset_id: int, destination: Path, repo: str = assets.REPOSITO
         )
 
 
-def verify_attestations(paths: list[Path], repo: str = assets.REPOSITORY) -> None:
+def verify_attestations(paths: list[Path], repo: str, source_sha: str) -> None:
     for path in paths:
-        subprocess.run(["gh", "attestation", "verify", str(path), "--repo", repo], check=True)
+        subprocess.run(
+            [
+                "gh",
+                "attestation",
+                "verify",
+                str(path),
+                "--repo",
+                repo,
+                "--source-digest",
+                source_sha,
+            ],
+            check=True,
+        )
 
 
 def check_inventory(listed: list[dict], version: str) -> None:
@@ -132,6 +177,27 @@ def check_manifest_urls(manifest: dict, version: str) -> None:
             raise DraftVerificationError(f"gel-registry.json references unknown asset {name}")
 
 
+def check_manifest_digests(manifest: dict, download_dir: Path) -> None:
+    for fragment in manifest["indexes"]:
+        for package in fragment["packages"]:
+            for ref in package["installrefs"]:
+                name = ref["ref"].rsplit("/", 1)[-1]
+                actual = digests.digest_file(download_dir / name)
+                expected = ref["verification"]
+                if actual.blake2b512 != expected["blake2b"]:
+                    raise DraftVerificationError(
+                        f"{name}: gel-registry.json BLAKE2b does not match the staged bytes"
+                    )
+                if actual.sha256 != expected["sha256"]:
+                    raise DraftVerificationError(
+                        f"{name}: gel-registry.json SHA-256 does not match the staged bytes"
+                    )
+                if actual.size != expected["size"]:
+                    raise DraftVerificationError(
+                        f"{name}: gel-registry.json size does not match the staged bytes"
+                    )
+
+
 def verify(
     record: dict,
     download_dir: Path,
@@ -139,6 +205,8 @@ def verify(
     verify_attestations_flag: bool = True,
 ) -> None:
     version = record["version"]
+    release = get_release(str(record["draft_release_id"]), repo)
+    check_release_identity(release, record)
     listed = list_release_assets(str(record["draft_release_id"]), repo)
     check_inventory(listed, version)
 
@@ -166,20 +234,11 @@ def verify(
     manifest = json.loads((download_dir / assets.REGISTRY_MANIFEST_NAME).read_bytes())
     registry_manifest.validate_manifest(manifest)
     check_manifest_urls(manifest, version)
-
-    for fragment in manifest["indexes"]:
-        for package in fragment["packages"]:
-            for ref in package["installrefs"]:
-                name = ref["ref"].rsplit("/", 1)[-1]
-                actual = digests.digest_file(download_dir / name)
-                if actual.blake2b512 != ref["verification"]["blake2b"]:
-                    raise DraftVerificationError(
-                        f"{name}: gel-registry.json BLAKE2b does not match the staged bytes"
-                    )
-                if actual.size != ref["verification"]["size"]:
-                    raise DraftVerificationError(
-                        f"{name}: gel-registry.json size does not match the staged bytes"
-                    )
+    check_manifest_digests(manifest, download_dir)
 
     if verify_attestations_flag:
-        verify_attestations([download_dir / entry["name"] for entry in record["assets"]], repo)
+        verify_attestations(
+            [download_dir / entry["name"] for entry in record["assets"]],
+            repo,
+            record["source_sha"],
+        )

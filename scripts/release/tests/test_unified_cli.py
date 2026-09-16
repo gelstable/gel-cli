@@ -19,11 +19,17 @@ class ModelBoundaryTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CandidateRecord.model_validate(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
+                    "line": "release/v1.x",
+                    "pr_number": 1,
+                    "phase": None,
                     "version": "1.2.3",
                     "tag": "v1.2.3",
                     "draft_release_id": 1,
                     "source_sha": "a" * 40,
+                    "build_sha": "a" * 40,
+                    "source_snapshot": "d" * 64,
+                    "base_sha": "b" * 40,
                     "build_date": "2026-09-12T00:00:00+00:00",
                     "workflow_runs": [],
                     "attestation": {
@@ -39,11 +45,17 @@ class ModelBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "tag must be v1.2.3"):
             CandidateRecord.model_validate(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
+                    "line": "release/v1.x",
+                    "pr_number": 1,
+                    "phase": None,
                     "version": "1.2.3",
                     "tag": "v1.2.4",
                     "draft_release_id": 1,
                     "source_sha": "a" * 40,
+                    "build_sha": "a" * 40,
+                    "source_snapshot": "d" * 64,
+                    "base_sha": "b" * 40,
                     "build_date": "2026-09-12T00:00:00+00:00",
                     "workflow_runs": [],
                     "attestation": {
@@ -126,11 +138,17 @@ class CliBoundaryTests(unittest.TestCase):
             record.write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
+                        "line": "release/v1.x",
+                        "pr_number": 1,
+                        "phase": None,
                         "version": "1.2.3",
                         "tag": "v1.2.3",
                         "draft_release_id": 1,
                         "source_sha": "a" * 40,
+                        "build_sha": "a" * 40,
+                        "source_snapshot": "d" * 64,
+                        "base_sha": "b" * 40,
                         "build_date": "2026-09-12T00:00:00+00:00",
                         "workflow_runs": [],
                         "attestation": {

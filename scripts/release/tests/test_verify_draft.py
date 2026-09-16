@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from gel_release import assets, digests, registry_manifest, verify_draft
+from gel_release import assets, candidate, digests, registry_manifest, verify_draft
 
 
 def _manifest(version: str) -> dict:
@@ -87,12 +87,81 @@ class InventoryTests(unittest.TestCase):
         ]
         verify_draft.check_inventory(listed, "7.11.0")
 
+    def test_preview_inventory_requires_candidate_record_asset(self):
+        listed = [
+            {"id": i, "name": name, "size": 1}
+            for i, name in enumerate(assets.expected_assets("7.11.0"))
+        ]
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "gel-candidate.json"):
+            verify_draft.check_inventory(listed, "7.11.0", phase="alpha")
+
+    def test_prerelease_version_requires_candidate_record_asset(self):
+        listed = [
+            {"id": i, "name": name, "size": 1}
+            for i, name in enumerate(assets.expected_assets("7.11.0-alpha.1"))
+        ]
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "gel-candidate.json"):
+            verify_draft.check_inventory(listed, "7.11.0-alpha.1")
+
+    def test_preview_inventory_accepts_candidate_record_asset(self):
+        listed = [
+            {"id": i, "name": name, "size": 1}
+            for i, name in enumerate(assets.expected_assets("7.11.0"))
+        ]
+        listed.append({"id": 999, "name": "gel-candidate.json", "size": 1})
+        verify_draft.check_inventory(listed, "7.11.0", phase="alpha")
+
+    def test_preview_inventory_accepts_record_argument(self):
+        listed = [
+            {"id": i, "name": name, "size": 1}
+            for i, name in enumerate(assets.expected_assets("7.11.0"))
+        ]
+        listed.append({"id": 999, "name": "gel-candidate.json", "size": 1})
+        verify_draft.check_inventory(listed, "7.11.0", record={"phase": "alpha"})
+
+    def test_stable_inventory_rejects_candidate_record_asset(self):
+        listed = [
+            {"id": i, "name": name, "size": 1}
+            for i, name in enumerate(assets.expected_assets("7.11.0"))
+        ]
+        listed.append({"id": 999, "name": "gel-candidate.json", "size": 1})
+        with self.assertRaises(verify_draft.DraftVerificationError):
+            verify_draft.check_inventory(listed, "7.11.0")
+
 
 class ReleaseIdentityTests(unittest.TestCase):
-    RECORD = {"tag": "v7.11.0", "source_sha": "a" * 40}
+    RECORD = {
+        "schema_version": 2,
+        "line": "release/v7.x",
+        "pr_number": 321,
+        "phase": None,
+        "version": "7.11.0",
+        "tag": "v7.11.0",
+        "draft_release_id": 123456789,
+        "source_sha": "a" * 40,
+        "build_sha": "a" * 40,
+        "source_snapshot": "d" * 64,
+        "base_sha": "b" * 40,
+        "build_date": "2026-09-12T00:00:00+00:00",
+        "workflow_runs": [],
+        "attestation": {"predicate_type": "https://slsa.dev/provenance/v1", "subject_count": 1},
+        "assets": [
+            {
+                "id": 1,
+                "name": "asset",
+                "size": 1,
+                "sha256": "0" * 64,
+                "blake2b512": "0" * 128,
+            }
+        ],
+    }
 
     RELEASE = {
+        "id": 123456789,
         "tag_name": "v7.11.0",
+        "name": "v7.11.0",
+        "draft": True,
+        "prerelease": False,
         "target_commitish": "master",
         "body": "Candidate staged from " + RECORD["source_sha"] + ".",
     }
@@ -209,10 +278,47 @@ class ReleaseIdentityTests(unittest.TestCase):
     @mock.patch("gel_release.verify_draft.resolve_tag_commit", return_value=None)
     @mock.patch("gel_release.verify_draft.get_release", return_value=RELEASE)
     def test_skip_attestations_rejects_uncreated_draft_tag(self, get_release, resolve_tag):
-        record = {**self.RECORD, "version": "7.11.0", "draft_release_id": 1}
+        record = {**self.RECORD, "version": "7.11.0"}
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(verify_draft.DraftVerificationError, "not created"):
                 verify_draft.verify(record, Path(tmp), verify_attestations_flag=False)
+
+    def test_release_id_must_match_candidate(self):
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "release id"):
+            verify_draft.check_release_identity({**self.RELEASE, "id": 999}, self.RECORD)
+
+    def test_release_must_be_draft(self):
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "draft"):
+            verify_draft.check_release_identity({**self.RELEASE, "draft": False}, self.RECORD)
+
+    def test_release_name_must_match_tag(self):
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "name"):
+            verify_draft.check_release_identity({**self.RELEASE, "name": "wrong"}, self.RECORD)
+
+    def test_release_prerelease_flag_matches_phase(self):
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "prerelease"):
+            verify_draft.check_release_identity({**self.RELEASE, "prerelease": True}, self.RECORD)
+
+    @mock.patch(
+        "gel_release.verify_draft._gh_json",
+        return_value={"object": {"type": "commit", "sha": "c" * 40}},
+    )
+    def test_preview_release_tag_resolves_to_build_sha(self, gh_json):
+        record = {
+            **self.RECORD,
+            "version": "7.11.0-alpha.1",
+            "tag": "v7.11.0-alpha.1",
+            "phase": "alpha",
+            "build_sha": "c" * 40,
+            "source_sha": "a" * 40,
+        }
+        release = {
+            **self.RELEASE,
+            "tag_name": record["tag"],
+            "name": record["tag"],
+            "prerelease": True,
+        }
+        self.assertEqual(verify_draft.check_release_identity(release, record), "c" * 40)
 
 
 class ManifestDigestTests(unittest.TestCase):
@@ -224,6 +330,146 @@ class ManifestDigestTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(verify_draft.DraftVerificationError, "SHA-256"):
                 verify_draft.check_manifest_digests(manifest, Path(tmp))
+
+
+def _preview_candidate(root: Path) -> tuple[dict, Path, dict[int, bytes]]:
+    version = "7.11.0-alpha.1"
+    dist = root / "dist"
+    dist.mkdir()
+    for name in assets.expected_assets(version):
+        if name in {
+            *(assets.registry_identity_name(target) for target in assets.REGISTRY_TARGETS),
+            *(assets.registry_zstd_name(target) for target in assets.REGISTRY_TARGETS),
+            assets.REGISTRY_MANIFEST_NAME,
+            assets.SHA256SUMS_NAME,
+            assets.BLAKE2B_SUMS_NAME,
+        }:
+            continue
+        (dist / name).write_bytes(f"payload for {name}".encode())
+    manifest = _manifest_with_downloads(dist, version)
+    (dist / assets.REGISTRY_MANIFEST_NAME).write_bytes(registry_manifest.dump(manifest))
+    skip = {assets.SHA256SUMS_NAME, assets.BLAKE2B_SUMS_NAME}
+    digests.write_sums(dist, "sha256", dist / assets.SHA256SUMS_NAME, skip)
+    digests.write_sums(dist, "blake2b512", dist / assets.BLAKE2B_SUMS_NAME, skip)
+    ids = {name: 1000 + index for index, name in enumerate(assets.expected_assets(version))}
+    record = candidate.build_record(
+        line="release/v7.x",
+        pr_number=321,
+        phase="alpha",
+        version=version,
+        tag=f"v{version}",
+        draft_release_id=123456789,
+        source_sha="a" * 40,
+        build_sha="c" * 40,
+        source_snapshot="d" * 64,
+        base_sha="b" * 40,
+        build_date="2026-09-12T00:00:00+00:00",
+        workflow_runs=[],
+        attestation={
+            "predicate_type": "https://slsa.dev/provenance/v1",
+            "subject_count": len(assets.expected_assets(version)),
+        },
+        dist_dir=dist,
+        asset_ids=ids,
+    )
+    payloads = {entry["id"]: (dist / entry["name"]).read_bytes() for entry in record["assets"]}
+    payloads[9000] = candidate.dump(record)
+    return record, dist, payloads
+
+
+class CandidateReadbackTests(unittest.TestCase):
+    @mock.patch("gel_release.verify_draft.verify_attestations")
+    @mock.patch("gel_release.verify_draft.download_asset")
+    @mock.patch("gel_release.verify_draft.list_release_assets")
+    @mock.patch("gel_release.verify_draft.resolve_tag_commit", return_value="c" * 40)
+    @mock.patch("gel_release.verify_draft.get_release")
+    def test_preview_record_is_read_back_separately_from_distribution_digests(
+        self, get_release, resolve_tag, list_assets, download, attestations
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record, dist, payloads = _preview_candidate(root)
+            get_release.return_value = {
+                "id": record["draft_release_id"],
+                "tag_name": record["tag"],
+                "name": record["tag"],
+                "draft": True,
+                "prerelease": True,
+            }
+            listed = [
+                {
+                    "id": entry["id"],
+                    "name": entry["name"],
+                    "size": len(payloads[entry["id"]]),
+                }
+                for entry in record["assets"]
+            ]
+            listed.append(
+                {
+                    "id": 9000,
+                    "name": candidate.PREVIEW_RECORD_NAME,
+                    "size": len(payloads[9000]),
+                }
+            )
+            list_assets.return_value = listed
+
+            def readback(asset_id, destination, repo):
+                destination.write_bytes(payloads[asset_id])
+
+            download.side_effect = readback
+            readback_dir = root / "readback"
+            verify_draft.verify(record, readback_dir, verify_attestations_flag=True)
+
+            self.assertEqual(
+                (readback_dir / candidate.PREVIEW_RECORD_NAME).read_bytes(), payloads[9000]
+            )
+            attested_paths = attestations.call_args.args[0]
+            self.assertTrue(
+                all(path.name != candidate.PREVIEW_RECORD_NAME for path in attested_paths)
+            )
+            self.assertEqual(attestations.call_args.args[2], record["build_sha"])
+
+    @mock.patch("gel_release.verify_draft.download_asset")
+    @mock.patch("gel_release.verify_draft.list_release_assets")
+    @mock.patch("gel_release.verify_draft.resolve_tag_commit", return_value="c" * 40)
+    @mock.patch("gel_release.verify_draft.get_release")
+    def test_preview_record_changed_bytes_fail_closed(
+        self, get_release, resolve_tag, list_assets, download
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record, _, payloads = _preview_candidate(root)
+            get_release.return_value = {
+                "id": record["draft_release_id"],
+                "tag_name": record["tag"],
+                "name": record["tag"],
+                "draft": True,
+                "prerelease": True,
+            }
+            listed = [
+                {
+                    "id": entry["id"],
+                    "name": entry["name"],
+                    "size": len(payloads[entry["id"]]),
+                }
+                for entry in record["assets"]
+            ]
+            listed.append(
+                {
+                    "id": 9000,
+                    "name": candidate.PREVIEW_RECORD_NAME,
+                    "size": len(payloads[9000]),
+                }
+            )
+            list_assets.return_value = listed
+
+            def readback(asset_id, destination, repo):
+                payload = payloads[asset_id]
+                destination.write_bytes(payload + (b" " if asset_id == 9000 else b""))
+
+            download.side_effect = readback
+            with self.assertRaisesRegex(verify_draft.DraftVerificationError, "bytes"):
+                verify_draft.verify(record, root / "readback", verify_attestations_flag=False)
 
 
 class AttestationPolicyTests(unittest.TestCase):

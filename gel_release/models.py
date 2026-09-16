@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
@@ -10,6 +11,17 @@ PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Blake2b512 = Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
 GitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+SourceSnapshot = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+_BASE_VERSION_COMPONENT = r"(?:0|[1-9][0-9]*)"
+_STABLE_VERSION_PATTERN = re.compile(
+    rf"^{_BASE_VERSION_COMPONENT}\.{_BASE_VERSION_COMPONENT}\.{_BASE_VERSION_COMPONENT}$"
+)
+_PREVIEW_VERSION_PATTERN = re.compile(
+    rf"^(?P<base>{_BASE_VERSION_COMPONENT}\.{_BASE_VERSION_COMPONENT}\.{_BASE_VERSION_COMPONENT})"
+    r"-(?P<phase>alpha|beta|rc)\.(?P<number>[1-9][0-9]*)$"
+)
+_LINE_PATTERN = re.compile(r"^release/v(?P<major>[1-9][0-9]*)\.x$")
 
 
 class StrictModel(BaseModel):
@@ -36,11 +48,25 @@ class AttestationRecord(StrictModel):
 
 
 class CandidateRecord(StrictModel):
-    schema_version: Literal[1]
-    version: Annotated[str, Field(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+].+)?$")]
+    schema_version: Literal[2]
+    line: Annotated[str, Field(pattern=r"^release/v[1-9][0-9]*\.x$")]
+    pr_number: PositiveInt
+    phase: Literal["alpha", "beta", "rc"] | None
+    version: Annotated[
+        str,
+        Field(
+            pattern=(
+                rf"^{_BASE_VERSION_COMPONENT}\.{_BASE_VERSION_COMPONENT}\.{_BASE_VERSION_COMPONENT}"
+                r"(?:-(?:alpha|beta|rc)\.[1-9][0-9]*)?$"
+            )
+        ),
+    ]
     tag: Annotated[str, Field(min_length=2)]
     draft_release_id: PositiveInt
     source_sha: GitSha
+    source_snapshot: SourceSnapshot
+    build_sha: GitSha
+    base_sha: GitSha
     build_date: Annotated[str, Field(min_length=1)]
     workflow_runs: list[WorkflowRun]
     attestation: AttestationRecord
@@ -48,12 +74,47 @@ class CandidateRecord(StrictModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> CandidateRecord:
+        line_match = _LINE_PATTERN.fullmatch(self.line)
+        if line_match is None:
+            # Keep the explicit message useful when this is called directly
+            # instead of relying on Pydantic's field error.
+            raise ValueError(f"line must be a release/v<major>.x branch: {self.line!r}")
+
+        stable_match = _STABLE_VERSION_PATTERN.fullmatch(self.version)
+        preview_match = _PREVIEW_VERSION_PATTERN.fullmatch(self.version)
+        if stable_match is None and preview_match is None:
+            raise ValueError(f"unsupported candidate version {self.version!r}")
+
+        version_major = int(self.version.split(".", 1)[0])
+        line_major = int(line_match.group("major"))
+        if line_major != version_major:
+            raise ValueError(
+                f"line {self.line} major {line_major} does not match version major {version_major}"
+            )
+
         expected = f"v{self.version}"
         if self.tag != expected:
             raise ValueError(f"tag must be {expected}")
+
+        if self.phase is None:
+            if stable_match is None:
+                raise ValueError("phase must match the prerelease version")
+            if self.build_sha != self.source_sha:
+                raise ValueError("stable candidate build_sha must equal source_sha")
+        else:
+            if preview_match is None or preview_match.group("phase") != self.phase:
+                raise ValueError("phase must match the prerelease version")
+            if self.build_sha == self.source_sha:
+                raise ValueError("preview candidate build_sha must differ from source_sha")
+
         names = [asset.name for asset in self.assets]
         if len(names) != len(set(names)):
             raise ValueError("candidate asset names must be unique")
+        ids = [asset.id for asset in self.assets]
+        if len(ids) != len(set(ids)):
+            raise ValueError("candidate asset ids must be unique")
+        if "gel-candidate.json" in names or "packaging/release-candidate.json" in names:
+            raise ValueError("candidate record must not include itself in assets")
         if self.attestation.subject_count != len(self.assets):
             raise ValueError("attestation subject_count must match asset count")
         return self

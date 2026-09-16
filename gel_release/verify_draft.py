@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 from . import assets, candidate, digests, registry_manifest
-from .models import GithubAsset
+from .models import CandidateRecord, GithubAsset
 
 DISTRIBUTION_SUFFIXES = (".tar.gz", ".zip", ".deb", ".rpm")
 DIGEST_MANIFEST_NAMES = (assets.SHA256SUMS_NAME, assets.BLAKE2B_SUMS_NAME)
@@ -141,19 +142,48 @@ def resolve_tag_commit(tag: str, repo: str = assets.REPOSITORY) -> str | None:
 
 
 def check_release_identity(
-    release: dict, record: dict, repo: str = assets.REPOSITORY
+    release: dict,
+    record: Mapping[str, object] | CandidateRecord,
+    repo: str = assets.REPOSITORY,
 ) -> str | None:
+    if isinstance(record, CandidateRecord):
+        record = record.model_dump(mode="json")
+    release_id = release.get("id")
+    expected_release_id = record.get("draft_release_id")
+    if isinstance(release_id, bool) or not isinstance(release_id, int):
+        raise DraftVerificationError("draft release response has no valid release id")
+    if release_id != expected_release_id:
+        raise DraftVerificationError(
+            f"draft release id {release_id} does not match candidate release id "
+            f"{expected_release_id}"
+        )
+
     expected_tag = record["tag"]
     actual_tag = release.get("tag_name")
     if actual_tag != expected_tag:
         raise DraftVerificationError(
             f"draft release tag {actual_tag!r} does not match candidate tag {expected_tag!r}"
         )
-    resolved = resolve_tag_commit(expected_tag, repo)
-    if resolved is not None and resolved.lower() != record["source_sha"].lower():
+    if release.get("name") != expected_tag:
         raise DraftVerificationError(
-            f"tag {expected_tag} resolves to {resolved}, expected candidate source "
-            f"{record['source_sha']}"
+            f"draft release name {release.get('name')!r} does not match candidate tag "
+            f"{expected_tag!r}"
+        )
+    if release.get("draft") is not True:
+        raise DraftVerificationError("candidate release must still be a draft")
+    expected_prerelease = record.get("phase") is not None
+    if release.get("prerelease") is not expected_prerelease:
+        raise DraftVerificationError(
+            f"draft release prerelease flag {release.get('prerelease')!r} does not match "
+            f"candidate phase {record.get('phase')!r}"
+        )
+
+    resolved = resolve_tag_commit(expected_tag, repo)
+    expected_build_sha = record.get("build_sha", record["source_sha"])
+    if resolved is not None and resolved.lower() != expected_build_sha.lower():
+        raise DraftVerificationError(
+            f"tag {expected_tag} resolves to {resolved}, expected candidate build/source "
+            f"SHA {expected_build_sha}"
         )
     return resolved
 
@@ -191,9 +221,38 @@ def verify_attestations(paths: list[Path], repo: str, source_sha: str) -> None:
         )
 
 
-def check_inventory(listed: list[dict], version: str) -> None:
+def check_inventory(
+    listed: list[dict],
+    version: str,
+    phase: str | Mapping[str, object] | CandidateRecord | None = None,
+    *,
+    record: Mapping[str, object] | CandidateRecord | None = None,
+    preview: bool | None = None,
+    record_asset_name: str | None = None,
+) -> None:
+    if isinstance(phase, Mapping):
+        record = phase
+        phase = record.get("phase")
+    elif isinstance(phase, CandidateRecord):
+        record = phase
+        phase = record.phase
+    elif record is not None and phase is None:
+        phase = record.phase if isinstance(record, CandidateRecord) else record.get("phase")
+    if preview is True and phase is None:
+        phase = "preview"
+    if preview is False:
+        phase = None
+    if phase is None and preview is None and record_asset_name is None:
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-(?:alpha|beta|rc)\.[1-9][0-9]*", version):
+            phase = "preview"
+    if phase is not None and phase not in {"alpha", "beta", "rc"}:
+        if phase != "preview":
+            raise DraftVerificationError(f"unsupported candidate phase {phase!r}")
+
     names = sorted(entry["name"] for entry in listed)
     expected = assets.expected_assets(version)
+    if phase is not None or record_asset_name is not None:
+        expected = sorted([*expected, record_asset_name or candidate.PREVIEW_RECORD_NAME])
     if names != expected:
         missing = sorted(set(expected) - set(names))
         extra = sorted(set(names) - set(expected))
@@ -251,11 +310,44 @@ def check_manifest_digests(manifest: dict, download_dir: Path) -> None:
 
 
 def verify(
-    record: dict,
+    record: Mapping[str, object] | CandidateRecord,
     download_dir: Path,
     repo: str = assets.REPOSITORY,
     verify_attestations_flag: bool = True,
+    expected_source_snapshot: str | None = None,
+    *,
+    expected_version: str | None = None,
+    expected_line: str | None = None,
+    expected_pr_number: int | None = None,
+    expected_phase: str | None = None,
+    expected_source_sha: str | None = None,
+    expected_build_sha: str | None = None,
+    expected_base_sha: str | None = None,
+    source_snapshot: str | None = None,
 ) -> None:
+    if expected_source_snapshot is not None and source_snapshot is not None:
+        if expected_source_snapshot != source_snapshot:
+            raise DraftVerificationError(
+                "conflicting expected source snapshots were supplied for draft verification"
+            )
+    if expected_source_snapshot is None:
+        expected_source_snapshot = source_snapshot
+    record = candidate.validate_record(record).model_dump(mode="json")
+    expected_identity = {
+        "version": expected_version,
+        "line": expected_line,
+        "pr_number": expected_pr_number,
+        "phase": expected_phase,
+        "source_sha": expected_source_sha,
+        "build_sha": expected_build_sha,
+        "source_snapshot": expected_source_snapshot,
+        "base_sha": expected_base_sha,
+    }
+    for field, expected in expected_identity.items():
+        if expected is not None and record[field] != expected:
+            raise DraftVerificationError(
+                f"candidate {field} {record[field]!r} does not match expected {expected!r}"
+            )
     version = record["version"]
     release = get_release(str(record["draft_release_id"]), repo)
     tag_commit = check_release_identity(release, record, repo)
@@ -265,7 +357,7 @@ def verify(
             "attestation verification disabled"
         )
     listed = list_release_assets(str(record["draft_release_id"]), repo)
-    check_inventory(listed, version)
+    check_inventory(listed, version, record=record)
 
     by_name = {entry["name"]: entry for entry in listed}
     for entry in record["assets"]:
@@ -283,10 +375,23 @@ def verify(
     for entry in record["assets"]:
         download_asset(entry["id"], download_dir / entry["name"], repo)
 
-    candidate.verify_record(record, version, download_dir)
+    try:
+        candidate.verify_record(
+            record,
+            version,
+            download_dir,
+            expected_source_snapshot=expected_source_snapshot,
+        )
+    except candidate.CandidateMismatch as error:
+        raise DraftVerificationError(str(error)) from error
 
     for name in DIGEST_MANIFEST_NAMES:
-        digests.verify_sums(download_dir, download_dir / name)
+        try:
+            digests.verify_sums(download_dir, download_dir / name)
+        except (digests.DigestMismatch, OSError, ValueError) as error:
+            raise DraftVerificationError(
+                f"{name}: digest manifest verification failed: {error}"
+            ) from error
 
     manifest = json.loads((download_dir / assets.REGISTRY_MANIFEST_NAME).read_bytes())
     registry_manifest.validate_manifest(manifest)
@@ -297,5 +402,20 @@ def verify(
         verify_attestations(
             [download_dir / entry["name"] for entry in record["assets"]],
             repo,
-            record["source_sha"],
+            record["build_sha"],
         )
+
+    if record["phase"] is not None:
+        record_asset = by_name[candidate.PREVIEW_RECORD_NAME]
+        expected_record_bytes = candidate.dump(record)
+        if record_asset["size"] != len(expected_record_bytes):
+            raise DraftVerificationError(
+                f"{candidate.PREVIEW_RECORD_NAME}: size {record_asset['size']} does not match "
+                "expected candidate record bytes"
+            )
+        record_path = download_dir / candidate.PREVIEW_RECORD_NAME
+        download_asset(record_asset["id"], record_path, repo)
+        try:
+            candidate.verify_record_asset(record, record_path)
+        except candidate.CandidateMismatch as error:
+            raise DraftVerificationError(str(error)) from error

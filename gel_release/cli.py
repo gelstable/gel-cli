@@ -62,8 +62,15 @@ def _parser() -> argparse.ArgumentParser:
         dest="candidate_command", required=True
     )
     write = record.add_parser("write")
-    for flag in ("version", "source-sha", "build-date"):
-        write.add_argument(f"--{flag}", required=True)
+    write.add_argument("--line", required=True)
+    write.add_argument("--version", required=True)
+    write.add_argument("--source-sha", "--original-source-sha", dest="source_sha", required=True)
+    write.add_argument("--build-sha", required=True)
+    write.add_argument("--source-snapshot", "--snapshot", dest="source_snapshot", required=True)
+    write.add_argument("--base-sha", required=True)
+    write.add_argument("--build-date", required=True)
+    write.add_argument("--pr-number", "--pr", dest="pr_number", required=True, type=int)
+    write.add_argument("--phase", choices=("alpha", "beta", "rc"))
     for flag in ("draft-release-id", "run-id", "run-attempt"):
         write.add_argument(f"--{flag}", required=True, type=int)
     for flag in ("dist-dir", "asset-ids", "out"):
@@ -92,6 +99,14 @@ def _parser() -> argparse.ArgumentParser:
     draft.add_argument("--download-dir", required=True, type=Path)
     draft.add_argument("--repo", default=assets.REPOSITORY)
     draft.add_argument("--skip-attestations", action="store_true")
+    draft.add_argument("--version")
+    draft.add_argument("--line")
+    draft.add_argument("--pr-number", "--pr", dest="pr_number", type=int)
+    draft.add_argument("--phase", choices=("alpha", "beta", "rc"))
+    draft.add_argument("--source-sha", "--original-source-sha", dest="source_sha")
+    draft.add_argument("--build-sha")
+    draft.add_argument("--source-snapshot", "--snapshot", dest="source_snapshot")
+    draft.add_argument("--base-sha")
     public = commands.add_parser("verify-public")
     public.add_argument("--record", default=candidate.CANDIDATE_PATH, type=Path)
     public.add_argument("--download-dir", required=True, type=Path)
@@ -189,9 +204,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"wrote {args.out}")
         elif args.command == "candidate" and args.candidate_command == "write":
             validated = candidate.write_record(
+                line=args.line,
+                pr_number=args.pr_number,
+                phase=args.phase,
                 version=args.version,
                 draft_release_id=args.draft_release_id,
                 source_sha=args.source_sha,
+                build_sha=args.build_sha,
+                source_snapshot=args.source_snapshot,
+                base_sha=args.base_sha,
                 build_date=args.build_date,
                 run_id=args.run_id,
                 run_attempt=args.run_attempt,
@@ -224,6 +245,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.download_dir,
                 args.repo,
                 not args.skip_attestations,
+                expected_version=args.version,
+                expected_line=args.line,
+                expected_pr_number=args.pr_number,
+                expected_phase=args.phase,
+                expected_source_sha=args.source_sha,
+                expected_build_sha=args.build_sha,
+                expected_source_snapshot=args.source_snapshot,
+                expected_base_sha=args.base_sha,
             )
             print("staged candidate verified against the draft release")
         elif args.command == "verify-public":

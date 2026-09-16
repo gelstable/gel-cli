@@ -70,6 +70,21 @@ def meaningful_tree(rev: str, repo: Path = Path(".")) -> str:
     return hashlib.sha256("".join(canonical).encode("utf-8")).hexdigest()
 
 
+def assert_snapshot(expected: str, rev: str, repo: Path = Path(".")) -> None:
+    """Require a revision's meaningful source snapshot to match ``expected``."""
+
+    # Accept either natural positional ordering when called by integrations:
+    # ``assert_snapshot(expected, rev)`` is the canonical form, while
+    # ``assert_snapshot(rev, expected)`` remains unambiguous by digest length.
+    if len(expected) == 40 and len(rev) == 64:
+        expected, rev = rev, expected
+    actual = meaningful_tree(rev, repo)
+    if actual != expected:
+        raise SourceDrift(
+            f"{rev} meaningful source snapshot {actual} does not match expected {expected}"
+        )
+
+
 def compare(base_rev: str, head_rev: str, repo: Path = Path(".")) -> list[str]:
     base = tree_entries(base_rev, repo)
     head = tree_entries(head_rev, repo)

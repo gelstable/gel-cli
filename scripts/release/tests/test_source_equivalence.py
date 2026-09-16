@@ -122,6 +122,14 @@ class EquivalenceTests(unittest.TestCase):
             source_equivalence.meaningful_tree(source_change, self.repo),
         )
 
+    def test_snapshot_mismatch_is_rejected(self):
+        with self.assertRaisesRegex(source_equivalence.SourceDrift, "snapshot"):
+            source_equivalence.assert_snapshot("f" * 64, self.base, self.repo)
+
+    def test_snapshot_match_is_accepted(self):
+        expected = source_equivalence.meaningful_tree(self.base, self.repo)
+        source_equivalence.assert_snapshot(expected, self.base, self.repo)
+
 
 if __name__ == "__main__":
     unittest.main()

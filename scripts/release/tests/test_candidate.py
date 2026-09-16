@@ -20,11 +20,20 @@ def _dist(root: Path, version: str) -> tuple[Path, dict[str, int]]:
 
 def _record(root: Path, version: str = "7.11.0") -> tuple[dict, Path]:
     dist, ids = _dist(root, version)
+    phase = "alpha" if "-alpha." in version else None
+    source_sha = "a" * 40
+    build_sha = source_sha if phase is None else "c" * 40
     record = candidate.build_record(
+        line="release/v7.x",
+        pr_number=321,
+        phase=phase,
         version=version,
         tag=f"v{version}",
         draft_release_id=123456789,
-        source_sha="a" * 40,
+        source_sha=source_sha,
+        build_sha=build_sha,
+        source_snapshot="d" * 64,
+        base_sha="b" * 40,
         build_date="2026-09-12T00:00:00+00:00",
         workflow_runs=[{"workflow": "release-candidate.yml", "run_id": 42, "run_attempt": 1}],
         attestation={
@@ -55,12 +64,29 @@ class RecordShapeTests(unittest.TestCase):
     def test_identity_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             record, _ = _record(Path(tmp))
-            self.assertEqual(record["schema_version"], 1)
+            self.assertEqual(record["schema_version"], 2)
+            self.assertEqual(record["line"], "release/v7.x")
+            self.assertEqual(record["pr_number"], 321)
+            self.assertIsNone(record["phase"])
             self.assertEqual(record["tag"], "v7.11.0")
             self.assertEqual(record["draft_release_id"], 123456789)
             self.assertEqual(record["source_sha"], "a" * 40)
+            self.assertEqual(record["build_sha"], "a" * 40)
+            self.assertEqual(record["base_sha"], "b" * 40)
+            self.assertEqual(record["source_snapshot"], "d" * 64)
             self.assertEqual(record["workflow_runs"][0]["run_attempt"], 1)
             self.assertEqual(record["attestation"]["subject_count"], 23)
+
+    def test_valid_preview_shape_uses_derived_build_sha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, _ = _record(Path(tmp), "7.11.0-alpha.1")
+            self.assertEqual(record["schema_version"], 2)
+            self.assertEqual(record["line"], "release/v7.x")
+            self.assertEqual(record["pr_number"], 321)
+            self.assertEqual(record["phase"], "alpha")
+            self.assertEqual(record["source_sha"], "a" * 40)
+            self.assertEqual(record["build_sha"], "c" * 40)
+            self.assertNotIn("gel-candidate.json", {item["name"] for item in record["assets"]})
 
     def test_dump_is_byte_stable_and_newline_terminated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -83,16 +109,78 @@ class RecordShapeTests(unittest.TestCase):
             dist.mkdir()
             with self.assertRaises(candidate.CandidateMismatch):
                 candidate.build_record(
+                    line="release/v7.x",
+                    pr_number=1,
+                    phase=None,
                     version="7.11.0",
                     tag="v7.11.0",
                     draft_release_id=1,
                     source_sha="a" * 40,
+                    build_sha="a" * 40,
+                    source_snapshot="d" * 64,
+                    base_sha="b" * 40,
                     build_date="2026-09-12T00:00:00+00:00",
                     workflow_runs=[],
                     attestation={},
                     dist_dir=dist,
                     asset_ids={},
                 )
+
+    def test_wrong_line_major_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, _ = _record(Path(tmp))
+            record["line"] = "release/v8.x"
+            with self.assertRaises(candidate.CandidateMismatch):
+                candidate.validate_record(record)
+
+    def test_phase_and_version_must_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, _ = _record(Path(tmp))
+            record["phase"] = "alpha"
+            with self.assertRaises(candidate.CandidateMismatch):
+                candidate.validate_record(record)
+
+    def test_preview_build_sha_must_be_derived_from_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, _ = _record(Path(tmp), "7.11.0-alpha.1")
+            record["build_sha"] = record["source_sha"]
+            with self.assertRaises(candidate.CandidateMismatch):
+                candidate.validate_record(record)
+
+    def test_changed_source_snapshot_is_rejected_when_expected_snapshot_is_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, dist = _record(Path(tmp))
+            with self.assertRaises(candidate.CandidateMismatch):
+                candidate.verify_record(record, "7.11.0", dist, expected_source_snapshot="e" * 64)
+
+    def test_duplicate_asset_names_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, _ = _record(Path(tmp))
+            record["assets"][1]["name"] = record["assets"][0]["name"]
+            with self.assertRaises(candidate.CandidateMismatch):
+                candidate.validate_record(record)
+
+    def test_preview_record_asset_name_is_separate_from_digest_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, _ = _record(Path(tmp), "7.11.0-alpha.1")
+            self.assertEqual(candidate.record_asset_name(record), "gel-candidate.json")
+            self.assertNotIn("gel-candidate.json", [item["name"] for item in record["assets"]])
+
+    def test_uploaded_record_readback_preserves_bytes_and_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, _ = _record(Path(tmp), "7.11.0-alpha.1")
+            expected = candidate.dump(record)
+            loaded = candidate.load_bytes(expected)
+            self.assertEqual(candidate.dump(loaded), expected)
+            self.assertEqual(loaded, record)
+
+    def test_uploaded_record_readback_rejects_changed_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, _ = _record(Path(tmp), "7.11.0-alpha.1")
+            path = Path(tmp) / candidate.PREVIEW_RECORD_NAME
+            path.write_bytes(candidate.dump(record) + b" ")
+            with self.assertRaises(candidate.CandidateMismatch):
+                candidate.verify_record_asset(record, path)
 
 
 class VerifyTests(unittest.TestCase):
@@ -176,12 +264,22 @@ class CliTests(unittest.TestCase):
             write_args = [
                 "candidate",
                 "write",
+                "--line",
+                "release/v7.x",
+                "--pr-number",
+                "321",
                 "--version",
                 "7.11.0",
                 "--draft-release-id",
                 "123456789",
                 "--source-sha",
                 "b" * 40,
+                "--build-sha",
+                "b" * 40,
+                "--source-snapshot",
+                "d" * 64,
+                "--base-sha",
+                "a" * 40,
                 "--build-date",
                 "2026-09-12T00:00:00+00:00",
                 "--run-id",

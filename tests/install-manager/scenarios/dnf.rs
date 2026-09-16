@@ -63,7 +63,13 @@ fn rpm_arch() -> Option<&'static str> {
 }
 
 pub fn run() {
-    let privilege = match unix_package::precheck(&["rpmbuild", "rpm"], PackageQuery::Rpm) {
+    let package = std::env::var_os("GEL_E2E_PACKAGE").map(PathBuf::from);
+    let tools: &[&str] = if package.is_some() {
+        &["rpm"]
+    } else {
+        &["rpmbuild", "rpm"]
+    };
+    let privilege = match unix_package::precheck(tools, PackageQuery::Rpm) {
         Ok(privilege) => privilege,
         Err(reason) => {
             eprintln!("skipping: {reason}");
@@ -77,7 +83,7 @@ pub fn run() {
         );
         return;
     };
-    let scenario = DnfScenario::new(privilege, arch).expect("prepare the dnf scenario");
+    let scenario = DnfScenario::new(privilege, arch, package).expect("prepare the dnf scenario");
     scenario::assert_managed(&scenario);
 }
 
@@ -85,16 +91,24 @@ pub struct DnfScenario {
     root: tempfile::TempDir,
     privilege: Privilege,
     arch: &'static str,
+    /// When set by CI, install this exact release `.rpm` instead of building
+    /// a fixture package around the extracted candidate binary.
+    package: Option<PathBuf>,
     /// See the same field on the apt scenario.
     attempted: AtomicBool,
 }
 
 impl DnfScenario {
-    fn new(privilege: Privilege, arch: &'static str) -> anyhow::Result<DnfScenario> {
+    fn new(
+        privilege: Privilege,
+        arch: &'static str,
+        package: Option<PathBuf>,
+    ) -> anyhow::Result<DnfScenario> {
         Ok(DnfScenario {
             root: tempfile::Builder::new().prefix("gel-e2e-dnf-").tempdir()?,
             privilege,
             arch,
+            package,
             attempted: AtomicBool::new(false),
         })
     }
@@ -132,6 +146,25 @@ impl Scenario for DnfScenario {
     }
 
     fn install(&self, source: &Path) -> anyhow::Result<PathBuf> {
+        if let Some(package) = &self.package {
+            anyhow::ensure!(
+                package.is_file(),
+                "configured release package does not exist: {}",
+                package.display(),
+            );
+            self.attempted.store(true, Ordering::SeqCst);
+            scenario::checked(
+                self.privilege.command("rpm").arg("-i").arg(package),
+                "`rpm -i` release package",
+            )?;
+            let installed = unix_package::installed_system_bin()?;
+            anyhow::ensure!(
+                scenario::blake2b_hex(&installed) == scenario::blake2b_hex(source),
+                "the release .rpm installed bytes different from the candidate archive",
+            );
+            return Ok(installed);
+        }
+
         let top = self.root.path().join("rpmbuild");
         for sub in ["SOURCES", "SPECS", "BUILD", "BUILDROOT", "RPMS", "SRPMS"] {
             fs_err::create_dir_all(top.join(sub))?;

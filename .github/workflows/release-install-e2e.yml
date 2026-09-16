@@ -141,6 +141,8 @@ jobs:
           if [[ "$TARGET" == x86_64-unknown-linux-musl ]]; then
             test -s "release-dist/gel_${VERSION}_amd64.deb"
             test -s "release-dist/gel-${VERSION}-1.x86_64.rpm"
+            cp "release-dist/gel_${VERSION}_amd64.deb" dist/
+            cp "release-dist/gel-${VERSION}-1.x86_64.rpm" dist/
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
@@ -206,6 +208,8 @@ jobs:
     name: apt (ubuntu)
     needs: prepare
     runs-on: ubuntu-24.04
+    env:
+      GEL_E2E_PACKAGE: dist/gel_${{ inputs.version }}_amd64.deb
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -223,9 +227,11 @@ jobs:
     needs: prepare
     runs-on: ubuntu-24.04
     container: fedora:41
+    env:
+      GEL_E2E_PACKAGE: dist/gel-${{ inputs.version }}-1.x86_64.rpm
     steps:
       - name: Install container dependencies
-        run: dnf -y install git rpm-build tar
+        run: dnf -y install git rpm tar
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           ref: ${{ inputs.build_sha }}

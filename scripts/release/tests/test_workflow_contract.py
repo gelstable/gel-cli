@@ -80,6 +80,24 @@ class CandidateInputContractTests(unittest.TestCase):
         controller = (WORKFLOWS / "release-controller.yml").read_text()
         assert "gh workflow run release-candidate.yml" in controller
         assert '-f identity="$identity"' in controller
+        assert 'build_sha="$(jq -r \'.build_sha\' "$RUNNER_TEMP/identity.json")"' in controller
+        assert 'git push origin "$build_sha:refs/heads/$candidate_ref"' in controller
+        assert 'jq -c . "$RUNNER_TEMP/identity.json"' in controller
+        assert '--ref "$candidate_ref"' in controller
+
+    def test_dispatch_source_is_bound_to_the_immutable_build_sha(self):
+        workflow = _workflow("release-candidate.yml")
+        identity_text = _run_text(workflow["jobs"]["identity"])
+        assert any(
+            step.get("if") == "github.event_name == 'workflow_dispatch'"
+            for step in _steps(workflow["jobs"]["identity"])
+        )
+        assert 'test "$GITHUB_SHA" = "$BUILD_SHA"' in identity_text
+
+    def test_json_identity_normalization_keeps_the_object(self):
+        identity_text = _run_text(_workflow("release-candidate.yml")["jobs"]["identity"])
+        assert 'if type == "object" then . else error(' in identity_text
+        assert ".build_sha = (.build_sha // .source_sha)" in identity_text
 
 
 class CandidateGraphContractTests(unittest.TestCase):
@@ -139,6 +157,28 @@ class CandidateGraphContractTests(unittest.TestCase):
             "e2e_winget",
         ):
             assert scenario in install_text
+
+    def test_linux_package_scenarios_install_the_release_packages(self):
+        workflow = _workflow("release-install-e2e.yml")
+        prepare_text = _run_text(workflow["jobs"]["prepare"])
+        assert "release-dist/gel_${VERSION}_amd64.deb" in prepare_text
+        assert "release-dist/gel-${VERSION}-1.x86_64.rpm" in prepare_text
+
+        apt = workflow["jobs"]["apt"]
+        dnf = workflow["jobs"]["dnf"]
+        assert ".deb" in str(apt.get("env", {}))
+        assert "GEL_E2E_PACKAGE" in apt.get("env", {})
+        assert ".rpm" in str(dnf.get("env", {}))
+        assert "GEL_E2E_PACKAGE" in dnf.get("env", {})
+
+        scenarios = WORKFLOWS.parents[1] / "tests" / "install-manager" / "scenarios"
+        apt_source = (scenarios / "apt.rs").read_text()
+        dnf_source = (scenarios / "dnf.rs").read_text()
+        for source in (apt_source, dnf_source):
+            assert "GEL_E2E_PACKAGE" in source
+            assert "if let Some(package)" in source
+            assert '.arg("-i")' in source
+            assert ".arg(package)" in source
 
     def test_stage_uploads_exact_inventory_attests_and_reads_api_back(self):
         workflow = _workflow("release-candidate.yml")

@@ -149,7 +149,9 @@ jobs:
           set -euo pipefail
           identity_file="$RUNNER_TEMP/candidate-identity.json"
           if [[ -n "$IDENTITY_JSON" ]]; then
-            printf '%s' "$IDENTITY_JSON" | jq -e 'type == "object"' > "$identity_file"
+            printf '%s' "$IDENTITY_JSON" | jq -e \
+              'if type == "object" then . else error("candidate identity must be an object") end' \
+              > "$identity_file"
             jq '.build_sha = (.build_sha // .source_sha)' "$identity_file" > "$identity_file.tmp"
             mv "$identity_file.tmp" "$identity_file"
           else
@@ -213,6 +215,14 @@ jobs:
               "channel=" + .channel
             ' "$identity_file"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Confirm dispatch ref is the immutable build commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          BUILD_SHA: ${{ steps.identity.outputs.build_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$BUILD_SHA"
 
   plan:
     name: plan immutable candidate

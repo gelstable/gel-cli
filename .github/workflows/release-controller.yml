@@ -285,15 +285,33 @@ jobs:
           mv "$RUNNER_TEMP/identity-with-build.json" "$RUNNER_TEMP/identity.json"
           echo "build_sha=$build_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch immutable candidate staging
+      - name: Create immutable candidate dispatch ref
         if: steps.identity.outputs.identity != ''
+        id: dispatch
         env:
           GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
         run: |
           set -euo pipefail
+          # A workflow_dispatch run's GITHUB_SHA comes from its ref, not from
+          # the checkout ref used by its jobs. Create a ref at the exact build
+          # commit so the signed provenance source identity and every checkout
+          # describe the same immutable bytes.
+          build_sha="$(jq -r '.build_sha' "$RUNNER_TEMP/identity.json")"
+          candidate_ref="gel-release-candidate/$GITHUB_RUN_ID"
+          git push origin "$build_sha:refs/heads/$candidate_ref"
+          echo "candidate_ref=$candidate_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch immutable candidate staging
+        if: steps.identity.outputs.identity != ''
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          DISPATCH_REF: ${{ steps.dispatch.outputs.candidate_ref }}
+        run: |
+          set -euo pipefail
+          candidate_ref="$DISPATCH_REF"
           # The staging workflow checks out this exact build_sha for every job.
           identity="$(jq -c . "$RUNNER_TEMP/identity.json")"
           gh workflow run release-candidate.yml \
             --repo "$GITHUB_REPOSITORY" \
-            --ref "$CONTROLLER_REF" \
+            --ref "$candidate_ref" \
             -f identity="$identity"

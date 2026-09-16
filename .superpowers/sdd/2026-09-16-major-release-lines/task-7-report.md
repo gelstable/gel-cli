@@ -14,7 +14,9 @@ records are pushed to the live PR head only after a final identity check;
 preview records are uploaded as `gel-candidate.json`.
 
 The Task 6 controller dispatch interface was checked and is wired to
-`release-candidate.yml` with `-f identity="$identity"`.
+`release-candidate.yml` with `-f identity="$identity"`. It creates a
+run-scoped branch at the finalized `build_sha` before dispatching, and the
+candidate workflow checks that the dispatch source SHA equals that identity.
 
 ## RED
 
@@ -73,6 +75,8 @@ direnv exec . bash -lc 'PYTHONPATH=. uv run --frozen ruff format --check gel_rel
 - `.github/workflows/release-install-e2e.yml`: reusable native install harness
   and eight required package-manager/direct-install scenarios using candidate
   artifacts.
+- `.github/workflows/release-controller.yml`: immutable dispatch ref creation
+  so workflow provenance and candidate checkouts share `build_sha`.
 - `gel_release/github_release.py`: live PR identity checks, exact draft retry
   matching, and candidate identity serialization.
 - `gel_release/verify_draft.py`: persisted candidate identity verification.
@@ -81,6 +85,9 @@ direnv exec . bash -lc 'PYTHONPATH=. uv run --frozen ruff format --check gel_rel
 - `scripts/release/tests/test_github_release.py`: live identity and draft retry
   boundary tests.
 - `scripts/release/tests/test_verify_draft.py`: candidate record identity tests.
+- `tests/install-manager/scenarios/apt.rs` and
+  `tests/install-manager/scenarios/dnf.rs`: install and verify the actual
+  candidate `.deb` and `.rpm` when supplied by the release workflow.
 - `.superpowers/sdd/2026-09-16-major-release-lines/task-7-report.md`: this
   report.
 
@@ -90,12 +97,70 @@ direnv exec . bash -lc 'PYTHONPATH=. uv run --frozen ruff format --check gel_rel
   Windows runners and were contract-tested locally but not executed in this
   environment.
 - `actions/attest-build-provenance` derives the attestation predicate's source
-  commit from the workflow event's OIDC claims. The Task 6 controller dispatches
-  the candidate workflow with `--ref master`, while candidate jobs deliberately
-  check out the immutable `build_sha`. A live GitHub run should confirm that
-  the resulting attestation source digest matches the record's `build_sha`; if
-  it follows the dispatch ref instead, the workflow needs an attestation input
-  or a controller dispatch adjustment before production use.
+  commit from the workflow event's OIDC claims. The controller now dispatches
+  from a run-scoped branch whose tip is the immutable `build_sha`, and the
+  candidate workflow fails before staging if `GITHUB_SHA` differs. A hosted run
+  is still needed to exercise the GitHub attestation service end to end.
 - `ty check` still reports two pre-existing type errors in `verify_draft.py`
   (the `expected_build_sha` narrowing and phase assignment); no new errors were
   introduced by Task 7.
+
+## Review fix round 1
+
+### RED
+
+The added regression contracts initially reproduced the three blocking gaps:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH=. uv run --frozen pytest scripts/release/tests/test_workflow_contract.py -q'
+..FF..F......                                                            [100%]
+3 failed, 10 passed in 0.15s
+```
+
+The first actionlint run after adding the dispatch ref reported:
+
+```text
+direnv exec . bash -lc 'actionlint .github/workflows/*.yml'
+.github/workflows/release-controller.yml:309:9: shellcheck reported issue in this script: SC2153:info:2:16: Possible misspelling: CANDIDATE_REF may not be assigned. Did you mean candidate_ref?
+```
+
+### GREEN
+
+```text
+direnv exec . bash -lc 'PYTHONPATH=. uv run --frozen pytest scripts/release/tests/test_workflow_contract.py -q'
+..............                                                           [100%]
+14 passed in 0.16s
+```
+
+```text
+direnv exec . bash -lc 'PYTHONPATH=. uv run --frozen pytest scripts/release/tests -q'
+........................................................................ [ 33%]
+........................................................................ [ 66%]
+........................................................................ [100%]
+216 passed in 11.69s
+```
+
+```text
+direnv exec . bash -lc 'cargo test --features install_manager_e2e --test install-manager --no-run'
+Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+```
+
+```text
+direnv exec . bash -lc 'actionlint .github/workflows/*.yml'
+# no output; exit 0
+
+direnv exec . bash -lc 'scripts/ci/check-action-pins.sh .github/workflows'
+# no output; exit 0
+
+direnv exec . bash -lc 'git diff --check'
+# no output; exit 0
+
+direnv exec . bash -lc 'cargo fmt --all -- --check'
+# no output; exit 0
+
+direnv exec . bash -lc 'PYTHONPATH=. uv run --frozen ruff check gel_release/github_release.py gel_release/verify_draft.py scripts/release/tests/test_github_release.py scripts/release/tests/test_verify_draft.py scripts/release/tests/test_workflow_contract.py'
+All checks passed!
+
+direnv exec . bash -lc 'PYTHONPATH=. uv run --frozen ruff format --check gel_release/github_release.py gel_release/verify_draft.py scripts/release/tests/test_github_release.py scripts/release/tests/test_verify_draft.py scripts/release/tests/test_workflow_contract.py'
+5 files already formatted
+```

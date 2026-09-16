@@ -9,7 +9,14 @@ from unittest import mock
 
 import yaml
 
-from gel_release import cli, github_release, release_state, source_equivalence, verify_draft
+from gel_release import (
+    candidate,
+    cli,
+    github_release,
+    release_state,
+    source_equivalence,
+    verify_draft,
+)
 from gel_release.models import CandidateRecord
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -371,9 +378,10 @@ class StableMergeGateTests(unittest.TestCase):
         self.source_sha = self._git("rev-parse", "HEAD")
         self.snapshot = source_equivalence.meaningful_tree(self.source_sha, self.repo)
         self.record = self._record()
+        self.staged_sha = self._stage_record()
         self.live = _live_pr(
             base_sha=self.base_sha,
-            head_sha=self.source_sha,
+            head_sha=self.staged_sha,
             snapshot=self.snapshot,
         )
 
@@ -417,6 +425,44 @@ class StableMergeGateTests(unittest.TestCase):
         value.update(overrides)
         return CandidateRecord.model_validate(value)
 
+    def _stage_record(self) -> str:
+        target = self.repo / "packaging" / "release-candidate.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(candidate.dump(self.record))
+        self._git("add", str(target.relative_to(self.repo)))
+        self._git("commit", "-qm", "stage candidate record")
+        return self._git("rev-parse", "HEAD")
+
+    def _record_successor(self, record_bytes: bytes, *, source_change: bool = False) -> str:
+        self._git("switch", "--detach", self.source_sha)
+        target = self.repo / "packaging" / "release-candidate.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(record_bytes)
+        if source_change:
+            (self.repo / "README.md").write_text("source changed after staging\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "stage candidate record")
+        return self._git("rev-parse", "HEAD")
+
+    def _merge_ref_sha(self) -> str:
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "commit-tree",
+                f"{self.staged_sha}^{{tree}}",
+                "-p",
+                self.staged_sha,
+                "-p",
+                self.base_sha,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            input="prospective merge ref\n",
+        ).stdout.strip()
+
     def _merge_sha(self, *generated: tuple[str, str]) -> str:
         for path, contents in generated:
             target = self.repo / path
@@ -431,12 +477,34 @@ class StableMergeGateTests(unittest.TestCase):
             github_release.check_stable_merge(
                 self.record,
                 live or self.live,
-                merge_sha or self.source_sha,
+                merge_sha or self.staged_sha,
                 self.repo,
             )
 
     def test_current_same_repository_generated_pr_with_verified_draft_is_accepted(self):
         self._check()
+
+    def test_staged_record_successor_and_actual_merge_ref_are_accepted(self):
+        self._check(merge_sha=self._merge_ref_sha())
+
+    def test_staged_record_successor_requires_exact_record_bytes(self):
+        value = self.record.model_dump(mode="json")
+        value["build_date"] = "2026-09-17T00:00:00+00:00"
+        successor = self._record_successor(candidate.dump(value))
+        live = {**self.live, "head": {**self.live["head"], "sha": successor}}
+        with self.assertRaisesRegex(ValueError, "record|bytes"):
+            self._check(live=live, merge_sha=successor)
+
+    def test_staged_record_successor_rejects_source_tree_drift(self):
+        successor = self._record_successor(candidate.dump(self.record), source_change=True)
+        live = {**self.live, "head": {**self.live["head"], "sha": successor}}
+        with self.assertRaisesRegex(ValueError, "source|README|record"):
+            self._check(live=live, merge_sha=successor)
+
+    def test_pre_record_source_head_is_rejected_as_stale(self):
+        live = {**self.live, "head": {**self.live["head"], "sha": self.source_sha}}
+        with self.assertRaisesRegex(ValueError, "source|record"):
+            self._check(live=live, merge_sha=self.source_sha)
 
     def test_generated_metadata_only_merge_tree_is_accepted(self):
         merge_sha = self._merge_sha(

@@ -248,11 +248,34 @@ def check_stable_merge(
         ("PR number", live.number, validated.pr_number),
         ("release line", live.base_ref, validated.line),
         ("base SHA", live.base_sha, validated.base_sha),
-        ("source SHA", live.head_sha, validated.source_sha),
     )
     for name, actual, expected in checks:
         if actual != expected:
             raise ValueError(f"live PR {name} {actual!r} does not match candidate {expected!r}")
+
+    try:
+        expected_record = candidate.dump(validated)
+        if live.head_sha == validated.source_sha:
+            # A retry can find the record already committed by an earlier
+            # staging attempt. It is still required to contain the exact
+            # record bytes before this equality is accepted.
+            source_equivalence.assert_record_present(
+                validated.source_sha,
+                expected_record,
+                repo,
+            )
+        else:
+            # The staging workflow commits the record after recording the
+            # tested source SHA. Require that one record-only successor so a
+            # newer source or an unrelated generated commit cannot pass.
+            source_equivalence.assert_record_successor(
+                validated.source_sha,
+                live.head_sha,
+                expected_record,
+                repo,
+            )
+    except source_equivalence.SourceDrift as error:
+        raise ValueError(f"live PR source SHA check failed: {error}") from error
 
     version_fields = ("prepared_version", "cargo_version", "version")
     head = live_pr.get("head")

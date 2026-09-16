@@ -19,6 +19,7 @@ ALLOWLIST = frozenset(
         "packaging/release-candidate.json",
     }
 )
+RECORD_PATH = "packaging/release-candidate.json"
 
 
 class SourceDrift(ValueError):
@@ -125,3 +126,66 @@ def assert_merge_equivalent(
     """
 
     assert_equivalent(tested_source, merge_revision, repo)
+
+
+def _record_bytes(rev: str, repo: Path) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{rev}:{RECORD_PATH}"],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise SourceDrift(
+            f"{rev} does not contain {RECORD_PATH}: {error.stderr.decode(errors='replace')}"
+        ) from error
+    return completed.stdout
+
+
+def assert_record_present(rev: str, expected_record: bytes, repo: Path = Path(".")) -> None:
+    """Require a revision to contain exactly the staged candidate record."""
+
+    actual = _record_bytes(rev, repo)
+    if actual != expected_record:
+        raise SourceDrift(f"{rev} contains a candidate record with unexpected bytes")
+
+
+def assert_record_successor(
+    tested_source: str,
+    successor: str,
+    expected_record: bytes,
+    repo: Path = Path("."),
+) -> None:
+    """Require ``successor`` to be the single record-only commit after source.
+
+    The release workflow records the candidate after testing ``tested_source``.
+    This check binds the live PR head to that exact staging operation: it must
+    have the tested source as its only parent, change only the candidate record,
+    and contain the exact bytes that were verified.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "--parents", "-n", "1", successor],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise SourceDrift(f"could not inspect candidate successor {successor}: {error}") from error
+    parents = completed.stdout.split()
+    if len(parents) != 2 or parents[1] != tested_source:
+        actual = " ".join(parents[1:]) or "no parent"
+        raise SourceDrift(
+            f"{successor} is not the single record successor of {tested_source}; parents={actual}"
+        )
+
+    base = tree_entries(tested_source, repo)
+    head = tree_entries(successor, repo)
+    changed = [path for path in sorted(set(base) | set(head)) if base.get(path) != head.get(path)]
+    if changed != [RECORD_PATH]:
+        details = ", ".join(changed) if changed else "no paths"
+        raise SourceDrift(
+            f"{successor} changes {details}; expected only {RECORD_PATH} after {tested_source}"
+        )
+    assert_record_present(successor, expected_record, repo)

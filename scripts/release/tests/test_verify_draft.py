@@ -419,6 +419,7 @@ class CandidateReadbackTests(unittest.TestCase):
             download.side_effect = readback
             readback_dir = root / "readback"
             verify_draft.verify(record, readback_dir, verify_attestations_flag=True)
+            verify_draft.verify(record, readback_dir, verify_attestations_flag=True)
 
             self.assertEqual(
                 (readback_dir / candidate.PREVIEW_RECORD_NAME).read_bytes(), payloads[9000]

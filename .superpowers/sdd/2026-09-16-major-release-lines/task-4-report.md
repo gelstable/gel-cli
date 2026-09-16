@@ -85,3 +85,87 @@ Result: 24 files already formatted.
 - Preview record assets are intentionally read back after distribution
   verification and are not included in provenance subjects, because the record
   cannot attest itself without recursive digests.
+
+## Review fix round 1
+
+The review identified two regressions: malformed `--asset-ids` JSON could raise
+an uncaught `TypeError`, and a second preview verification using the same
+download directory treated the already downloaded `gel-candidate.json` as an
+extra distribution. Added focused CLI, candidate inventory, and preview
+readback tests before applying the fixes.
+
+### RED
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_candidate.py scripts/release/tests/test_verify_draft.py scripts/release/tests/test_unified_cli.py -q'
+```
+
+```text
+...................F....F...F..............................F..........   [100%]
+4 failed, 66 passed in 1.08s
+```
+
+The failing tests were the new preview readback inventory test, the new
+unknown-extra preview inventory test, the new CLI malformed asset ID test, and
+the second-run preview verification test.
+
+### GREEN
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_candidate.py scripts/release/tests/test_verify_draft.py scripts/release/tests/test_unified_cli.py -q'
+```
+
+```text
+.......................................................................  [100%]
+71 passed in 1.15s
+```
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests -q'
+```
+
+```text
+........................................................................ [ 46%]
+........................................................................ [ 93%]
+..........                                                               [100%]
+154 passed in 4.94s
+```
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen ruff check gel_release scripts/release/tests'
+```
+
+```text
+All checks passed!
+```
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen ruff format --check gel_release scripts/release/tests'
+```
+
+```text
+24 files already formatted
+```
+
+`git diff --check` completed without output.
+
+### Fix files
+
+- `gel_release/candidate.py`: validate the asset ID JSON as a list of unique
+  `{name, id}` objects and report malformed values as `CandidateMismatch`; let
+  preview verification explicitly ignore only its known readback asset while
+  retaining exact distribution inventory checks.
+- `gel_release/verify_draft.py`: pass the preview record asset name to staged
+  distribution verification.
+- `scripts/release/tests/test_candidate.py`: cover malformed CLI asset IDs and
+  preview inventory filtering while retaining unknown-extra rejection.
+- `scripts/release/tests/test_verify_draft.py`: run preview verification twice
+  against the same directory.
+- `scripts/release/tests/test_unified_cli.py`: exercise malformed asset ID
+  inputs through the unified subprocess CLI and assert no traceback.
+
+### Fix concern
+
+The inventory exception is limited to the exact `gel-candidate.json` name and
+only for preview records. Stable verification and all other unexpected files
+remain errors.

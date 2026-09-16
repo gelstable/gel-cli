@@ -251,6 +251,30 @@ class VerifyTests(unittest.TestCase):
             with self.assertRaises(candidate.CandidateMismatch):
                 candidate.verify_record(record, "7.11.0", dist)
 
+    def test_preview_readback_asset_is_ignored_when_verifying_staged_distributions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, dist = _record(Path(tmp), "7.11.0-alpha.1")
+            (dist / candidate.PREVIEW_RECORD_NAME).write_bytes(candidate.dump(record))
+            candidate.verify_record(
+                record,
+                "7.11.0-alpha.1",
+                dist,
+                record_asset_name=candidate.PREVIEW_RECORD_NAME,
+            )
+
+    def test_unknown_extra_asset_is_still_rejected_with_preview_readback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record, dist = _record(Path(tmp), "7.11.0-alpha.1")
+            (dist / candidate.PREVIEW_RECORD_NAME).write_bytes(candidate.dump(record))
+            (dist / "surprise.bin").write_bytes(b"unexpected")
+            with self.assertRaises(candidate.CandidateMismatch):
+                candidate.verify_record(
+                    record,
+                    "7.11.0-alpha.1",
+                    dist,
+                    record_asset_name=candidate.PREVIEW_RECORD_NAME,
+                )
+
 
 class CliTests(unittest.TestCase):
     def test_cli_write_and_verify(self):
@@ -313,6 +337,55 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 self.assertEqual(cli.main(verify_args), 0)
             self.assertIn("matches", buf.getvalue())
+
+    def test_cli_write_rejects_malformed_asset_ids_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dist, _ = _dist(root, "7.11.0")
+            out_record = root / "release-candidate.json"
+            for malformed in (["name"], None):
+                with self.subTest(malformed=malformed):
+                    asset_ids_path = root / "asset-ids.json"
+                    asset_ids_path.write_text(json.dumps(malformed))
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        result = cli.main(
+                            [
+                                "candidate",
+                                "write",
+                                "--line",
+                                "release/v7.x",
+                                "--pr-number",
+                                "321",
+                                "--version",
+                                "7.11.0",
+                                "--draft-release-id",
+                                "123456789",
+                                "--source-sha",
+                                "b" * 40,
+                                "--build-sha",
+                                "b" * 40,
+                                "--source-snapshot",
+                                "d" * 64,
+                                "--base-sha",
+                                "a" * 40,
+                                "--build-date",
+                                "2026-09-12T00:00:00+00:00",
+                                "--run-id",
+                                "42",
+                                "--run-attempt",
+                                "1",
+                                "--dist-dir",
+                                str(dist),
+                                "--asset-ids",
+                                str(asset_ids_path),
+                                "--out",
+                                str(out_record),
+                            ]
+                        )
+                    self.assertEqual(result, 2)
+                    self.assertIn("validation error", stderr.getvalue().lower())
+                    self.assertNotIn("traceback", stderr.getvalue().lower())
 
 
 if __name__ == "__main__":

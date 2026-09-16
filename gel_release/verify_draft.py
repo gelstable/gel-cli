@@ -381,6 +381,9 @@ def verify(
             version,
             download_dir,
             expected_source_snapshot=expected_source_snapshot,
+            record_asset_name=(
+                candidate.PREVIEW_RECORD_NAME if record["phase"] is not None else None
+            ),
         )
     except candidate.CandidateMismatch as error:
         raise DraftVerificationError(str(error)) from error

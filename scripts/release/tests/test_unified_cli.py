@@ -132,6 +132,52 @@ class CliBoundaryTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("validation", completed.stderr.lower())
 
+    def test_candidate_write_rejects_malformed_asset_ids_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dist = root / "dist"
+            dist.mkdir()
+            asset_ids = root / "asset-ids.json"
+            output = root / "record.json"
+            for malformed in (["name"], None):
+                with self.subTest(malformed=malformed):
+                    asset_ids.write_text(json.dumps(malformed))
+                    completed = self._run(
+                        "candidate",
+                        "write",
+                        "--line",
+                        "release/v1.x",
+                        "--pr-number",
+                        "1",
+                        "--version",
+                        "1.2.3",
+                        "--draft-release-id",
+                        "1",
+                        "--source-sha",
+                        "a" * 40,
+                        "--build-sha",
+                        "a" * 40,
+                        "--source-snapshot",
+                        "d" * 64,
+                        "--base-sha",
+                        "b" * 40,
+                        "--build-date",
+                        "2026-09-12T00:00:00+00:00",
+                        "--run-id",
+                        "1",
+                        "--run-attempt",
+                        "1",
+                        "--dist-dir",
+                        str(dist),
+                        "--asset-ids",
+                        str(asset_ids),
+                        "--out",
+                        str(output),
+                    )
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertIn("validation error", completed.stderr.lower())
+                    self.assertNotIn("traceback", completed.stderr.lower())
+
     def test_candidate_mismatch_is_reported_without_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
             record = Path(tmp) / "record.json"

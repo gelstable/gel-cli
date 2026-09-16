@@ -179,6 +179,7 @@ def verify_record(
     expected_source_snapshot: str | None = None,
     source_snapshot: str | None = None,
     source_revision: str | None = None,
+    record_asset_name: str | None = None,
     repo: Path = Path("."),
 ) -> None:
     if expected_source_snapshot is not None and source_snapshot is not None:
@@ -189,6 +190,11 @@ def verify_record(
     if expected_source_snapshot is None:
         expected_source_snapshot = source_snapshot
     validated = validate_record(record)
+    if record_asset_name is not None:
+        if validated.phase is None or record_asset_name != PREVIEW_RECORD_NAME:
+            raise CandidateMismatch(
+                f"unsupported candidate record asset name {record_asset_name!r}"
+            )
     if source_revision is not None:
         verify_source_snapshot(validated, source_revision, repo)
     record = validated.model_dump(mode="json")
@@ -214,7 +220,9 @@ def verify_record(
         extra = sorted(set(recorded) - set(expected))
         raise CandidateMismatch(f"inventory mismatch; missing={missing} extra={extra}")
 
-    on_disk = sorted(p.name for p in dist_dir.iterdir() if p.is_file())
+    on_disk = sorted(
+        p.name for p in dist_dir.iterdir() if p.is_file() and p.name != record_asset_name
+    )
     if on_disk != expected:
         missing = sorted(set(expected) - set(on_disk))
         extra = sorted(set(on_disk) - set(expected))
@@ -250,7 +258,31 @@ def write_record(
     asset_ids_path: Path,
     out: Path,
 ) -> CandidateRecord:
-    asset_ids = {item["name"]: item["id"] for item in json.loads(asset_ids_path.read_bytes())}
+    try:
+        parsed_asset_ids = json.loads(asset_ids_path.read_bytes())
+    except (OSError, ValueError) as error:
+        raise CandidateMismatch(
+            f"{asset_ids_path} must contain valid JSON asset ID entries: {error}"
+        ) from error
+    if not isinstance(parsed_asset_ids, list):
+        raise CandidateMismatch(f"{asset_ids_path} must contain a JSON list of asset objects")
+
+    asset_ids: dict[str, int] = {}
+    for index, item in enumerate(parsed_asset_ids):
+        if not isinstance(item, Mapping):
+            raise CandidateMismatch(
+                f"{asset_ids_path} asset ID entry {index} must be an object with name and id"
+            )
+        name = item.get("name")
+        asset_id = item.get("id")
+        if not isinstance(name, str) or not name:
+            raise CandidateMismatch(f"{asset_ids_path} asset ID entry {index} has an invalid name")
+        if isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0:
+            raise CandidateMismatch(f"{asset_ids_path} asset ID entry {index} has an invalid id")
+        if name in asset_ids:
+            raise CandidateMismatch(f"{asset_ids_path} contains duplicate asset name {name!r}")
+        asset_ids[name] = asset_id
+
     record = build_record(
         line=line,
         pr_number=pr_number,

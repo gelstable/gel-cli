@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
+import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -23,12 +26,226 @@ from . import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class LinePreparation:
+    """Validated state used to prepare one generated PR for a release line."""
+
+    base_ref: str
+    base_sha: str
+    major: int
+    generated_head: str
+    head_ref: str | None
+    pending: bool
+    prepared_version: str | None
+    pending_files: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "base_ref": self.base_ref,
+            "base_sha": self.base_sha,
+            "major": self.major,
+            "generated_head": self.generated_head,
+            "head_ref": self.head_ref,
+            "pending": self.pending,
+            "prepared_version": self.prepared_version,
+            "pending_files": list(self.pending_files),
+        }
+
+
+def _git(repo: Path, *args: str, optional: bool = False) -> str | None:
+    """Run a read-only Git command in ``repo`` and return its trimmed output."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        if optional:
+            return None
+        detail = (
+            error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+        )
+        raise ValueError(f"git {' '.join(args)} failed in {repo}: {detail}") from error
+    return completed.stdout.strip()
+
+
+def _cargo_version(repo: Path) -> str:
+    cargo_path = repo / "Cargo.toml"
+    try:
+        document = tomllib.loads(cargo_path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"could not read {cargo_path}: {error}") from error
+
+    package = document.get("package")
+    if not isinstance(package, dict):
+        raise ValueError(f"{cargo_path} has no package table")
+    version = package.get("version")
+    if version is True or (isinstance(version, dict) and version.get("workspace") is True):
+        workspace = document.get("workspace")
+        if isinstance(workspace, dict):
+            workspace_package = workspace.get("package")
+            if isinstance(workspace_package, dict):
+                version = workspace_package.get("version")
+    if not isinstance(version, str) or not version:
+        raise ValueError(f"{cargo_path} has no concrete package version")
+    return version
+
+
+def _locked_cargo_version(repo: Path) -> str | None:
+    lock_path = repo / "Cargo.lock"
+    if not lock_path.exists():
+        return None
+    try:
+        document = tomllib.loads(lock_path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"could not read {lock_path}: {error}") from error
+    packages = document.get("package")
+    if not isinstance(packages, list):
+        raise ValueError(f"{lock_path} has no package entries")
+    versions = {
+        package.get("version")
+        for package in packages
+        if isinstance(package, dict) and package.get("name") == "gel-cli"
+    }
+    versions.discard(None)
+    if len(versions) > 1:
+        raise ValueError(f"{lock_path} has ambiguous gel-cli package versions")
+    return next(iter(versions), None)
+
+
+def _pending_change_files(repo: Path) -> tuple[str, ...]:
+    directory = repo / ".changeset"
+    if not directory.is_dir():
+        return ()
+    return tuple(
+        str(path.relative_to(repo)) for path in sorted(directory.glob("*.md")) if path.is_file()
+    )
+
+
+def prepare_line(
+    base_ref: str,
+    repo: Path = Path("."),
+    *,
+    prepared: bool = False,
+    expected_base_sha: str | None = None,
+    head_ref: str | None = None,
+    prepared_version: str | None = None,
+) -> LinePreparation:
+    """Validate release-line state before creating or refreshing its PR.
+
+    The normal invocation runs on the release line before Knope consumes the
+    change files.  ``prepared=True`` is used by the workflow after Knope has
+    created the generated branch and removed those files; it retains the same
+    line and base checks while requiring a concrete prepared version.
+    """
+
+    repo = Path(repo)
+    major = release_state.parse_line(base_ref)
+    generated_head = release_state.expected_head(major)
+    if head_ref is not None and head_ref != generated_head:
+        raise ValueError(
+            f"generated head {head_ref!r} does not match release line {base_ref!r}; "
+            f"expected {generated_head!r}"
+        )
+
+    base_sha = _git(repo, "rev-parse", "--verify", f"{base_ref}^{{commit}}")
+    if base_sha is None:
+        raise ValueError(f"could not resolve release line {base_ref!r}")
+
+    remote_sha = _git(
+        repo,
+        "rev-parse",
+        "--verify",
+        f"refs/remotes/origin/{base_ref}^{{commit}}",
+        optional=True,
+    )
+    if remote_sha is not None and remote_sha != base_sha:
+        raise ValueError(
+            f"stale release line {base_ref!r}: local base {base_sha} does not match "
+            f"origin/{base_ref} at {remote_sha}"
+        )
+
+    head_sha = _git(repo, "rev-parse", "--verify", "HEAD^{commit}")
+    current_ref = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", optional=True)
+    if not prepared:
+        if current_ref is not None and current_ref != base_ref:
+            raise ValueError(
+                f"preparation must start from release line {base_ref!r}; current ref is "
+                f"{current_ref!r}"
+            )
+        if current_ref is None and head_sha != base_sha:
+            raise ValueError(
+                f"detached HEAD {head_sha} does not match release line {base_ref!r} at {base_sha}"
+            )
+    elif current_ref is not None and current_ref != generated_head:
+        raise ValueError(
+            f"prepared release must be on generated head {generated_head!r}; current ref is "
+            f"{current_ref!r}"
+        )
+
+    if expected_base_sha is not None:
+        if re.fullmatch(r"[0-9a-f]{40}", expected_base_sha) is None:
+            raise ValueError(f"invalid expected release-line base SHA {expected_base_sha!r}")
+        if expected_base_sha != base_sha:
+            raise ValueError(
+                f"release line {base_ref!r} moved from expected base {expected_base_sha} "
+                f"to {base_sha}"
+            )
+
+    pending_files = _pending_change_files(repo)
+    cargo_version = (
+        _cargo_version(repo) if (prepared or pending_files or prepared_version) else None
+    )
+    if prepared_version is None:
+        prepared_version = cargo_version
+    elif cargo_version is not None and cargo_version != prepared_version:
+        raise ValueError(
+            f"prepared version {prepared_version!r} does not match Cargo.toml version "
+            f"{cargo_version!r}"
+        )
+    if prepared_version is not None:
+        preview.stable_version(prepared_version, major)
+        locked_version = _locked_cargo_version(repo)
+        if locked_version is not None and locked_version != prepared_version:
+            raise ValueError(
+                f"Cargo.lock gel-cli version {locked_version!r} does not match prepared "
+                f"Cargo.toml version {prepared_version!r}"
+            )
+
+    return LinePreparation(
+        base_ref=base_ref,
+        base_sha=base_sha,
+        major=major,
+        generated_head=generated_head,
+        head_ref=generated_head,
+        pending=bool(pending_files),
+        prepared_version=prepared_version,
+        pending_files=pending_files,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gel-release")
     commands = parser.add_subparsers(dest="command", required=True)
     identity = commands.add_parser("pr-identity")
     identity.add_argument("--pr-json", required=True, type=Path)
     identity.add_argument("--repo", required=True)
+    preparation = commands.add_parser("prepare-line")
+    preparation.add_argument("--base-ref", required=True)
+    preparation.add_argument(
+        "--repo-root", "--repo", dest="repo_root", default=Path("."), type=Path
+    )
+    preparation.add_argument("--prepared", action="store_true")
+    preparation.add_argument(
+        "--expected-base-sha",
+        "--base-sha",
+        dest="expected_base_sha",
+    )
+    preparation.add_argument("--head-ref")
+    preparation.add_argument("--prepared-version")
     matrix = commands.add_parser("matrix")
     matrix.add_argument("kind", choices=("build", "smoke"))
     channel = commands.add_parser("channel")
@@ -169,6 +386,16 @@ def main(argv: list[str] | None = None) -> int:
                 args.repo,
             )
             print(json.dumps(identity.as_dict(), separators=(",", ":"), sort_keys=True))
+        elif args.command == "prepare-line":
+            result = prepare_line(
+                args.base_ref,
+                args.repo_root,
+                prepared=args.prepared,
+                expected_base_sha=args.expected_base_sha,
+                head_ref=args.head_ref,
+                prepared_version=args.prepared_version,
+            )
+            print(json.dumps(result.as_dict(), separators=(",", ":"), sort_keys=True))
         elif args.command == "matrix":
             print(json.dumps(_matrix(args.kind), separators=(",", ":")))
         elif args.command == "channel":

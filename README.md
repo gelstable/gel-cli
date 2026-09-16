@@ -40,6 +40,43 @@ corrupts its record of the install, which is worse than refusing. The background
 version check reports the same instruction when a newer release exists.
 
 
+Release lines
+=============
+
+Gel CLI releases are prepared independently on long-lived `release/vN.x`
+branches. To start a new major line, cut it from `master`, set the intended
+plain starting version in `Cargo.toml` and `Cargo.lock`, and push the branch:
+
+```
+git switch -c release/v8.x master
+# edit Cargo.toml and Cargo.lock to set 8.0.0
+git commit -am "chore: start release/v8.x at 8.0.0"
+git push origin release/v8.x
+```
+
+Each release change on a line needs a `.changeset/*.md` file. Fixes normally
+land on `master` first and are cherry-picked onto the line when needed. A push
+with pending change files runs the line-specific preparation workflow. It
+validates the line's current base and version, prepares one PR from
+`knope/release-vN.x`, and dispatches candidate staging after creating or
+refreshing that PR. A line with no pending change files produces no PR. After a
+release PR merges, the next change on that line creates a new PR; other major
+lines keep their own version and generated head.
+
+Use the same validator locally when diagnosing a preparation run:
+
+```
+gel-release prepare-line --base-ref release/v8.x
+```
+
+The command reports the line base SHA, pending files, generated head, and
+prepared plain version as JSON. A moved line base or a prepared version whose
+major differs from the line stops the workflow before it pushes. If a refresh
+replaces a PR that already has a stable candidate record, preparation starts
+again from the latest line and removes that old record before the branch is
+updated.
+
+
 Development
 ===========
 

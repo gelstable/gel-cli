@@ -97,6 +97,18 @@ class PullRequestIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "PR #42.*closed|state"):
             release_state.validate_pr(_pr(state="closed"), REPOSITORY)
 
+    def test_conflicting_phase_labels_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "phase labels"):
+            release_state.validate_pr(
+                _pr(
+                    labels=[
+                        {"name": "prerelease:alpha"},
+                        {"name": "prerelease:rc"},
+                    ]
+                ),
+                REPOSITORY,
+            )
+
     def test_mismatched_base_repository_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "PR #42.*repository"):
             release_state.validate_pr(_pr(base_repo="someone/gel-cli"), REPOSITORY)
@@ -154,6 +166,39 @@ class CliIdentityTests(unittest.TestCase):
                 "major": 7,
             },
         )
+
+    def test_pr_identity_rejects_conflicting_fetched_phase_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pr.json"
+            path.write_text(
+                json.dumps(
+                    _pr(
+                        labels=[
+                            {"name": "prerelease:alpha"},
+                            {"name": "prerelease:rc"},
+                        ]
+                    )
+                )
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "gel_release.cli",
+                    "pr-identity",
+                    "--pr-json",
+                    str(path),
+                    "--repo",
+                    REPOSITORY,
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("phase labels", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
 
 
 if __name__ == "__main__":

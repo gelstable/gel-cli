@@ -82,6 +82,27 @@ def phase_from_labels(labels: list[str]) -> str | None:
     return _PHASE_LABELS[active[0]] if active else None
 
 
+def _phase_labels(pr: dict, number: int) -> None:
+    raw_labels = pr.get("labels", [])
+    if not isinstance(raw_labels, list):
+        raise ValueError(f"PR #{number} has invalid phase labels")
+
+    labels = []
+    for label in raw_labels:
+        if isinstance(label, str):
+            labels.append(label)
+            continue
+        if isinstance(label, dict) and isinstance(label.get("name"), str):
+            labels.append(label["name"])
+            continue
+        raise ValueError(f"PR #{number} has invalid phase labels")
+
+    try:
+        phase_from_labels(labels)
+    except ValueError as error:
+        raise ValueError(f"PR #{number} has invalid phase labels: {error}") from None
+
+
 def _nested_repo(value: object) -> str | None:
     if not isinstance(value, dict):
         return None
@@ -113,6 +134,7 @@ def validate_pr(pr: dict, repo: str) -> ReleasePr:
     state = pr.get("state")
     if state != "open":
         raise ValueError(f"PR #{number} is not open (state {state!r})")
+    _phase_labels(pr, number)
 
     base = pr.get("base")
     head = pr.get("head")

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Literal
 
 import jsonschema
 
@@ -44,7 +45,7 @@ def _version_details(version: str) -> dict:
     }
 
 
-def release_channel(version: str) -> str:
+def release_channel(version: str) -> Literal["stable", "testing"]:
     details = _version_details(version)
     if not details["prerelease"]:
         return "stable"

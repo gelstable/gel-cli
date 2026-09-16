@@ -16,6 +16,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+README = REPO_ROOT / "README.md"
+BRANCH_PROTECTION = REPO_ROOT / ".github" / "branch-protection.md"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -319,3 +321,62 @@ class StableMergeWorkflowContractTests(unittest.TestCase):
             if "uses:" not in line or "./" in line:
                 continue
             assert re.search(r"uses:\s+[^@\s]+@[0-9a-f]{40}\s+#\s+.+$", line)
+
+
+class ReleaseMigrationDocumentationContractTests(unittest.TestCase):
+    def test_readme_covers_line_migration_and_recovery(self):
+        text = README.read_text()
+        for required in (
+            "release/vN.x",
+            "master",
+            "Cargo.toml",
+            "Cargo.lock",
+            ".changeset/",
+            "cherry-pick",
+            "prerelease:alpha",
+            "prerelease:beta",
+            "prerelease:rc",
+            "retry",
+            "stale draft",
+            "stable merge gate",
+            "Release publish",
+            "latest",
+            "separate snapshot pull request",
+            "published, non-draft",
+            "allowlist",
+            "master-based generated release workflow",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, text)
+
+    def test_readme_keeps_legacy_package_root_and_channel_paths_documented(self):
+        text = README.read_text()
+        for required in (
+            "GEL_PKG_ROOT",
+            "EDGEDB_PKG_ROOT",
+            "https://packages.geldata.com",
+            "nightly",
+            "[registry]",
+            "sources",
+            '"channel": "stable"',
+            '"channel": "testing"',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, text)
+
+    def test_branch_protection_guidance_requires_the_stable_merge_gate_on_each_line(self):
+        self.assertTrue(BRANCH_PROTECTION.is_file())
+        text = BRANCH_PROTECTION.read_text()
+        for required in (
+            "release/v*.x",
+            "stable merge gate",
+            "opened",
+            "synchronize",
+            "reopened",
+            "labeled",
+            "unlabeled",
+            "required status check",
+            "Do not allow bypassing",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, text)

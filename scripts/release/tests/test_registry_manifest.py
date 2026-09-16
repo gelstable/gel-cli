@@ -1,6 +1,7 @@
 import json
 import unittest
 from pathlib import Path
+from typing import Literal, get_type_hints
 
 from gel_release import assets, digests, registry_manifest
 
@@ -115,6 +116,47 @@ class ManifestShapeTests(unittest.TestCase):
             registry_manifest.build_manifest(
                 "7.11.0-dev.4121", "2026-09-12T00:00:00+00:00", _entries("7.11.0-dev.4121")
             )
+
+    def test_release_channel_accepts_only_supported_semver_phases(self):
+        self.assertEqual(
+            get_type_hints(registry_manifest.release_channel)["return"],
+            Literal["stable", "testing"],
+        )
+        for version, expected in (
+            ("7.1.0", "stable"),
+            ("7.1.0+build.123", "stable"),
+            ("7.1.0-alpha.1", "testing"),
+            ("7.1.0-beta.1", "testing"),
+            ("7.1.0-rc.1", "testing"),
+        ):
+            with self.subTest(version=version):
+                self.assertEqual(registry_manifest.release_channel(version), expected)
+
+        for version in (
+            "7.1.0-dev.1",
+            "7.1.0-preview.1",
+            "7.1.0-foo.1",
+            "7.1.0-alpha",
+            "7.1.0-rc.1.2",
+        ):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ValueError, "unsupported release version"):
+                    registry_manifest.release_channel(version)
+
+    def test_testing_manifest_marks_each_index_with_explicit_testing_channel(self):
+        manifest = registry_manifest.build_manifest(
+            "7.1.0-beta.1", "2026-09-12T00:00:00+00:00", _entries("7.1.0-beta.1")
+        )
+        registry_manifest.validate_manifest(manifest)
+        self.assertEqual(
+            {index["channel"] for index in manifest["indexes"]},
+            {"testing"},
+        )
+        # The consumer selects this explicit field; it does not infer a channel
+        # from the package version when a manifest is reviewed or promoted.
+        reviewed = json.loads(registry_manifest.dump(manifest))
+        reviewed["indexes"][0]["channel"] = "stable"
+        registry_manifest.validate_manifest(reviewed)
 
 
 class IsolationTests(unittest.TestCase):

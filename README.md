@@ -44,24 +44,139 @@ Release lines
 =============
 
 Gel CLI releases are prepared independently on long-lived `release/vN.x`
-branches. To start a new major line, cut it from `master`, set the intended
-plain starting version in `Cargo.toml` and `Cargo.lock`, and push the branch:
+branches. Each line has its own version, changelog, generated release pull
+request, and candidate record. A v7 release and a v8 release can therefore be
+prepared at the same time without sharing generated state.
+
+Starting a line
+---------------
+
+To start a major line, cut `release/vN.x` from `master`, set its intended plain
+starting version in both `Cargo.toml` and `Cargo.lock`, and push the branch:
 
 ```
 git switch -c release/v8.x master
-# edit Cargo.toml and Cargo.lock to set 8.0.0
+# edit Cargo.toml and Cargo.lock to set the package to 8.0.0
 git commit -am "chore: start release/v8.x at 8.0.0"
 git push origin release/v8.x
 ```
 
-Each release change on a line needs a `.changeset/*.md` file. Fixes normally
-land on `master` first and are cherry-picked onto the line when needed. A push
-with pending change files runs the line-specific preparation workflow. It
-validates the line's current base and version, prepares one PR from
-`knope/release-vN.x`, and dispatches candidate staging after creating or
-refreshing that PR. A line with no pending change files produces no PR. After a
-release PR merges, the next change on that line creates a new PR; other major
-lines keep their own version and generated head.
+Protect `master` and every active `release/vN.x` branch before accepting
+release changes. The line rule must require the `Release candidate check /
+stable merge gate` status check; the complete configuration is in
+[`.github/branch-protection.md`](.github/branch-protection.md). The gate runs
+again whenever a release PR is opened, synchronized, reopened, labeled, or
+unlabeled, so a preview label cannot leave a stale green stable check.
+
+Day-to-day line releases
+------------------------
+
+Every release change on a line needs a `.changeset/*.md` file. Fixes normally
+land on `master` first and are cherry-picked onto the line when needed:
+
+```
+git switch release/v8.x
+git cherry-pick <master-commit>
+git push origin release/v8.x
+```
+
+The line-specific `Release PR` workflow validates the line's current base and
+version, and prepares one pull request from `knope/release-vN.x`. A line with
+no pending change files produces no release PR. After a release PR merges, the
+next change on that line creates a new PR; other major lines keep their own
+version and generated head.
+
+The controller re-evaluates the live release PR on every label transition.
+An unlabelled PR is a stable candidate. A maintainer can add exactly one of
+`prerelease:alpha`, `prerelease:beta`, or `prerelease:rc` to request a testing
+preview. The first published preview for a phase receives suffix `.1`; a
+retry with the same phase and source snapshot does nothing, while a changed
+phase or source receives the next published suffix. Failed or stale drafts do
+not consume a suffix because only published preview tags advance the counter.
+Use the controller's line/PR retry dispatch after a transient workflow
+failure; it resolves the current labels and source again before staging.
+
+Candidate staging creates the draft release and reads all staged assets back
+through the GitHub API. If a draft is stale, leave published releases and tags
+untouched, refresh the line PR from its current line tip, and retry the same
+line. Preparation removes an old `packaging/release-candidate.json` from the
+refreshed generated branch before replacing it. A draft is reusable only when
+its tag and candidate identity still match; an identity mismatch is a stop for
+maintainer investigation rather than an opportunity to replace bytes.
+
+Stable merge and publication
+----------------------------
+
+Review the version, changelog, candidate record, draft assets, attestations,
+and the `Release candidate check / stable merge gate` result. A phase-labeled
+PR cannot merge because the stable gate requires no active prerelease label. An
+unlabelled current candidate can merge only after the gate has verified the
+prospective merge tree and the existing draft. Merging the release PR is the
+approval to publish.
+
+`Release publish` handles the line push at the actual merge SHA. It rechecks
+the candidate record, draft bytes, source equivalence, and tag identity, then
+publishes the existing draft and creates the stable tag. It never rebuilds,
+uploads, replaces, or moves published assets or tags. A normal backport push
+without a matching newly merged candidate is a no-op. If publication fails,
+retry the same line push after fixing the cause; an existing matching tag and
+published release are successful idempotent states.
+
+GitHub's `latest` flag is selected from the greatest published stable SemVer
+across all major lines, so a v7 patch does not displace a newer v8 stable
+release. Preview releases remain testing releases and never become latest.
+
+Version channels and package ordering
+-------------------------------------
+
+The release version selects the generated manifest channel explicitly:
+
+| Version | Registry channel | GitHub release |
+| --- | --- | --- |
+| `7.1.0` | `stable` | published stable |
+| `7.1.0-alpha.1`, `7.1.0-beta.1`, `7.1.0-rc.1` | `testing` | prerelease |
+
+Only plain SemVer and the `alpha`, `beta`, and `rc` phase prereleases are
+accepted. `-dev.1` and arbitrary suffixes are rejected during candidate
+planning. Every index in `gel-registry.json` carries its `channel` field; the
+registry uses that explicit field when selecting stable or testing entries.
+Linux package metadata rewrites a supported prerelease as
+`7.1.0~alpha.1` (and similarly for beta and rc), which makes it sort below the
+matching `7.1.0` package in both Debian and RPM package managers.
+
+Registry snapshot promotion
+---------------------------
+
+Publishing a GitHub release does not directly change the public registry. The
+registry promotion job discovers only published, non-draft releases from
+`gelstable/gel-cli`, accepts only release tags and assets on the registry
+allowlist, and keeps the manifest's explicit `stable` or `testing` channel.
+It ignores drafts, arbitrary releases, and unsupported version suffixes. The
+job proposes those reviewed entries in a separate snapshot pull request in
+the registry repository. Review and merge that separate snapshot pull request
+to update the public registry; a pinned snapshot URL remains available for
+clients that need a reviewable immutable view. Include releases from every
+active major line when promoting the snapshot.
+
+The client-side `[registry].sources` configuration below can point at a moving
+registry root or a pinned snapshot. The release migration does not change the
+legacy package-root path: with no configured source, the built-in default is
+still `https://packages.geldata.com`, and `GEL_PKG_ROOT` plus the legacy
+`EDGEDB_PKG_ROOT` overrides and the `nightly` channel continue to work.
+
+Retiring the old release workflow
+---------------------------------
+
+Repositories migrating from the old master-based generated release workflow
+must leave it in place while the line workflow is proven. First run the new
+line workflow through an end-to-end candidate: build every target, run the
+install matrix, read the draft assets back through the API, pass the stable
+merge gate, and exercise merge/publish plus registry snapshot promotion for
+one line. Confirm that two active lines keep independent PRs, candidates,
+versions, and changelogs. Only after those checks pass end to end should the
+old master-based generated release workflow and its trigger be retired. Keep
+the line workflows and branch protection rules as the sole release path after
+the cutover.
 
 Use the same validator locally when diagnosing a preparation run:
 
@@ -142,10 +257,18 @@ Manifest documents use `schema_version = 1` and identify each package index with
       "channel": "stable",
       "platform": "x86_64-unknown-linux-gnu",
       "ref": "indexes/stable-x86_64-unknown-linux-gnu.json"
+    },
+    {
+      "channel": "testing",
+      "platform": "x86_64-unknown-linux-gnu",
+      "ref": "indexes/testing-x86_64-unknown-linux-gnu.json"
     }
   ]
 }
 ```
+
+The `testing` entry is selected explicitly by its `channel` field; a client
+does not infer a channel from a package version or an index filename.
 
 Index references may be absolute HTTP(S) or `file://` URLs, root-relative or
 document-relative URLs for HTTP manifests, or paths relative to local manifest

@@ -45,6 +45,45 @@ class CommandTests(unittest.TestCase):
             "7.11.0~rc.1",
         )
 
+    def test_deb_and_rpm_commands_order_every_supported_prerelease_below_stable(self):
+        stable_deb = linux_packages.deb_command(AMD64, "7.1.0", Path("target/completions"))
+        stable_rpm = linux_packages.rpm_command(AMD64, "7.1.0")
+        stable_deb_version = stable_deb[stable_deb.index("--deb-version") + 1]
+        stable_rpm_version = stable_rpm[stable_rpm.index("--set-metadata") + 1]
+        self.assertEqual(stable_deb_version, "7.1.0-1")
+        self.assertEqual(stable_rpm_version, 'version = "7.1.0"')
+
+        for phase in ("alpha", "beta", "rc"):
+            version = f"7.1.0-{phase}.1"
+            with self.subTest(version=version):
+                deb = linux_packages.deb_command(AMD64, version, Path("target/completions"))
+                rpm = linux_packages.rpm_command(AMD64, version)
+                deb_version = deb[deb.index("--deb-version") + 1]
+                rpm_version = rpm[rpm.index("--set-metadata") + 1]
+                self.assertEqual(deb_version, f"7.1.0~{phase}.1-1")
+                self.assertEqual(rpm_version, f'version = "7.1.0~{phase}.1"')
+                # Debian and RPM both define `~` as sorting before the same
+                # version without a prerelease suffix.  Compare the exact
+                # package values after removing each tool's fixed revision
+                # decoration so this test does not rely on Python's lexical
+                # ordering (where `~` sorts after `-`).
+                deb_core, _, deb_revision = deb_version.rpartition("-")
+                stable_core, _, stable_revision = stable_deb_version.rpartition("-")
+                self.assertEqual(deb_revision, stable_revision)
+                self.assertEqual(deb_core.split("~", 1)[0], stable_core)
+                self.assertTrue(deb_core.partition("~")[1])
+
+                rpm_core = rpm_version.removeprefix('version = "').removesuffix('"')
+                stable_rpm_core = stable_rpm_version.removeprefix('version = "').removesuffix('"')
+                self.assertEqual(rpm_core.split("~", 1)[0], stable_rpm_core)
+                self.assertTrue(rpm_core.partition("~")[1])
+
+    def test_package_manager_version_rejects_unsupported_suffixes(self):
+        for version in ("7.1.0-dev.1", "7.1.0-preview.1", "7.1.0-foo.1"):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ValueError, "unsupported release version"):
+                    linux_packages.package_manager_version(version)
+
     def test_prerelease_commands_override_internal_package_versions(self):
         deb = linux_packages.deb_command(AMD64, "7.11.0-rc.1", Path("target/completions"))
         rpm = linux_packages.rpm_command(AMD64, "7.11.0-rc.1")

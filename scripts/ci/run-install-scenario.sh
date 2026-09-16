@@ -2,16 +2,14 @@
 #
 # Run exactly one install-manager e2e scenario and prove that it really ran.
 #
-# The whole point of the install-e2e workflow is that its green ticks mean
+# The whole point of the release install matrix is that its green ticks mean
 # something, and there are two ways a scenario job can pass while testing
 # nothing at all:
 #
 #   1. The package manager is missing, so the scenario prints `skipping:` on
 #      stderr and returns. Every scenario job exists *because* its manager is
 #      present on that runner, so a skip there means the tool went missing and
-#      the job proved nothing. A skip is a failure (except for winget, which is
-#      genuinely absent from the Windows image and is run with
-#      GEL_E2E_ALLOW_SKIP=1).
+#      the job proved nothing. A skip is a failure in this release matrix.
 #   2. The `--exact` filter matches no test — a renamed or mistyped scenario.
 #      libtest exits 0 when a filter selects nothing, so this is a silent green.
 #      The libtest summary line is parsed and exactly one test must have run.
@@ -20,7 +18,7 @@
 #
 # Environment:
 #   GEL_E2E_DIST        directory holding the downloaded binaries (default: dist)
-#   GEL_E2E_ALLOW_SKIP  set to 1 to permit a `skipping:` line (winget only)
+#   GEL_E2E_ALLOW_SKIP  set to 1 to permit a `skipping:` line in other uses
 
 set -euo pipefail
 

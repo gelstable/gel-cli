@@ -91,10 +91,57 @@ direnv exec . bash -lc 'PYTHONPATH= uv run --frozen ruff format gel_release/prev
 
 ## Concerns
 
-The specified `next_preview_version` interface receives
-`already_published` as `(phase, meaningful_tree)` pairs but does not receive
-the current snapshot separately. It therefore treats any matching phase entry
-in the supplied current-identity set as already published; the controller
-must pass entries scoped to the current identity when selecting a version.
-Suffix allocation itself only inspects published tags, so draft failures do not
-create gaps.
+Suffix allocation only inspects published tags, so draft failures do not create
+gaps.
+
+## Review fix round 1
+
+Reviewer finding: the original selector compared only the phase and could
+mistakenly suppress a new source snapshot when an older snapshot had already
+been published. The CLI also loaded published snapshot pairs without supplying
+the current snapshot. The selector now requires `current_snapshot` as its
+fifth argument and compares the exact `(phase, current_snapshot)` pair. The
+CLI requires `--snapshot` (also accepted as `--current-snapshot`) and passes it
+through to the selector.
+
+### Fix RED
+
+Exact command:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_preview.py scripts/release/tests/test_unified_cli.py -q'
+```
+
+Output before the fix:
+
+```text
+9 failed, 13 passed in 2.93s
+```
+
+The failures were the new old/current snapshot tests and CLI `--snapshot`
+coverage: the selector accepted four positional arguments and the CLI did not
+recognize `--snapshot`.
+
+### Fix GREEN
+
+Exact command:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_preview.py scripts/release/tests/test_unified_cli.py -q'
+```
+
+Output:
+
+```text
+22 passed in 3.05s
+```
+
+Additional post-fix release suite:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests -q'
+127 passed in 8.72s
+```
+
+The fix is committed in `23bbf840` (`fix: distinguish published preview
+snapshots`).

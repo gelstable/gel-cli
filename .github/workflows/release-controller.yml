@@ -1,0 +1,299 @@
+name: Release controller
+
+'on':
+  pull_request:
+    types: [labeled, unlabeled, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      line:
+        description: Release line to retry
+        required: true
+        type: string
+      pr:
+        description: Release pull request number to retry
+        required: true
+        type: string
+  repository_dispatch:
+    types: [release-line]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: release-controller-${{ github.event.pull_request.base.ref || inputs.line || github.event.client_payload.base_ref || github.event.client_payload.line || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CONTROLLER_REF: master
+  RUST_VERSION: "1.88"
+  UV_VERSION: "0.11.23"
+
+jobs:
+  resolve:
+    name: resolve and dispatch
+    if: github.repository == 'gelstable/gel-cli'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      issues: read
+      pull-requests: read
+    outputs:
+      identity: ${{ steps.identity.outputs.identity }}
+      version: ${{ steps.identity.outputs.version }}
+      build_sha: ${{ steps.identity.outputs.build_sha }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CONTROLLER_REF }}
+          token: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install release tooling
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
+          uv sync --frozen
+
+      - name: Resolve the requested pull request
+        id: request
+        env:
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          INPUT_PR: ${{ inputs.pr }}
+          EVENT_LINE: ${{ github.event.pull_request.base.ref }}
+          INPUT_LINE: ${{ inputs.line }}
+          DISPATCH_PR: ${{ github.event.client_payload.pr }}
+          DISPATCH_LINE: ${{ github.event.client_payload.base_ref || github.event.client_payload.line }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          pr_number="${EVENT_PR:-${INPUT_PR:-${DISPATCH_PR:-}}}"
+          line="${EVENT_LINE:-${INPUT_LINE:-${DISPATCH_LINE:-}}}"
+          if [[ -z "$pr_number" ]]; then
+            if [[ -z "$line" ]]; then
+              echo "a release line or pull request is required" >&2
+              exit 1
+            fi
+            pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+              --base "$line" --head "knope/release-v${line#release/v}.x" \
+              --json number --limit 2 | jq -r 'if length == 1 then .[0].number else empty end')"
+          fi
+          if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "invalid release pull request number: $pr_number" >&2
+            exit 1
+          fi
+          if [[ -z "$line" ]]; then
+            line="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq '.base.ref')"
+          fi
+          {
+            echo "number=$pr_number"
+            echo "line=$line"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and validate the live pull request
+        id: live
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.request.outputs.number }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/live-pr.json"
+          uv run --frozen gel-release pr-identity \
+            --pr-json "$RUNNER_TEMP/live-pr.json" \
+            --repo "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/pr-identity.json"
+
+      - name: Compute the prepared version and meaningful source snapshot
+        id: source
+        env:
+          PR_NUMBER: ${{ steps.request.outputs.number }}
+        run: |
+          set -euo pipefail
+          source_sha="$(jq -r '.head.sha' "$RUNNER_TEMP/live-pr.json")"
+          head_ref="$(jq -r '.head.ref' "$RUNNER_TEMP/live-pr.json")"
+          git fetch --no-tags origin "refs/heads/${head_ref}:refs/remotes/origin/${head_ref}"
+          source_tree="$RUNNER_TEMP/source-tree"
+          mkdir -p "$source_tree"
+          git archive "$source_sha" | tar -x -C "$source_tree"
+          version="$(cargo metadata --locked --format-version 1 --no-deps \
+            --manifest-path "$source_tree/Cargo.toml" \
+            | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
+          snapshot="$(uv run --frozen gel-release snapshot --rev "$source_sha" --repo .)"
+          jq --arg version "$version" --arg snapshot "$snapshot" \
+            '.prepared_version = $version | .source_snapshot = $snapshot' \
+            "$RUNNER_TEMP/live-pr.json" > "$RUNNER_TEMP/live-pr-enriched.json"
+          {
+            echo "source_sha=$source_sha"
+            echo "version=$version"
+            echo "snapshot=$snapshot"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read published tags and release records
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
+            --jq '.[].ref | sub("^refs/tags/"; "")' \
+            | jq -Rsc 'split("\n") | map(select(length > 0))' > "$RUNNER_TEMP/published-tags.json"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            > "$RUNNER_TEMP/releases.json"
+
+      - name: Read published preview candidate records
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r release_id asset_id; do
+            [[ -n "$release_id" && -n "$asset_id" ]] || continue
+            record="$(gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id")"
+            jq --argjson release_id "$release_id" --argjson record "$record" \
+              'map(if .id == $release_id then .candidate = $record else . end)' \
+              "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/releases-with-records.json"
+            mv "$RUNNER_TEMP/releases-with-records.json" "$RUNNER_TEMP/releases.json"
+          done < <(
+            jq -r '.[] | select(.draft != true) as $release
+              | $release.assets[]? | select(.name == "gel-candidate.json")
+              | [$release.id, .id] | @tsv' "$RUNNER_TEMP/releases.json"
+          )
+
+      - name: Verify the active phase was authorized by a maintainer
+        if: steps.source.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.request.outputs.number }}
+        run: |
+          set -euo pipefail
+          phase="$(jq -r '[.labels[]?.name] | map(select(. == "prerelease:alpha" or . == "prerelease:beta" or . == "prerelease:rc")) | if length == 1 then .[0] | split(":")[1] else empty end' "$RUNNER_TEMP/live-pr-enriched.json")"
+          if [[ -z "$phase" ]]; then
+            exit 0
+          fi
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/timeline" \
+            | jq 'add' > "$RUNNER_TEMP/phase-timeline.json"
+          permissions_file="$RUNNER_TEMP/phase-permissions.json"
+          echo '{}' > "$permissions_file"
+          jq -r '.[].actor | select((.type // "") != "Bot" and ((.login // "") | endswith("[bot]") | not)) | .login // empty' "$RUNNER_TEMP/phase-timeline.json" \
+            | sort -u \
+            | while IFS= read -r actor; do
+                permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$actor/permission" --jq '.permission')"
+                jq --arg actor "$actor" --arg permission "$permission" \
+                  '. + {($actor): $permission}' "$permissions_file" > "$permissions_file.tmp"
+                mv "$permissions_file.tmp" "$permissions_file"
+              done
+          authorized="$(uv run --frozen gel-release phase-authorized \
+            --timeline-json "$RUNNER_TEMP/phase-timeline.json" \
+            --phase "$phase" \
+            --permissions-json "$permissions_file")"
+          if [[ "$authorized" != true ]]; then
+            echo "phase $phase was not added by an authorized maintainer" >&2
+            exit 1
+          fi
+
+      - name: Resolve the immutable candidate identity from live state
+        id: identity
+        run: |
+          set -euo pipefail
+          uv run --frozen gel-release resolve-candidate \
+            --pr-json "$RUNNER_TEMP/live-pr.json" \
+            --live-pr-json "$RUNNER_TEMP/live-pr-enriched.json" \
+            --tags-json "$RUNNER_TEMP/published-tags.json" \
+            --releases-json "$RUNNER_TEMP/releases.json" \
+            --repo "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/identity.json"
+          if [[ ! -s "$RUNNER_TEMP/identity.json" ]]; then
+            echo "the current phase and source snapshot are already published"
+            exit 0
+          fi
+          identity="$(jq -c . "$RUNNER_TEMP/identity.json")"
+          {
+            echo "identity=$identity"
+            echo "version=$(jq -r '.version' "$RUNNER_TEMP/identity.json")"
+            echo "build_sha=$(jq -r '.build_sha' "$RUNNER_TEMP/identity.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Recheck the live pull request before deriving or dispatching
+        if: steps.identity.outputs.identity != ''
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.request.outputs.number }}
+          EXPECTED_BASE_SHA: ${{ fromJSON(steps.identity.outputs.identity).base_sha }}
+          EXPECTED_SOURCE_SHA: ${{ fromJSON(steps.identity.outputs.identity).source_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/live-pr-final.json"
+          uv run --frozen gel-release pr-identity \
+            --pr-json "$RUNNER_TEMP/live-pr-final.json" \
+            --repo "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/pr-identity-final.json"
+          final_base_sha="$(jq -r '.base_sha' "$RUNNER_TEMP/pr-identity-final.json")"
+          final_source_sha="$(jq -r '.head_sha' "$RUNNER_TEMP/pr-identity-final.json")"
+          if [[ "$final_base_sha" != "$EXPECTED_BASE_SHA" || "$final_source_sha" != "$EXPECTED_SOURCE_SHA" ]]; then
+            echo "the release PR changed while the candidate was resolving" >&2
+            exit 1
+          fi
+          expected_phase="$(jq -r '.phase // empty' "$RUNNER_TEMP/identity.json")"
+          final_phase="$(jq -r '[.labels[]?.name] | map(select(. == "prerelease:alpha" or . == "prerelease:beta" or . == "prerelease:rc")) | if length == 1 then .[0] | split(":")[1] else empty end' "$RUNNER_TEMP/live-pr-final.json")"
+          if [[ "$final_phase" != "$expected_phase" ]]; then
+            echo "the release PR phase changed while the candidate was resolving" >&2
+            exit 1
+          fi
+          if [[ -n "$final_phase" ]]; then
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/timeline" \
+              | jq 'add' > "$RUNNER_TEMP/phase-timeline-final.json"
+            permissions_file="$RUNNER_TEMP/phase-permissions-final.json"
+            echo '{}' > "$permissions_file"
+            jq -r '.[].actor | select((.type // "") != "Bot" and ((.login // "") | endswith("[bot]") | not)) | .login // empty' "$RUNNER_TEMP/phase-timeline-final.json" \
+              | sort -u \
+              | while IFS= read -r actor; do
+                  permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$actor/permission" --jq '.permission')"
+                  jq --arg actor "$actor" --arg permission "$permission" \
+                    '. + {($actor): $permission}' "$permissions_file" > "$permissions_file.tmp"
+                  mv "$permissions_file.tmp" "$permissions_file"
+                done
+            authorized="$(uv run --frozen gel-release phase-authorized \
+              --timeline-json "$RUNNER_TEMP/phase-timeline-final.json" \
+              --phase "$final_phase" \
+              --permissions-json "$permissions_file")"
+            if [[ "$authorized" != true ]]; then
+              echo "phase $final_phase is no longer authorized" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Derive and preserve the preview build commit
+        if: steps.identity.outputs.identity != '' && fromJSON(steps.identity.outputs.identity).phase != null
+        id: preview
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          LINE: ${{ fromJSON(steps.identity.outputs.identity).line }}
+          TAG: v${{ fromJSON(steps.identity.outputs.identity).version }}
+          SOURCE_SHA: ${{ fromJSON(steps.identity.outputs.identity).source_sha }}
+        run: |
+          set -euo pipefail
+          build_sha="$(uv run --frozen gel-release derive-preview-commit \
+            --source-sha "$SOURCE_SHA" --version "${TAG#v}" --repo-root .)"
+          preview_line="${LINE//\//-}"
+          preview_ref="refs/heads/gel-preview-build/${preview_line}/${TAG}"
+          git update-ref "$preview_ref" "$build_sha"
+          git push --force origin "$build_sha:$preview_ref"
+          jq --arg build_sha "$build_sha" '.build_sha = $build_sha' \
+            "$RUNNER_TEMP/identity.json" > "$RUNNER_TEMP/identity-with-build.json"
+          mv "$RUNNER_TEMP/identity-with-build.json" "$RUNNER_TEMP/identity.json"
+          echo "build_sha=$build_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch immutable candidate staging
+        if: steps.identity.outputs.identity != ''
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          # The staging workflow checks out this exact build_sha for every job.
+          identity="$(jq -c . "$RUNNER_TEMP/identity.json")"
+          gh workflow run release-candidate.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$CONTROLLER_REF" \
+            -f identity="$identity"

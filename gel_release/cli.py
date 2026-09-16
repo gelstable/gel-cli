@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from . import (
     assets,
     candidate,
+    github_release,
     linux_packages,
     package_target,
     preview,
@@ -404,6 +405,22 @@ def _parser() -> argparse.ArgumentParser:
     sync.add_argument("--head-ref", required=True)
     sync.add_argument("--version", required=True)
     sync.add_argument("--body-file", required=True, type=Path)
+    resolve = commands.add_parser("resolve-candidate")
+    resolve.add_argument("--pr-json", required=True, type=Path)
+    resolve.add_argument("--live-pr-json", required=True, type=Path)
+    resolve.add_argument("--repo", default=assets.REPOSITORY)
+    resolve.add_argument("--tags-json", required=True, type=Path)
+    resolve.add_argument("--releases-json", required=True, type=Path)
+    resolve.add_argument("--prepared-version")
+    resolve.add_argument("--source-snapshot")
+    derive = commands.add_parser("derive-preview-commit")
+    derive.add_argument("--source-sha", required=True)
+    derive.add_argument("--version", required=True)
+    derive.add_argument("--repo-root", "--repo", dest="repo_root", default=Path("."), type=Path)
+    authorize = commands.add_parser("phase-authorized")
+    authorize.add_argument("--timeline-json", required=True, type=Path)
+    authorize.add_argument("--phase", required=True)
+    authorize.add_argument("--permissions-json", required=True, type=Path)
     preparation = commands.add_parser("prepare-line")
     preparation.add_argument("--base-ref", required=True)
     preparation.add_argument(
@@ -548,6 +565,15 @@ def _read_published_snapshots(path: Path) -> set[tuple[str, str]]:
     return result
 
 
+def _read_releases(path: Path) -> list[dict]:
+    value = json.loads(path.read_text())
+    if isinstance(value, dict):
+        value = value.get("releases")
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"{path} must contain a JSON list of release objects")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
@@ -573,6 +599,39 @@ def main(argv: list[str] | None = None) -> int:
                     version=args.version,
                     body_file=args.body_file,
                 )
+            )
+        elif args.command == "resolve-candidate":
+            pr = release_state.validate_pr(json.loads(args.pr_json.read_bytes()), args.repo)
+            live_pr = json.loads(args.live_pr_json.read_bytes())
+            if not isinstance(live_pr, dict):
+                raise ValueError("live PR JSON must be an object")
+            if args.prepared_version is not None:
+                live_pr["prepared_version"] = args.prepared_version
+            if args.source_snapshot is not None:
+                live_pr["source_snapshot"] = args.source_snapshot
+            identity = github_release.resolve_candidate(
+                pr,
+                live_pr,
+                _read_tags(args.tags_json),
+                _read_releases(args.releases_json),
+            )
+            if identity is not None:
+                print(json.dumps(identity.as_dict(), separators=(",", ":"), sort_keys=True))
+        elif args.command == "derive-preview-commit":
+            print(
+                github_release.derive_preview_commit(
+                    args.source_sha,
+                    args.version,
+                    args.repo_root,
+                )
+            )
+        elif args.command == "phase-authorized":
+            timeline = json.loads(args.timeline_json.read_bytes())
+            permissions = json.loads(args.permissions_json.read_bytes())
+            print(
+                "true"
+                if github_release.phase_authorized(timeline, args.phase, permissions)
+                else "false"
             )
         elif args.command == "prepare-line":
             result = prepare_line(

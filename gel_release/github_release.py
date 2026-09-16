@@ -1020,6 +1020,8 @@ def _assert_inline_distribution_bytes(
 def _verify_draft_before_publication(
     record: CandidateRecord,
     expected: CandidateIdentity,
+    *,
+    expected_tag_target: str | None = None,
 ) -> None:
     """Read every draft asset through the authenticated API before publishing."""
 
@@ -1031,6 +1033,7 @@ def _verify_draft_before_publication(
                 assets.REPOSITORY,
                 True,
                 expected_identity=expected.as_dict(),
+                expected_tag_target=expected_tag_target,
             )
         except verify_draft.DraftVerificationError as error:
             raise ValueError(f"draft verification failed: {error}") from error
@@ -1106,27 +1109,10 @@ def _verify_published_asset_bytes(
 
 def _tag_target(
     tag: str,
-    release: Mapping[str, object],
+    _release: Mapping[str, object],
 ) -> str | None:
-    """Return an existing tag commit, with fixture fields taking precedence."""
+    """Resolve the actual GitHub ref target, including annotated tags."""
 
-    for key in ("tag_target", "tag_sha", "target_sha"):
-        if key in release:
-            value = release[key]
-            if value is None:
-                return None
-            if not isinstance(value, str) or _GIT_SHA.fullmatch(value) is None:
-                raise ValueError(f"release tag {tag} has an invalid target {value!r}")
-            return value
-    target_commitish = release.get("target_commitish")
-    if isinstance(target_commitish, str) and _GIT_SHA.fullmatch(target_commitish) is not None:
-        return target_commitish
-    tag_data = release.get("tag")
-    if isinstance(tag_data, Mapping):
-        tag_object = tag_data.get("object")
-        object_sha = tag_object.get("sha") if isinstance(tag_object, Mapping) else None
-        if isinstance(object_sha, str) and _GIT_SHA.fullmatch(object_sha) is not None:
-            return object_sha
     try:
         return verify_draft.resolve_tag_commit(tag, assets.REPOSITORY)
     except verify_draft.DraftVerificationError as error:
@@ -1292,15 +1278,6 @@ def _matching_merge_pr(
         raise ValueError(f"merged PR #{record.pr_number} has incomplete branch identity")
     if base.get("ref") != record.line:
         raise ValueError(f"merged PR #{record.pr_number} base does not match {record.line}")
-    base_sha = base.get("sha")
-    if base_sha is not None:
-        if not isinstance(base_sha, str) or _GIT_SHA.fullmatch(base_sha) is None:
-            raise ValueError(f"merged PR #{record.pr_number} has an invalid base SHA")
-        if base_sha != record.base_sha:
-            raise ValueError(
-                f"merged PR #{record.pr_number} base SHA {base_sha} does not match "
-                f"candidate {record.base_sha}"
-            )
     expected_head = release_state.expected_head(release_state.parse_line(record.line))
     if head.get("ref") != expected_head:
         raise ValueError(f"merged PR #{record.pr_number} head does not match {expected_head}")
@@ -1336,6 +1313,24 @@ def _matching_merge_pr(
     if merged is not True and not merged_pr.get("merge_commit_sha"):
         return False
     return True
+
+
+def _assert_line_push_base(record: CandidateRecord, line_push_sha: str) -> None:
+    """Bind the candidate base to the release-line push's first parent."""
+
+    try:
+        parents = _run_git(Path("."), "rev-list", "--parents", "-n", "1", line_push_sha).split()
+    except ValueError as error:
+        raise ValueError(
+            f"line push {line_push_sha} has no inspectable merge topology: {error}"
+        ) from error
+    if len(parents) < 2:
+        raise ValueError(f"line push {line_push_sha} has no first parent")
+    if parents[1] != record.base_sha:
+        raise ValueError(
+            f"line push {line_push_sha} first parent {parents[1]} does not match "
+            f"candidate base {record.base_sha}"
+        )
 
 
 def _assert_record_introduced(
@@ -1486,6 +1481,7 @@ def publish_stable(
             "rejection=no merge-matching candidate record"
         )
         return
+    _assert_line_push_base(validated, line_push_sha)
     _assert_record_introduced(validated, line_push_sha, release)
     _assert_merge_source(validated, line_push_sha, release)
     draft = _assert_release_shape(release, expected, validated, allow_published=True)
@@ -1505,7 +1501,11 @@ def publish_stable(
         )
         return
 
-    _verify_draft_before_publication(validated, expected)
+    _verify_draft_before_publication(
+        validated,
+        expected,
+        expected_tag_target=line_push_sha,
+    )
     _ensure_tag(validated.tag, line_push_sha, release)
     make_latest = should_make_latest(validated.version, _published_stable_versions(release))
     _publish_release(validated, prerelease=False, make_latest=make_latest)

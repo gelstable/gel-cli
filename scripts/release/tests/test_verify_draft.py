@@ -320,6 +320,19 @@ class ReleaseIdentityTests(unittest.TestCase):
         }
         self.assertEqual(verify_draft.check_release_identity(release, record), "c" * 40)
 
+    @mock.patch(
+        "gel_release.verify_draft._gh_json",
+        return_value={"object": {"type": "commit", "sha": "c" * 40}},
+    )
+    def test_expected_tag_target_accepts_stable_merge_sha(self, gh_json):
+        resolved = verify_draft.check_release_identity(
+            self.RELEASE,
+            self.RECORD,
+            expected_build_sha="c" * 40,
+        )
+        self.assertEqual(resolved, "c" * 40)
+        gh_json.assert_called_once_with("api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0")
+
     def test_candidate_identity_matches_all_immutable_fields(self):
         expected = {
             "line": self.RECORD["line"],

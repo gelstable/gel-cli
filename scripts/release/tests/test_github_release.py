@@ -679,6 +679,16 @@ class PreviewCommitTests(unittest.TestCase):
 class PublicationTests(unittest.TestCase):
     """Publication rechecks reviewed identity before changing GitHub state."""
 
+    def setUp(self):
+        # The publication fixtures use synthetic SHAs. Individual topology
+        # tests stop this adapter and exercise the real first-parent check.
+        self._topology = mock.patch.object(github_release, "_assert_line_push_base")
+        self._topology.start()
+        self.addCleanup(self._topology.stop)
+        self._tag_lookup = mock.patch.object(verify_draft, "resolve_tag_commit", return_value=None)
+        self._tag_lookup.start()
+        self.addCleanup(self._tag_lookup.stop)
+
     def _preview_identity(self) -> dict[str, object]:
         return {
             "line": BASE_REF,
@@ -828,16 +838,20 @@ class PublicationTests(unittest.TestCase):
         identity = self._preview_identity()
         record = self._record(identity)
         release = self._release(identity, record, draft=False, tag_target=identity["build_sha"])
-        with mock.patch.object(github_release, "_gh_mutate") as mutate:
-            github_release.publish_preview(identity, record, self._preview_pr(), release)
+        with mock.patch.object(
+            verify_draft, "resolve_tag_commit", return_value=identity["build_sha"]
+        ):
+            with mock.patch.object(github_release, "_gh_mutate") as mutate:
+                github_release.publish_preview(identity, record, self._preview_pr(), release)
             mutate.assert_not_called()
 
     def test_preview_rejects_immutable_mismatched_existing_tag(self):
         identity = self._preview_identity()
         record = self._record(identity)
         release = self._release(identity, record, tag_target="e" * 40)
-        with self.assertRaisesRegex(ValueError, "tag|commit|target"):
-            github_release.publish_preview(identity, record, self._preview_pr(), release)
+        with mock.patch.object(verify_draft, "resolve_tag_commit", return_value="e" * 40):
+            with self.assertRaisesRegex(ValueError, "tag|commit|target"):
+                github_release.publish_preview(identity, record, self._preview_pr(), release)
 
     def test_preview_rejects_changed_inline_distribution_bytes(self):
         identity = self._preview_identity()
@@ -888,16 +902,52 @@ class PublicationTests(unittest.TestCase):
         record = self._record(identity)
         release = self._stable_release(record)
         release["tag_target"] = "f" * 40
-        with self.assertRaisesRegex(ValueError, "tag|target|commit"):
-            github_release.publish_stable(record, "e" * 40, release)
+        with mock.patch.object(verify_draft, "resolve_tag_commit", return_value="f" * 40):
+            with self.assertRaisesRegex(ValueError, "tag|target|commit"):
+                github_release.publish_stable(record, "e" * 40, release)
+
+    def test_stable_uses_merge_first_parent_for_recorded_base(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        # GitHub's merged PR payload can report the current release-line tip,
+        # which may be the merge itself or a later push. The immutable base is
+        # the first parent of the pushed merge commit.
+        release["merged_pr"]["base"]["sha"] = "e" * 40
+        self._topology.stop()
+        with mock.patch.object(github_release, "_run_git", return_value=f"{'e' * 40} {BASE_SHA}"):
+            with mock.patch.object(github_release, "_gh_mutate"):
+                with mock.patch.object(verify_draft, "verify"):
+                    github_release.publish_stable(record, "e" * 40, release)
+
+    def test_stable_draft_verification_accepts_actual_merge_tag_target(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        with mock.patch.object(github_release, "_gh_mutate"):
+            with mock.patch.object(verify_draft, "verify") as verify:
+                github_release.publish_stable(record, "e" * 40, release)
+        self.assertEqual(verify.call_args.kwargs.get("expected_tag_target"), "e" * 40)
+
+    def test_tag_target_resolves_the_actual_ref_when_release_has_sha_metadata(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        release["target_commitish"] = "f" * 40
+        release["tag"] = {"object": {"type": "commit", "sha": "f" * 40}}
+        with mock.patch.object(verify_draft, "resolve_tag_commit", return_value=None) as resolve:
+            self.assertIsNone(github_release._tag_target(record.tag, release))
+        resolve.assert_called_once_with(record.tag, REPOSITORY)
 
     def test_stable_rejects_moved_merge_base(self):
         identity = self._stable_identity()
         record = self._record(identity)
         release = self._stable_release(record)
         release["merged_pr"]["base"]["sha"] = "f" * 40
-        with self.assertRaisesRegex(ValueError, "base|candidate"):
-            github_release.publish_stable(record, "e" * 40, release)
+        self._topology.stop()
+        with mock.patch.object(github_release, "_run_git", return_value=f"{'e' * 40} {'f' * 40}"):
+            with self.assertRaisesRegex(ValueError, "base|candidate"):
+                github_release.publish_stable(record, "e" * 40, release)
 
     def test_stable_rejects_changed_draft_bytes(self):
         identity = self._stable_identity()
@@ -915,8 +965,9 @@ class PublicationTests(unittest.TestCase):
         identity = self._stable_identity()
         record = self._record(identity)
         release = self._stable_release(record, draft=False)
-        with mock.patch.object(github_release, "_gh_mutate") as mutate:
-            github_release.publish_stable(record, "e" * 40, release)
+        with mock.patch.object(verify_draft, "resolve_tag_commit", return_value="e" * 40):
+            with mock.patch.object(github_release, "_gh_mutate") as mutate:
+                github_release.publish_stable(record, "e" * 40, release)
             mutate.assert_not_called()
 
     def test_latest_uses_numeric_semver_across_release_lines(self):

@@ -278,6 +278,8 @@ def check_release_identity(
     release: dict,
     record: Mapping[str, object] | CandidateRecord,
     repo: str = assets.REPOSITORY,
+    *,
+    expected_build_sha: str | None = None,
 ) -> str | None:
     if isinstance(record, CandidateRecord):
         record = record.model_dump(mode="json")
@@ -312,7 +314,10 @@ def check_release_identity(
         )
 
     resolved = resolve_tag_commit(expected_tag, repo)
-    expected_build_sha = record.get("build_sha", record["source_sha"])
+    if expected_build_sha is None:
+        expected_build_sha = record.get("build_sha", record["source_sha"])
+    if not isinstance(expected_build_sha, str):
+        raise DraftVerificationError("expected tag target SHA is invalid")
     if resolved is not None and resolved.lower() != expected_build_sha.lower():
         raise DraftVerificationError(
             f"tag {expected_tag} resolves to {resolved}, expected candidate build/source "
@@ -456,6 +461,7 @@ def verify(
     expected_source_sha: str | None = None,
     expected_build_sha: str | None = None,
     expected_base_sha: str | None = None,
+    expected_tag_target: str | None = None,
     source_snapshot: str | None = None,
     expected_identity: Mapping[str, object] | None = None,
 ) -> None:
@@ -486,7 +492,12 @@ def verify(
         check_candidate_identity(record, expected_identity)
     version = record["version"]
     release = get_release(str(record["draft_release_id"]), repo)
-    tag_commit = check_release_identity(release, record, repo)
+    tag_commit = check_release_identity(
+        release,
+        record,
+        repo,
+        expected_build_sha=expected_tag_target,
+    )
     if tag_commit is None and not verify_attestations_flag:
         raise DraftVerificationError(
             f"tag {record['tag']} is not created; source cannot be checked with "

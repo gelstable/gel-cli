@@ -6,7 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 from gel_release import cli, release_state
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _git(repo: Path, *argv: str) -> str:
@@ -204,6 +208,130 @@ class PrepareLineCliTests(unittest.TestCase):
     def test_line_parser_still_rejects_master_before_preparation(self):
         with self.assertRaisesRegex(ValueError, "master"):
             release_state.parse_line("master")
+
+
+class ReleasePrWorkflowTests(unittest.TestCase):
+    def test_live_line_is_refetched_after_knope_before_prepared_validation(self):
+        workflow = yaml.safe_load(
+            (REPO_ROOT / ".github" / "workflows" / "release-pr.yml").read_text()
+        )
+        steps = workflow["jobs"]["prepare"]["steps"]
+        preparation = next(
+            step for step in steps if step.get("name") == "Prepare the line-specific release branch"
+        )
+        run = preparation["run"]
+        base_fetch = (
+            'git fetch --no-tags origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"'
+        )
+        fetches = [index for index in range(len(run)) if run.startswith(base_fetch, index)]
+        self.assertGreaterEqual(
+            len(fetches),
+            2,
+            "the line must be fetched again after preparation to avoid a stale push",
+        )
+        post_fetch = fetches[-1]
+        knope = run.index("knope prepare-release")
+        post_validation = run.index("uv run --frozen gel-release prepare-line")
+        self.assertLess(knope, post_fetch)
+        self.assertLess(post_fetch, post_validation)
+
+        push = next(
+            step for step in steps if step.get("name") == "Push the prepared release branch"
+        )
+        self.assertIn("git fetch --no-tags origin", push["run"])
+        self.assertIn("live_base_sha", push["run"])
+        self.assertIn('live_base_sha" != "$BASE_SHA"', push["run"])
+
+    def test_pr_operation_creates_after_previous_pr_is_merged(self):
+        create = cli.release_pr_operation(
+            [],
+            base_ref="release/v7.x",
+            head_ref="knope/release-v7.x",
+        )
+        self.assertEqual(create.operation, "create")
+        self.assertIsNone(create.number)
+
+        refresh = cli.release_pr_operation(
+            [
+                {
+                    "number": 101,
+                    "baseRefName": "release/v7.x",
+                    "headRefName": "knope/release-v7.x",
+                }
+            ],
+            base_ref="release/v7.x",
+            head_ref="knope/release-v7.x",
+        )
+        self.assertEqual(refresh.operation, "refresh")
+        self.assertEqual(refresh.number, 101)
+
+        # A merged PR is no longer returned by `gh pr list --state open`, so
+        # the next release must select create again for the same line/head.
+        next_release = cli.release_pr_operation(
+            [],
+            base_ref="release/v7.x",
+            head_ref="knope/release-v7.x",
+        )
+        self.assertEqual(next_release.operation, "create")
+
+    def test_pr_operation_rejects_ambiguous_open_prs(self):
+        with self.assertRaisesRegex(ValueError, "more than one"):
+            cli.release_pr_operation(
+                [
+                    {"number": 101},
+                    {"number": 102},
+                ],
+                base_ref="release/v7.x",
+                head_ref="knope/release-v7.x",
+            )
+
+    def test_pr_operation_cli_is_the_workflow_create_refresh_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prs = Path(tmp) / "open-prs.json"
+            prs.write_text(
+                json.dumps(
+                    [
+                        {
+                            "number": 101,
+                            "baseRefName": "release/v7.x",
+                            "headRefName": "knope/release-v7.x",
+                        }
+                    ]
+                )
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = cli.main(
+                    [
+                        "pr-operation",
+                        "--pr-json",
+                        str(prs),
+                        "--base-ref",
+                        "release/v7.x",
+                        "--head-ref",
+                        "knope/release-v7.x",
+                    ]
+                )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue()), {"operation": "refresh", "number": 101})
+
+    def test_workflow_uses_live_pr_list_for_create_or_refresh(self):
+        workflow = yaml.safe_load(
+            (REPO_ROOT / ".github" / "workflows" / "release-pr.yml").read_text()
+        )
+        steps = workflow["jobs"]["prepare"]["steps"]
+        pr_step = next(
+            step
+            for step in steps
+            if step.get("name") == "Create or refresh the release pull request"
+        )
+        run = pr_step["run"]
+        self.assertIn("gh pr list", run)
+        self.assertIn("--state open", run)
+        self.assertIn("gel-release pr-operation", run)
+        self.assertIn("gh pr create", run)
+        self.assertIn("gh pr edit", run)
 
 
 if __name__ == "__main__":

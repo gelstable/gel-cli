@@ -52,6 +52,71 @@ class LinePreparation:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ReleasePrOperation:
+    """The create or refresh operation selected for a line's open PRs."""
+
+    operation: str
+    number: int | None
+
+    def as_dict(self) -> dict[str, int | str | None]:
+        return {"operation": self.operation, "number": self.number}
+
+
+def release_pr_operation(
+    open_prs: list[dict[str, object]], *, base_ref: str, head_ref: str
+) -> ReleasePrOperation:
+    """Choose whether the line workflow creates or refreshes its release PR.
+
+    The input is the complete JSON list returned by ``gh pr list`` after it
+    has been filtered by the exact base and head refs.  Requiring at most one
+    matching open PR prevents a race or an ambiguous stale PR from selecting
+    the wrong candidate.
+    """
+
+    major = release_state.parse_line(base_ref)
+    expected_head = release_state.expected_head(major)
+    if head_ref != expected_head:
+        raise ValueError(
+            f"generated head {head_ref!r} does not match release line {base_ref!r}; "
+            f"expected {expected_head!r}"
+        )
+    if not isinstance(open_prs, list):
+        raise ValueError("open release PRs must be a JSON list")
+
+    numbers: list[int] = []
+    for index, pr in enumerate(open_prs):
+        if not isinstance(pr, dict):
+            raise ValueError(f"open release PR entry {index} is not an object")
+        number = pr.get("number")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise ValueError(f"open release PR entry {index} has invalid number {number!r}")
+        state = pr.get("state")
+        if state is not None and state != "OPEN" and state != "open":
+            raise ValueError(f"open release PR #{number} has state {state!r}")
+        listed_base = pr.get("baseRefName")
+        listed_head = pr.get("headRefName")
+        if isinstance(pr.get("base"), dict):
+            listed_base = listed_base or pr["base"].get("ref")
+        if isinstance(pr.get("head"), dict):
+            listed_head = listed_head or pr["head"].get("ref")
+        if listed_base is not None and listed_base != base_ref:
+            raise ValueError(
+                f"open release PR #{number} has base {listed_base!r}, expected {base_ref!r}"
+            )
+        if listed_head is not None and listed_head != head_ref:
+            raise ValueError(
+                f"open release PR #{number} has head {listed_head!r}, expected {head_ref!r}"
+            )
+        numbers.append(number)
+
+    if len(numbers) > 1:
+        raise ValueError(f"more than one open release PR exists for {base_ref!r} -> {head_ref!r}")
+    if not numbers:
+        return ReleasePrOperation(operation="create", number=None)
+    return ReleasePrOperation(operation="refresh", number=numbers[0])
+
+
 def _git(repo: Path, *args: str, optional: bool = False) -> str | None:
     """Run a read-only Git command in ``repo`` and return its trimmed output."""
 
@@ -233,6 +298,10 @@ def _parser() -> argparse.ArgumentParser:
     identity = commands.add_parser("pr-identity")
     identity.add_argument("--pr-json", required=True, type=Path)
     identity.add_argument("--repo", required=True)
+    operation = commands.add_parser("pr-operation")
+    operation.add_argument("--pr-json", required=True, type=Path)
+    operation.add_argument("--base-ref", required=True)
+    operation.add_argument("--head-ref", required=True)
     preparation = commands.add_parser("prepare-line")
     preparation.add_argument("--base-ref", required=True)
     preparation.add_argument(
@@ -386,6 +455,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.repo,
             )
             print(json.dumps(identity.as_dict(), separators=(",", ":"), sort_keys=True))
+        elif args.command == "pr-operation":
+            operation = release_pr_operation(
+                json.loads(args.pr_json.read_bytes()),
+                base_ref=args.base_ref,
+                head_ref=args.head_ref,
+            )
+            print(json.dumps(operation.as_dict(), separators=(",", ":"), sort_keys=True))
         elif args.command == "prepare-line":
             result = prepare_line(
                 args.base_ref,

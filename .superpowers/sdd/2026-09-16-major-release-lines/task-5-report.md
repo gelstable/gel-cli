@@ -95,3 +95,66 @@ changeset, without touching the worktree.
 - The controller is dispatched at `master` through `CONTROLLER_REF`; this keeps
   the controller workflow available even when a release line was cut before
   that workflow was added.
+
+## Review fix round 1
+
+The review identified two gaps and both are fixed in this round:
+
+- The preparation step now fetches `origin/$BASE_REF` again immediately after
+  `knope prepare-release` and before post-preparation validation. The push step
+  fetches the line a final time and compares its live SHA with the captured
+  base SHA before updating the generated head. A line that moves during
+  preparation therefore stops before the branch push, and the controller still
+  receives the line and PR identity only after fresh PR API validation.
+- Open PR selection is now a real CLI boundary. `pr-operation` consumes the
+  exact `gh pr list --state open` JSON, rejects ambiguous or mismatched rows,
+  chooses `refresh` for one matching PR, and chooses `create` for an empty list.
+  Tests exercise the empty list after a simulated merge, refresh, duplicate
+  rejection, and the workflow's create/edit integration points.
+
+### Fix RED
+
+The live-fetch regression test failed before the workflow change:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_release_pr.py::ReleasePrWorkflowTests -q'
+1 failed, 2 passed
+```
+
+The PR-operation tests then failed before the selector and CLI were added:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_release_pr.py::ReleasePrWorkflowTests -q'
+2 failed, 1 passed
+```
+
+### Fix GREEN
+
+The complete focused preparation suite passed:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests/test_release_pr.py -q'
+................                                                         [100%]
+16 passed in 4.93s
+```
+
+The full release suite and all required workflow/configuration checks passed:
+
+```text
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen pytest scripts/release/tests -q'
+170 passed in 9.83s
+
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen ruff check gel_release scripts/release/tests'
+All checks passed!
+
+direnv exec . bash -lc 'PYTHONPATH= uv run --frozen ruff format --check gel_release scripts/release/tests'
+25 files already formatted
+
+direnv exec . bash -lc 'actionlint .github/workflows/release-pr.yml'
+direnv exec . bash -lc 'scripts/ci/check-action-pins.sh .github/workflows/release-pr.yml'
+direnv exec . bash -lc 'knope --version'
+knope 0.23.0
+
+direnv exec . bash -lc 'knope --validate'
+direnv exec . bash -lc 'git diff --check'
+```

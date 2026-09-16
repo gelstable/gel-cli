@@ -58,10 +58,14 @@
             cargo_dist_wrapper
             pkgs.gh
             pkgs.jq
-            pkgs.python3
+            (pkgs.python3.withPackages (ps: [ ps.jsonschema ]))
             pkgs.ripgrep
             pkgs.shellcheck
             pkgs.zstd
+            (assert tooling_pkgs.cargo-deb.version == "3.7.0";
+              if pkgs.stdenv.isDarwin
+              then tooling_pkgs.cargo-deb.overrideAttrs (_: { doCheck = false; })
+              else tooling_pkgs.cargo-deb)
           ] ++ pkgs.lib.optional (builtins.hasAttr "powershell" pkgs) pkgs.powershell;
           rust_toolchain = fenix_pkgs.toolchainOf {
             channel = "1.88";

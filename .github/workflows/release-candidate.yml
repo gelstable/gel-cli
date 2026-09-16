@@ -1,0 +1,368 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.88"
+  CARGO_INCREMENTAL: "0"
+  CARGO_DEB_VERSION: "3.7.0"
+  CARGO_GENERATE_RPM_VERSION: "0.21.0"
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+      build_date: ${{ steps.identity.outputs.build_date }}
+      build_matrix: ${{ steps.matrix.outputs.build }}
+      smoke_matrix: ${{ steps.matrix.outputs.smoke }}
+    steps:
+      - name: Refuse any branch but the release branch
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" != "refs/heads/knope/release" ]]; then
+            echo "Staging only runs on knope/release, got ${{ github.ref }}" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Resolve candidate identity
+        id: identity
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
+          tag="v$version"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists; a released version cannot be re-staged" >&2
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "source_sha=$GITHUB_SHA"
+            echo "build_date=$(git show -s --format=%cI "$GITHUB_SHA")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Derive target matrices
+        id: matrix
+        run: |
+          echo "build=$(uv run --frozen gel-release matrix build)" >> "$GITHUB_OUTPUT"
+          echo "smoke=$(uv run --frozen gel-release matrix smoke)" >> "$GITHUB_OUTPUT"
+
+  completions:
+    name: completions
+    needs: plan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Generate shell completions once for every target
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin gel
+          uv run --frozen gel-release completions --binary target/debug/gel --out-dir target/completions
+          ls -l target/completions
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: completions
+          path: target/completions
+          if-no-files-found: error
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [plan, completions]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install zstd
+        if: startsWith(matrix.runner, 'windows')
+        run: choco install zstandard --no-progress -y
+        shell: pwsh
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: completions
+          path: target/completions
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --bin gel --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/gel"
+          if [[ -f "$binary.exe" ]]; then binary="$binary.exe"; fi
+          uv run --frozen gel-release package-target \
+            --target "${{ matrix.target }}" \
+            --version "${{ needs.plan.outputs.version }}" \
+            --binary "$binary" \
+            --completions-dir target/completions \
+            --out-dir dist
+
+      - name: Install Linux packaging tools
+        if: matrix.linux_packages
+        run: |
+          set -euo pipefail
+          cargo install --locked --version "$CARGO_DEB_VERSION" cargo-deb
+          cargo install --locked --version "$CARGO_GENERATE_RPM_VERSION" cargo-generate-rpm
+
+      - name: Build Linux packages
+        if: matrix.linux_packages
+        run: |
+          set -euo pipefail
+          uv run --frozen gel-release linux-packages \
+            --target "${{ matrix.target }}" \
+            --version "${{ needs.plan.outputs.version }}" \
+            --completions-dir target/completions \
+            --out-dir dist
+          test -z "$(git status --porcelain Cargo.toml)"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  stage:
+    name: stage
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      draft_release_id: ${{ steps.draft.outputs.draft_release_id }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Generate the registry manifest and digest manifests
+        run: |
+          set -euo pipefail
+          uv run --frozen gel-release assemble-stage --version "${{ needs.plan.outputs.version }}" --build-date "${{ needs.plan.outputs.build_date }}" --dist-dir dist
+
+      - name: Assert every archive has the expected layout
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.gz; do
+            tar -tzf "$archive" | grep -qE '/gel$'
+            tar -tzf "$archive" | grep -q '/completions/gel.bash$'
+          done
+          for archive in dist/*.zip; do
+            unzip -Z1 "$archive" | grep -q '/gel.exe$'
+            unzip -Z1 "$archive" | grep -q '/completions/gel.ps1$'
+          done
+
+      - name: Create or refresh the draft release
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # The draft is the authoritative candidate store. Creating it must not
+          # create a tag: --draft leaves tag_name unresolved until publication.
+          existing="$(gh api "/repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq "[.[] | select(.draft == true and .name == \"$TAG\")] | first | .id // empty")"
+          if [[ -z "$existing" ]]; then
+            existing="$(gh api -X POST "/repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$TAG" -f name="$TAG" -F draft=true -F prerelease=false \
+              -f body="Candidate staged from ${{ needs.plan.outputs.source_sha }}. Not yet published." \
+              --jq '.id')"
+          else
+            # Replacing any asset invalidates the previous candidate and its checks.
+            gh api "/repos/$GITHUB_REPOSITORY/releases/$existing/assets" --paginate --jq '.[].id' \
+              | while read -r asset_id; do
+                  gh api -X DELETE "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+                done
+          fi
+          echo "draft_release_id=$existing" >> "$GITHUB_OUTPUT"
+
+      - name: Upload every asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for asset in dist/*; do
+            gh release upload "${{ needs.plan.outputs.tag }}" "$asset" --repo "$GITHUB_REPOSITORY"
+          done
+
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*
+
+      - name: Record the uploaded asset ids
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate \
+            "/repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.draft_release_id }}/assets" \
+            --jq '[.[] | {id: .id, name: .name}]' | jq -s 'add' > asset-ids.json
+          jq 'length' asset-ids.json
+
+      - name: Write the candidate record
+        run: |
+          set -euo pipefail
+          uv run --frozen gel-release candidate write \
+            --version "${{ needs.plan.outputs.version }}" \
+            --draft-release-id "${{ steps.draft.outputs.draft_release_id }}" \
+            --source-sha "${{ needs.plan.outputs.source_sha }}" \
+            --build-date "${{ needs.plan.outputs.build_date }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --dist-dir dist \
+            --asset-ids asset-ids.json \
+            --out packaging/release-candidate.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-record
+          path: packaging/release-candidate.json
+          if-no-files-found: error
+
+  verify:
+    name: verify
+    needs: [plan, stage]
+    runs-on: ubuntu-24.04
+    permissions:
+      # Draft release assets are invisible to a contents:read token; reading the
+      # staged bytes back through the API requires write-level contents access.
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: candidate-record
+          path: packaging
+      - name: Read the candidate back from the API and verify it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          uv run --frozen gel-release verify-draft \
+            --record packaging/release-candidate.json \
+            --download-dir readback
+
+  smoke:
+    name: smoke (${{ matrix.target }})
+    needs: [plan, stage]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.smoke_matrix) }}
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+      - name: Unpack and run the exact archived bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.plan.outputs.version }}"
+          stem="gel-v$version-${{ matrix.target }}"
+          mkdir -p smoke
+          if [[ -f "dist/$stem.tar.gz" ]]; then
+            tar -xzf "dist/$stem.tar.gz" -C smoke
+            binary="smoke/$stem/gel"
+          else
+            unzip -q "dist/$stem.zip" -d smoke
+            binary="smoke/$stem/gel.exe"
+          fi
+          actual="$("$binary" --version)"
+          expected="Gel CLI $version"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "expected '$expected', got '$actual'" >&2
+            exit 1
+          fi
+          echo "$actual"
+
+  commit-metadata:
+    name: commit-metadata
+    needs: [plan, stage, verify, smoke]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: knope/release
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+      - name: Refuse to overwrite a newer candidate
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          if [[ "$head" != "${{ needs.plan.outputs.source_sha }}" ]]; then
+            echo "knope/release moved from ${{ needs.plan.outputs.source_sha }} to $head" >&2
+            echo "This staging run is stale; a newer candidate must be staged instead." >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: candidate-record
+          path: packaging
+
+      - name: Commit the candidate record
+        run: |
+          set -euo pipefail
+          git config user.name "gelstable-release"
+          git config user.email "release@gelstable.invalid"
+          git add packaging/release-candidate.json
+          if git diff --cached --quiet; then
+            echo "Candidate record unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: stage release candidate ${{ needs.plan.outputs.tag }}"
+          git push origin knope/release

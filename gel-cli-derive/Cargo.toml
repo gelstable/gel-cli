@@ -2,6 +2,7 @@
 name = "gel-cli-derive"
 license = "MIT/Apache-2.0"
 version = "0.4.0"
+publish = false
 authors = ["EdgeDB Inc. <hello@edgedb.com>"]
 edition.workspace = true
 rust-version.workspace = true

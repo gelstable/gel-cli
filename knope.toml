@@ -1,0 +1,31 @@
+[packages.gel-cli]
+versioned_files = ["Cargo.toml", "Cargo.lock"]
+changelog = "CHANGELOG.md"
+
+[[workflows]]
+name = "prepare-release"
+help_text = "Update the version, changelog, and release pull request"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+
+[[workflows.steps]]
+type = "Command"
+command = 'git commit -m "chore: prepare release $version"'
+
+[[workflows.steps]]
+type = "CreatePullRequest"
+base = "master"
+title = { template = "chore: prepare release $version", variables = { "$version" = "Version" } }
+body = { template = "Automated release pull request for $version.\n\nStaging runs on dispatch and commits `packaging/release-candidate.json` once the draft release is verified. Merging this pull request authorizes immediate publication of the reviewed candidate.", variables = { "$version" = "Version" } }
+
+[[workflows]]
+name = "document-change"
+help_text = "Create a change file to be included in the next release"
+
+[[workflows.steps]]
+type = "CreateChangeFile"
+
+[github]
+owner = "gelstable"
+repo = "gel-cli"

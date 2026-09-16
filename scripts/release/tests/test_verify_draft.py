@@ -154,7 +154,9 @@ class ReleaseIdentityTests(unittest.TestCase):
 
     @mock.patch(
         "gel_release.verify_draft._gh_json",
-        side_effect=subprocess.CalledProcessError(1, ["gh", "api"]),
+        side_effect=subprocess.CalledProcessError(
+            1, ["gh", "api"], stderr="gh: Not Found (HTTP 404)"
+        ),
     )
     def test_uncreated_draft_tag_is_not_proven_by_release_body(self, gh_json):
         resolved = verify_draft.check_release_identity(self.RELEASE, self.RECORD)
@@ -162,6 +164,26 @@ class ReleaseIdentityTests(unittest.TestCase):
         gh_json.assert_called_once_with(
             "api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0"
         )
+
+    @mock.patch(
+        "gel_release.verify_draft._gh_json",
+        side_effect=subprocess.CalledProcessError(
+            1, ["gh", "api"], stderr="gh: Forbidden (HTTP 403)"
+        ),
+    )
+    def test_tag_lookup_forbidden_fails_closed(self, gh_json):
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "lookup"):
+            verify_draft.check_release_identity(self.RELEASE, self.RECORD)
+
+    @mock.patch(
+        "gel_release.verify_draft._gh_json",
+        side_effect=subprocess.CalledProcessError(
+            1, ["gh", "api"], stderr="gh: Internal Server Error (HTTP 500)"
+        ),
+    )
+    def test_tag_lookup_server_error_fails_closed(self, gh_json):
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "lookup"):
+            verify_draft.check_release_identity(self.RELEASE, self.RECORD)
 
     @mock.patch("gel_release.verify_draft.resolve_tag_commit", return_value=None)
     @mock.patch("gel_release.verify_draft.get_release", return_value=RELEASE)

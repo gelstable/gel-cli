@@ -95,13 +95,27 @@ def _tag_object(payload: object, context: str) -> tuple[str, str]:
     return object_type, object_sha
 
 
+def _is_http_404(error: subprocess.CalledProcessError) -> bool:
+    output = "\n".join(
+        value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+        for value in (error.stdout, error.stderr)
+        if value
+    )
+    return re.search(r"\b404\b", output) is not None
+
+
 def resolve_tag_commit(tag: str, repo: str = assets.REPOSITORY) -> str | None:
     try:
         payload = _gh_json("api", f"/repos/{repo}/git/ref/tags/{tag}")
-    except subprocess.CalledProcessError:
-        # Candidate drafts are verified before publication, so their tag may
-        # not exist yet. Attestation verification remains the source proof.
-        return None
+    except subprocess.CalledProcessError as error:
+        if _is_http_404(error):
+            # Candidate drafts are verified before publication, so their tag
+            # may not exist yet. Attestation verification remains the source
+            # proof.
+            return None
+        raise DraftVerificationError(
+            f"tag lookup failed for {tag}; refusing to treat the API error as a missing tag"
+        ) from error
 
     object_type, object_sha = _tag_object(payload, f"tag ref {tag}")
     seen: set[str] = set()

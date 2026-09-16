@@ -136,8 +136,9 @@ The release version selects the generated manifest channel explicitly:
 | `7.1.0` | `stable` | published stable |
 | `7.1.0-alpha.1`, `7.1.0-beta.1`, `7.1.0-rc.1` | `testing` | prerelease |
 
-Only plain SemVer and the `alpha`, `beta`, and `rc` phase prereleases are
-accepted. `-dev.1` and arbitrary suffixes are rejected during candidate
+Only plain `X.Y.Z` versions and the `X.Y.Z-alpha.N`, `X.Y.Z-beta.N`, and
+`X.Y.Z-rc.N` phase prereleases (with `N` greater than zero) are accepted.
+Build metadata, `-dev.1`, and arbitrary suffixes are rejected during candidate
 planning. Every index in `gel-registry.json` carries its `channel` field; the
 registry uses that explicit field when selecting stable or testing entries.
 Linux package metadata rewrites a supported prerelease as

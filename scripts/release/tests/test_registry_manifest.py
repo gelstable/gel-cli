@@ -87,7 +87,7 @@ class ManifestShapeTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            registry_manifest._version_details("1.0.0+build.123"),
+            registry_manifest._version_details("1.0.0"),
             {"major": 1, "minor": 0, "patch": 0, "prerelease": [], "metadata": {}},
         )
 
@@ -124,7 +124,6 @@ class ManifestShapeTests(unittest.TestCase):
         )
         for version, expected in (
             ("7.1.0", "stable"),
-            ("7.1.0+build.123", "stable"),
             ("7.1.0-alpha.1", "testing"),
             ("7.1.0-beta.1", "testing"),
             ("7.1.0-rc.1", "testing"),
@@ -136,6 +135,10 @@ class ManifestShapeTests(unittest.TestCase):
             "7.1.0-dev.1",
             "7.1.0-preview.1",
             "7.1.0-foo.1",
+            "7.1.0+build.123",
+            "7.1.0-alpha.0",
+            "7.1.0-beta.0",
+            "7.1.0-rc.0",
             "7.1.0-alpha",
             "7.1.0-rc.1.2",
         ):

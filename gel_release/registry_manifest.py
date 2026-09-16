@@ -25,8 +25,7 @@ SCHEMA_PATH = (
 REVISION = "1"
 VERSION_PATTERN = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-    r"(?:-(alpha|beta|rc)\.([1-9][0-9]*|0))?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+    r"(?:-(alpha|beta|rc)\.([1-9][0-9]*))?$"
 )
 
 

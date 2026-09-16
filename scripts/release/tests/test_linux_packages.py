@@ -40,10 +40,6 @@ class CommandTests(unittest.TestCase):
     def test_package_manager_versions_sort_prereleases_before_stable(self):
         self.assertEqual(linux_packages.package_manager_version("7.11.0"), "7.11.0")
         self.assertEqual(linux_packages.package_manager_version("7.11.0-rc.1"), "7.11.0~rc.1")
-        self.assertEqual(
-            linux_packages.package_manager_version("7.11.0-rc.1+g874890b"),
-            "7.11.0~rc.1",
-        )
 
     def test_deb_and_rpm_commands_order_every_supported_prerelease_below_stable(self):
         stable_deb = linux_packages.deb_command(AMD64, "7.1.0", Path("target/completions"))
@@ -79,7 +75,15 @@ class CommandTests(unittest.TestCase):
                 self.assertTrue(rpm_core.partition("~")[1])
 
     def test_package_manager_version_rejects_unsupported_suffixes(self):
-        for version in ("7.1.0-dev.1", "7.1.0-preview.1", "7.1.0-foo.1"):
+        for version in (
+            "7.1.0-dev.1",
+            "7.1.0-preview.1",
+            "7.1.0-foo.1",
+            "7.1.0+build.123",
+            "7.1.0-alpha.0",
+            "7.1.0-beta.0",
+            "7.1.0-rc.0",
+        ):
             with self.subTest(version=version):
                 with self.assertRaisesRegex(ValueError, "unsupported release version"):
                     linux_packages.package_manager_version(version)

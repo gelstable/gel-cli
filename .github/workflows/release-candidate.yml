@@ -1,0 +1,867 @@
+name: Release candidate
+
+'on':
+  workflow_dispatch:
+    inputs:
+      identity:
+        description: JSON CandidateIdentity selected by the release controller
+        required: false
+        type: string
+      line:
+        description: Release line when explicit identity fields are supplied
+        required: false
+        type: string
+      pr_number:
+        description: Release pull request number
+        required: false
+        type: string
+      base_sha:
+        description: Release line base commit SHA
+        required: false
+        type: string
+      source_sha:
+        description: Original pull request head SHA
+        required: false
+        type: string
+      build_sha:
+        description: Immutable commit checked out by every build job
+        required: false
+        type: string
+      source_snapshot:
+        description: Meaningful source tree snapshot
+        required: false
+        type: string
+      phase:
+        description: Preview phase, when present
+        required: false
+        type: string
+      version:
+        description: Candidate version
+        required: false
+        type: string
+      channel:
+        description: Candidate channel
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      identity:
+        description: JSON CandidateIdentity selected by the release controller
+        required: false
+        type: string
+        default: ""
+      line:
+        description: Release line when explicit identity fields are supplied
+        required: false
+        type: string
+        default: ""
+      pr_number:
+        description: Release pull request number
+        required: false
+        type: string
+        default: ""
+      base_sha:
+        description: Release line base commit SHA
+        required: false
+        type: string
+        default: ""
+      source_sha:
+        description: Original pull request head SHA
+        required: false
+        type: string
+        default: ""
+      build_sha:
+        description: Immutable commit checked out by every build job
+        required: false
+        type: string
+        default: ""
+      source_snapshot:
+        description: Meaningful source tree snapshot
+        required: false
+        type: string
+        default: ""
+      phase:
+        description: Preview phase, when present
+        required: false
+        type: string
+        default: ""
+      version:
+        description: Candidate version
+        required: false
+        type: string
+        default: ""
+      channel:
+        description: Candidate channel
+        required: false
+        type: string
+        default: ""
+    outputs:
+      draft_release_id:
+        description: GitHub draft release id containing the verified bytes
+        value: ${{ jobs.stage.outputs.draft_release_id }}
+      verified_candidate:
+        description: Path or release asset name of the verified candidate record
+        value: ${{ jobs.verify.outputs.verified_candidate }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ inputs.line || inputs.identity || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.88"
+  CARGO_INCREMENTAL: "0"
+  CARGO_DEB_VERSION: "3.7.0"
+  CARGO_GENERATE_RPM_VERSION: "0.21.0"
+
+jobs:
+  identity:
+    name: normalize immutable identity
+    runs-on: ubuntu-24.04
+    outputs:
+      identity: ${{ steps.identity.outputs.identity }}
+      line: ${{ steps.identity.outputs.line }}
+      pr_number: ${{ steps.identity.outputs.pr_number }}
+      base_sha: ${{ steps.identity.outputs.base_sha }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+      build_sha: ${{ steps.identity.outputs.build_sha }}
+      source_snapshot: ${{ steps.identity.outputs.source_snapshot }}
+      phase: ${{ steps.identity.outputs.phase }}
+      version: ${{ steps.identity.outputs.version }}
+      channel: ${{ steps.identity.outputs.channel }}
+    steps:
+      - name: Normalize JSON or explicit immutable inputs
+        id: identity
+        env:
+          IDENTITY_JSON: ${{ inputs.identity }}
+          INPUT_LINE: ${{ inputs.line }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_BASE_SHA: ${{ inputs.base_sha }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          INPUT_BUILD_SHA: ${{ inputs.build_sha }}
+          INPUT_SOURCE_SNAPSHOT: ${{ inputs.source_snapshot }}
+          INPUT_PHASE: ${{ inputs.phase }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          identity_file="$RUNNER_TEMP/candidate-identity.json"
+          if [[ -n "$IDENTITY_JSON" ]]; then
+            printf '%s' "$IDENTITY_JSON" | jq -e 'type == "object"' > "$identity_file"
+            jq '.build_sha = (.build_sha // .source_sha)' "$identity_file" > "$identity_file.tmp"
+            mv "$identity_file.tmp" "$identity_file"
+          else
+            for required in INPUT_LINE INPUT_PR_NUMBER INPUT_BASE_SHA INPUT_SOURCE_SHA \
+              INPUT_BUILD_SHA INPUT_SOURCE_SNAPSHOT INPUT_VERSION INPUT_CHANNEL; do
+              if [[ -z "${!required}" ]]; then
+                echo "missing explicit candidate identity input ${required#INPUT_}" >&2
+                exit 1
+              fi
+            done
+            jq -n \
+              --arg line "$INPUT_LINE" \
+              --arg pr_number "$INPUT_PR_NUMBER" \
+              --arg base_sha "$INPUT_BASE_SHA" \
+              --arg source_sha "$INPUT_SOURCE_SHA" \
+              --arg build_sha "$INPUT_BUILD_SHA" \
+              --arg source_snapshot "$INPUT_SOURCE_SNAPSHOT" \
+              --arg phase "$INPUT_PHASE" \
+              --arg version "$INPUT_VERSION" \
+              --arg channel "$INPUT_CHANNEL" \
+              '{line: $line, pr_number: ($pr_number | tonumber), base_sha: $base_sha,
+                source_sha: $source_sha, build_sha: $build_sha,
+                source_snapshot: $source_snapshot,
+                phase: (if $phase == "" then null else $phase end),
+                version: $version, channel: $channel}' > "$identity_file"
+          fi
+
+          jq -e '
+            (.line | type == "string" and test("^release/v[1-9][0-9]*\\.x$")) and
+            (.pr_number | type == "number" and floor == . and . > 0) and
+            (.base_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+            (.source_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+            (.build_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+            (.source_snapshot | type == "string" and test("^[0-9a-f]{64}$")) and
+            (.version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+(-(?:alpha|beta|rc)\\.[1-9][0-9]*)?$")) and
+            (.channel | . == "stable" or . == "testing") and
+            (.phase == null or (.phase | . == "alpha" or . == "beta" or . == "rc"))
+          ' "$identity_file" >/dev/null
+          phase="$(jq -r '.phase // empty' "$identity_file")"
+          channel="$(jq -r '.channel' "$identity_file")"
+          if [[ -z "$phase" && "$channel" != stable ]]; then
+            echo "stable candidates must use the stable channel" >&2
+            exit 1
+          fi
+          if [[ -n "$phase" && "$channel" != testing ]]; then
+            echo "preview candidates must use the testing channel" >&2
+            exit 1
+          fi
+          identity="$(jq -c . "$identity_file")"
+          {
+            echo "identity=$identity"
+            jq -r '
+              "line=" + .line,
+              "pr_number=" + (.pr_number | tostring),
+              "base_sha=" + .base_sha,
+              "source_sha=" + .source_sha,
+              "build_sha=" + .build_sha,
+              "source_snapshot=" + .source_snapshot,
+              "phase=" + (.phase // ""),
+              "version=" + .version,
+              "channel=" + .channel
+            ' "$identity_file"
+          } >> "$GITHUB_OUTPUT"
+
+  plan:
+    name: plan immutable candidate
+    needs: identity
+    runs-on: ubuntu-24.04
+    outputs:
+      identity: ${{ needs.identity.outputs.identity }}
+      line: ${{ needs.identity.outputs.line }}
+      pr_number: ${{ needs.identity.outputs.pr_number }}
+      base_sha: ${{ needs.identity.outputs.base_sha }}
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      build_sha: ${{ needs.identity.outputs.build_sha }}
+      source_snapshot: ${{ needs.identity.outputs.source_snapshot }}
+      phase: ${{ needs.identity.outputs.phase }}
+      version: ${{ needs.identity.outputs.version }}
+      channel: ${{ needs.identity.outputs.channel }}
+      tag: ${{ steps.plan.outputs.tag }}
+      build_date: ${{ steps.plan.outputs.build_date }}
+      build_matrix: ${{ steps.matrix.outputs.build }}
+      smoke_matrix: ${{ steps.matrix.outputs.smoke }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.identity.outputs.build_sha }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Validate checkout and candidate identity
+        id: plan
+        env:
+          IDENTITY_JSON: ${{ needs.identity.outputs.identity }}
+          BUILD_SHA: ${{ needs.identity.outputs.build_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BUILD_SHA"
+          printf '%s' "$IDENTITY_JSON" > "$RUNNER_TEMP/candidate-identity.json"
+          PYTHONPATH=. uv run --frozen python - "$RUNNER_TEMP/candidate-identity.json" <<'PY'
+          import json
+          import sys
+          from gel_release.github_release import CandidateIdentity
+
+          CandidateIdentity.from_dict(json.load(open(sys.argv[1])))
+          PY
+          version="$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
+          expected="${{ needs.identity.outputs.version }}"
+          if [[ "$version" != "$expected" ]]; then
+            echo "Cargo metadata resolved $version, expected $expected" >&2
+            exit 1
+          fi
+          {
+            echo "tag=v$expected"
+            echo "build_date=$(git show -s --format=%cI "$BUILD_SHA")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Derive target matrices from release tooling
+        id: matrix
+        run: |
+          set -euo pipefail
+          echo "build=$(PYTHONPATH=. uv run --frozen gel-release matrix build)" >> "$GITHUB_OUTPUT"
+          echo "smoke=$(PYTHONPATH=. uv run --frozen gel-release matrix smoke)" >> "$GITHUB_OUTPUT"
+
+  completions:
+    name: completions
+    needs: [identity, plan]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.identity.outputs.build_sha }}
+          fetch-depth: 0
+          submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Generate shell completions once for every target
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+          cargo build --locked --bin gel
+          PYTHONPATH=. uv run --frozen gel-release completions \
+            --binary target/debug/gel --out-dir target/completions
+          for completion in gel.bash _gel gel.fish gel.ps1; do
+            test -s "target/completions/$completion"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: completions
+          path: target/completions
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [identity, plan, completions]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.identity.outputs.build_sha }}
+          fetch-depth: 0
+          submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Confirm immutable checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+
+      - name: Install musl toolchain
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install zstd
+        if: startsWith(matrix.runner, 'windows')
+        run: choco install zstandard --no-progress -y
+        shell: pwsh
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: completions
+          path: target/completions
+
+      - name: Build exact candidate bytes
+        shell: bash
+        run: cargo build --release --locked --bin gel --target "${{ matrix.target }}"
+
+      - name: Package exact candidate bytes
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/gel"
+          if [[ -f "$binary.exe" ]]; then binary="$binary.exe"; fi
+          test -s "$binary"
+          PYTHONPATH=. uv run --frozen gel-release package-target \
+            --target "$TARGET" \
+            --version "$VERSION" \
+            --binary "$binary" \
+            --completions-dir target/completions \
+            --out-dir dist
+
+      - name: Install Linux packaging tools
+        if: matrix.linux_packages
+        run: |
+          set -euo pipefail
+          cargo install --locked --version "$CARGO_DEB_VERSION" cargo-deb
+          cargo install --locked --version "$CARGO_GENERATE_RPM_VERSION" cargo-generate-rpm
+
+      - name: Build Linux packages from the exact binary
+        if: matrix.linux_packages
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. uv run --frozen gel-release linux-packages \
+            --target "$TARGET" \
+            --version "$VERSION" \
+            --completions-dir target/completions \
+            --out-dir dist
+          test -z "$(git status --porcelain Cargo.toml)"
+
+      - name: Require target outputs
+        shell: bash
+        run: test -n "$(find dist -maxdepth 1 -type f -size +0c -print -quit)"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+  smoke:
+    name: smoke (${{ matrix.target }})
+    needs: [identity, plan, build]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.smoke_matrix) }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.identity.outputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+      - name: Run the exact archived candidate bytes
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+          stem="gel-v$VERSION-$TARGET"
+          mkdir -p smoke
+          if [[ -f "dist/$stem.tar.gz" ]]; then
+            tar -xzf "dist/$stem.tar.gz" -C smoke
+            binary="smoke/$stem/gel"
+          elif [[ -f "dist/$stem.zip" ]]; then
+            unzip -q "dist/$stem.zip" -d smoke
+            binary="smoke/$stem/gel.exe"
+          else
+            echo "missing archive for $TARGET" >&2
+            exit 1
+          fi
+          test -s "$binary"
+          actual="$($binary --version)"
+          expected="Gel CLI $VERSION"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "expected '$expected', got '$actual'" >&2
+            exit 1
+          fi
+
+  install:
+    name: native install manager matrix
+    needs: [identity, plan, build]
+    uses: ./.github/workflows/release-install-e2e.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+      build_sha: ${{ needs.identity.outputs.build_sha }}
+    secrets: inherit
+
+  stage:
+    name: stage verified distribution
+    needs: [identity, plan, build, smoke, install]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      draft_release_id: ${{ steps.draft.outputs.draft_release_id }}
+      candidate_record: ${{ steps.record.outputs.record_path }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.identity.outputs.build_sha }}
+          fetch-depth: 1
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Assemble registry manifest and digest manifests
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          BUILD_DATE: ${{ needs.plan.outputs.build_date }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+          PYTHONPATH=. uv run --frozen gel-release assemble-stage \
+            --version "$VERSION" --build-date "$BUILD_DATE" --dist-dir dist
+
+      - name: Assert the exact release inventory
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. uv run --frozen python - "$VERSION" <<'PY'
+          import sys
+          from pathlib import Path
+          from gel_release import assets
+
+          expected = assets.expected_assets(sys.argv[1])
+          found = sorted(path.name for path in Path("dist").iterdir() if path.is_file())
+          if found != expected:
+              raise SystemExit(
+                  f"missing={sorted(set(expected) - set(found))} "
+                  f"extra={sorted(set(found) - set(expected))}"
+              )
+          PY
+
+      - name: Assert archive layouts
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.gz; do
+            tar -tzf "$archive" | grep -qE '/gel$'
+            tar -tzf "$archive" | grep -q '/completions/gel.bash$'
+          done
+          for archive in dist/*.zip; do
+            unzip -Z1 "$archive" | grep -q '/gel.exe$'
+            unzip -Z1 "$archive" | grep -q '/completions/gel.ps1$'
+          done
+
+      - name: Select the exact unpublished draft
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.plan.outputs.version }}
+          IDENTITY_JSON: ${{ needs.plan.outputs.identity }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$IDENTITY_JSON" > "$RUNNER_TEMP/candidate-identity.json"
+          gh api --paginate --slurp \
+            "/repos/$GITHUB_REPOSITORY/releases" | jq 'add' > "$RUNNER_TEMP/releases.json"
+          body="$(PYTHONPATH=. uv run --frozen python - "$RUNNER_TEMP/candidate-identity.json" <<'PY'
+          import json
+          import sys
+          from gel_release.github_release import CandidateIdentity, candidate_identity_body
+
+          identity = CandidateIdentity.from_dict(json.load(open(sys.argv[1])))
+          print(candidate_identity_body(identity))
+          PY
+          )"
+          existing="$(PYTHONPATH=. uv run --frozen python - \
+            "$RUNNER_TEMP/releases.json" "$RUNNER_TEMP/candidate-identity.json" <<'PY'
+          import json
+          import sys
+          from gel_release.github_release import find_reusable_draft
+
+          releases = json.load(open(sys.argv[1]))
+          identity = json.load(open(sys.argv[2]))
+          draft = find_reusable_draft(releases, identity)
+          if draft is not None:
+              print(draft["id"])
+          PY
+          )"
+          phase="$(jq -r '.phase // empty' "$RUNNER_TEMP/candidate-identity.json")"
+          prerelease=false
+          [[ -n "$phase" ]] && prerelease=true
+          if [[ -z "$existing" ]]; then
+            existing="$(gh api -X POST "/repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$TAG" -f name="$TAG" \
+              -F draft=true -F prerelease="$prerelease" \
+              -f body="$body" --jq '.id')"
+          else
+            # Replacing assets is safe only after find_reusable_draft proved that
+            # the release is still a draft with exactly this tag and identity.
+            gh api "/repos/$GITHUB_REPOSITORY/releases/$existing" \
+              > "$RUNNER_TEMP/reusable-release.json"
+            PYTHONPATH=. uv run --frozen python -c '
+            import json
+            import sys
+            from gel_release.github_release import find_reusable_draft
+
+            release = json.load(open(sys.argv[1]))
+            identity = json.load(open(sys.argv[2]))
+            reusable = find_reusable_draft([release], identity)
+            if reusable is None or str(reusable.get("id")) != sys.argv[3]:
+                raise SystemExit("the selected draft changed before asset replacement")
+            ' "$RUNNER_TEMP/reusable-release.json" \
+              "$RUNNER_TEMP/candidate-identity.json" "$existing"
+            gh api --paginate \
+              "/repos/$GITHUB_REPOSITORY/releases/$existing/assets" --jq '.[].id' \
+              | while read -r asset_id; do
+                  gh api -X DELETE \
+                    "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
+                done
+          fi
+          test "$existing" != ""
+          echo "draft_release_id=$existing" >> "$GITHUB_OUTPUT"
+
+      - name: Upload every distribution asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          for asset in dist/*; do
+            gh release upload "$TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+          done
+
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*
+
+      - name: Record uploaded distribution asset ids
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.draft_release_id }}
+        run: |
+          set -euo pipefail
+          gh api --paginate \
+            "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            --jq '[.[] | {id: .id, name: .name, size: .size}]' \
+            | jq -s 'add' > asset-ids.json
+          jq -e 'length > 0' asset-ids.json >/dev/null
+
+      - name: Write the immutable candidate record
+        id: record
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          LINE: ${{ needs.plan.outputs.line }}
+          PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
+          PHASE: ${{ needs.plan.outputs.phase }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          BUILD_SHA: ${{ needs.plan.outputs.build_sha }}
+          SOURCE_SNAPSHOT: ${{ needs.plan.outputs.source_snapshot }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          RELEASE_ID: ${{ steps.draft.outputs.draft_release_id }}
+        run: |
+          set -euo pipefail
+          record_path=packaging/release-candidate.json
+          phase_args=()
+          if [[ -n "$PHASE" ]]; then
+            record_path=packaging/gel-candidate.json
+            phase_args=(--phase "$PHASE")
+          fi
+          mkdir -p packaging
+          PYTHONPATH=. uv run --frozen gel-release candidate write \
+            --line "$LINE" \
+            --pr-number "$PR_NUMBER" \
+            "${phase_args[@]}" \
+            --version "$VERSION" \
+            --draft-release-id "$RELEASE_ID" \
+            --source-sha "$SOURCE_SHA" \
+            --build-sha "$BUILD_SHA" \
+            --source-snapshot "$SOURCE_SNAPSHOT" \
+            --base-sha "$BASE_SHA" \
+            --build-date "${{ needs.plan.outputs.build_date }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --dist-dir dist \
+            --asset-ids asset-ids.json \
+            --out "$record_path"
+          echo "record_path=$record_path" >> "$GITHUB_OUTPUT"
+          if [[ -n "$PHASE" ]]; then
+            gh release upload "v$VERSION" "$record_path" --repo "$GITHUB_REPOSITORY"
+          fi
+
+      - name: Verify the API has the exact staged inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.draft_release_id }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PHASE: ${{ needs.plan.outputs.phase }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            --jq '[.[] | {id: .id, name: .name, size: .size}]' \
+            | jq -s 'add' > "$RUNNER_TEMP/staged-assets.json"
+          PYTHONPATH=. uv run --frozen python - \
+            "$RUNNER_TEMP/staged-assets.json" "$VERSION" "$PHASE" <<'PY'
+          import json
+          import sys
+          from gel_release import verify_draft
+
+          listed = json.load(open(sys.argv[1]))
+          phase = sys.argv[3] or None
+          verify_draft.check_inventory(listed, sys.argv[2], phase=phase)
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: candidate-record
+          path: packaging/
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    name: verify draft through the API
+    needs: [identity, plan, stage]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      verified_candidate: ${{ steps.verify.outputs.verified_candidate }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.identity.outputs.build_sha }}
+          fetch-depth: 1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate-record
+          path: packaging
+      - name: Confirm the staged release is still a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.stage.outputs.draft_release_id }}
+        run: |
+          set -euo pipefail
+          gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --jq 'select(.draft == true) | .id' | grep -Fx "$RELEASE_ID"
+      - name: Read every candidate byte back from the API
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          LINE: ${{ needs.plan.outputs.line }}
+          PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
+          PHASE: ${{ needs.plan.outputs.phase }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          BUILD_SHA: ${{ needs.plan.outputs.build_sha }}
+          SOURCE_SNAPSHOT: ${{ needs.plan.outputs.source_snapshot }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          IDENTITY_JSON: ${{ needs.plan.outputs.identity }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+          record=packaging/release-candidate.json
+          phase_args=()
+          if [[ -n "$PHASE" ]]; then
+            record=packaging/gel-candidate.json
+            phase_args=(--phase "$PHASE")
+          fi
+          test -s "$record"
+          printf '%s' "$IDENTITY_JSON" > "$RUNNER_TEMP/identity.json"
+          PYTHONPATH=. uv run --frozen python - "$record" "$RUNNER_TEMP/identity.json" <<'PY'
+          import json
+          import sys
+          from gel_release import verify_draft
+
+          record = json.load(open(sys.argv[1]))
+          identity = json.load(open(sys.argv[2]))
+          verify_draft.check_candidate_identity(record, identity)
+          PY
+          PYTHONPATH=. uv run --frozen gel-release verify-draft \
+            --record "$record" \
+            --download-dir readback \
+            --version "$VERSION" \
+            --line "$LINE" \
+            --pr-number "$PR_NUMBER" \
+            "${phase_args[@]}" \
+            --source-sha "$SOURCE_SHA" \
+            --build-sha "$BUILD_SHA" \
+            --source-snapshot "$SOURCE_SNAPSHOT" \
+            --base-sha "$BASE_SHA"
+          if [[ -n "$PHASE" ]]; then
+            echo "verified_candidate=gel-candidate.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "verified_candidate=packaging/release-candidate.json" >> "$GITHUB_OUTPUT"
+          fi
+
+  commit-stable:
+    name: commit stable candidate to release PR
+    if: needs.plan.outputs.phase == ''
+    needs: [identity, plan, stage, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.identity.outputs.build_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate-record
+          path: packaging
+      - name: Recheck the live PR before committing metadata
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
+          EXPECTED_SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          EXPECTED_BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          IDENTITY_JSON: ${{ needs.plan.outputs.identity }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/live-pr.json"
+          live_source_sha="$(jq -r '.head.sha' "$RUNNER_TEMP/live-pr.json")"
+          if [[ "$live_source_sha" != "$EXPECTED_SOURCE_SHA" ]]; then
+            echo "release PR head moved from $EXPECTED_SOURCE_SHA to $live_source_sha" >&2
+            exit 1
+          fi
+          live_base_sha="$(jq -r '.base.sha' "$RUNNER_TEMP/live-pr.json")"
+          if [[ "$live_base_sha" != "$EXPECTED_BASE_SHA" ]]; then
+            echo "release PR base moved from $EXPECTED_BASE_SHA to $live_base_sha" >&2
+            exit 1
+          fi
+          version="$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
+          snapshot="$(PYTHONPATH=. uv run --frozen gel-release snapshot \
+            --rev "$EXPECTED_SOURCE_SHA" --repo .)"
+          jq --arg version "$version" --arg snapshot "$snapshot" \
+            '.prepared_version = $version | .source_snapshot = $snapshot' \
+            "$RUNNER_TEMP/live-pr.json" > "$RUNNER_TEMP/live-pr-enriched.json"
+          PYTHONPATH=. uv run --frozen python - \
+            "$RUNNER_TEMP/live-pr-enriched.json" "$IDENTITY_JSON" <<'PY'
+          import json
+          import sys
+          from gel_release.github_release import CandidateIdentity, assert_live_identity
+
+          identity = CandidateIdentity.from_dict(json.loads(sys.argv[2]))
+          assert_live_identity(identity, json.load(open(sys.argv[1])))
+          PY
+
+      - name: Push the stable record to the exact live PR head
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          IDENTITY_JSON: ${{ needs.plan.outputs.identity }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/live-pr-final.json"
+          final_source_sha="$(jq -r '.head.sha' "$RUNNER_TEMP/live-pr-final.json")"
+          version="$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
+          snapshot="$(PYTHONPATH=. uv run --frozen gel-release snapshot \
+            --rev "$final_source_sha" --repo .)"
+          jq --arg version "$version" --arg snapshot "$snapshot" \
+            '.prepared_version = $version | .source_snapshot = $snapshot' \
+            "$RUNNER_TEMP/live-pr-final.json" > "$RUNNER_TEMP/live-pr-final-enriched.json"
+          printf '%s' "$IDENTITY_JSON" > "$RUNNER_TEMP/identity-final.json"
+          PYTHONPATH=. uv run --frozen python - \
+            "$RUNNER_TEMP/live-pr-final-enriched.json" "$RUNNER_TEMP/identity-final.json" <<'PY'
+          import json
+          import sys
+          from gel_release.github_release import CandidateIdentity, assert_live_identity
+
+          identity = CandidateIdentity.from_dict(json.load(open(sys.argv[2])))
+          assert_live_identity(identity, json.load(open(sys.argv[1])))
+          PY
+          [[ "$final_source_sha" == "$SOURCE_SHA" ]]
+          head_ref="$(jq -r '.head.ref' "$RUNNER_TEMP/live-pr-final.json")"
+          test -n "$head_ref"
+          git fetch --no-tags origin "refs/heads/$head_ref:refs/remotes/origin/$head_ref"
+          remote_head="$(git rev-parse "refs/remotes/origin/$head_ref^{commit}")"
+          [[ "$remote_head" == "$SOURCE_SHA" ]]
+          git switch -C "$head_ref" "$SOURCE_SHA"
+          test -s packaging/release-candidate.json
+          git add packaging/release-candidate.json
+          if git diff --cached --quiet; then
+            echo "stable candidate record already committed at the live PR head"
+            exit 0
+          fi
+          git config user.name "gelstable-release"
+          git config user.email "release@gelstable.invalid"
+          git commit -m "chore: stage release candidate v${{ needs.plan.outputs.version }}"
+          git push --force-with-lease="refs/heads/$head_ref:$remote_head" \
+            origin "HEAD:refs/heads/$head_ref"

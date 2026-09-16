@@ -262,6 +262,86 @@ class ResolveCandidateTests(unittest.TestCase):
         )
 
 
+class CandidateIdentityBoundaryTests(unittest.TestCase):
+    IDENTITY = {
+        "line": BASE_REF,
+        "pr_number": 101,
+        "base_sha": BASE_SHA,
+        "source_sha": SOURCE_SHA,
+        "build_sha": SOURCE_SHA,
+        "source_snapshot": SNAPSHOT,
+        "phase": None,
+        "version": "7.1.0",
+        "channel": "stable",
+    }
+
+    def test_live_pr_matching_identity_is_accepted(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        github_release.assert_live_identity(identity, _live_pr())
+
+    def test_live_pr_head_change_is_rejected_before_record_push(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        with self.assertRaisesRegex(ValueError, "source|head"):
+            github_release.assert_live_identity(identity, _live_pr(head_sha="d" * 40))
+
+    def test_live_pr_phase_change_is_rejected_before_record_push(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        with self.assertRaisesRegex(ValueError, "phase"):
+            github_release.assert_live_identity(
+                identity,
+                _live_pr(labels=["prerelease:alpha"]),
+            )
+
+    def test_live_build_sha_change_is_rejected_when_present(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        live_pr = _live_pr()
+        live_pr["build_sha"] = "d" * 40
+        with self.assertRaisesRegex(ValueError, "build SHA"):
+            github_release.assert_live_identity(identity, live_pr)
+
+    def test_matching_draft_can_be_reused_only_when_body_identity_matches(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        release = {
+            "id": 123,
+            "tag_name": identity.tag,
+            "name": identity.tag,
+            "draft": True,
+            "prerelease": False,
+            "body": json.dumps({"candidate_identity": identity.as_dict()}),
+        }
+        self.assertEqual(
+            github_release.find_reusable_draft([release], identity),
+            release,
+        )
+
+    def test_draft_with_same_tag_but_different_line_fails_closed(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        other = {**identity.as_dict(), "line": "release/v8.x"}
+        release = {
+            "id": 123,
+            "tag_name": identity.tag,
+            "name": identity.tag,
+            "draft": True,
+            "prerelease": False,
+            "body": json.dumps({"candidate_identity": other}),
+        }
+        with self.assertRaisesRegex(ValueError, "identity|line"):
+            github_release.find_reusable_draft([release], identity)
+
+    def test_published_matching_tag_fails_closed(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        release = {
+            "id": 123,
+            "tag_name": identity.tag,
+            "name": identity.tag,
+            "draft": False,
+            "prerelease": False,
+            "body": json.dumps({"candidate_identity": identity.as_dict()}),
+        }
+        with self.assertRaisesRegex(ValueError, "published|draft"):
+            github_release.find_reusable_draft([release], identity)
+
+
 class PreviewCommitTests(unittest.TestCase):
     def _repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path, str]:
         directory = tempfile.TemporaryDirectory()

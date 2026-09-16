@@ -25,6 +25,47 @@ class DraftVerificationError(ValueError):
     """The staged release does not match the reviewed candidate."""
 
 
+_IDENTITY_FIELDS = (
+    "line",
+    "pr_number",
+    "base_sha",
+    "source_sha",
+    "build_sha",
+    "source_snapshot",
+    "phase",
+    "version",
+)
+
+
+def check_candidate_identity(
+    record: Mapping[str, object] | CandidateRecord,
+    expected: Mapping[str, object],
+) -> None:
+    """Compare a persisted record with every immutable workflow identity field."""
+
+    if not isinstance(expected, Mapping):
+        raise DraftVerificationError("expected candidate identity must be an object")
+    try:
+        actual = candidate.validate_record(record).model_dump(mode="json")
+    except candidate.CandidateMismatch as error:
+        raise DraftVerificationError(str(error)) from error
+    missing = [field for field in (*_IDENTITY_FIELDS, "channel") if field not in expected]
+    if missing:
+        raise DraftVerificationError(
+            "expected candidate identity is missing fields: " + ", ".join(missing)
+        )
+    for field in _IDENTITY_FIELDS:
+        if actual[field] != expected[field]:
+            raise DraftVerificationError(
+                f"candidate {field} {actual[field]!r} does not match expected {expected[field]!r}"
+            )
+    actual_channel = "testing" if actual["phase"] is not None else "stable"
+    if expected["channel"] != actual_channel:
+        raise DraftVerificationError(
+            f"candidate channel {expected['channel']!r} does not match phase {actual['phase']!r}"
+        )
+
+
 def _gh_json(*argv: str) -> object:
     completed = subprocess.run(["gh", *argv], check=True, capture_output=True, text=True)
     text = completed.stdout.strip()
@@ -324,6 +365,7 @@ def verify(
     expected_build_sha: str | None = None,
     expected_base_sha: str | None = None,
     source_snapshot: str | None = None,
+    expected_identity: Mapping[str, object] | None = None,
 ) -> None:
     if expected_source_snapshot is not None and source_snapshot is not None:
         if expected_source_snapshot != source_snapshot:
@@ -333,7 +375,7 @@ def verify(
     if expected_source_snapshot is None:
         expected_source_snapshot = source_snapshot
     record = candidate.validate_record(record).model_dump(mode="json")
-    expected_identity = {
+    expected_fields = {
         "version": expected_version,
         "line": expected_line,
         "pr_number": expected_pr_number,
@@ -343,11 +385,13 @@ def verify(
         "source_snapshot": expected_source_snapshot,
         "base_sha": expected_base_sha,
     }
-    for field, expected in expected_identity.items():
+    for field, expected in expected_fields.items():
         if expected is not None and record[field] != expected:
             raise DraftVerificationError(
                 f"candidate {field} {record[field]!r} does not match expected {expected!r}"
             )
+    if expected_identity is not None:
+        check_candidate_identity(record, expected_identity)
     version = record["version"]
     release = get_release(str(record["draft_release_id"]), repo)
     tag_commit = check_release_identity(release, record, repo)

@@ -320,6 +320,50 @@ class ReleaseIdentityTests(unittest.TestCase):
         }
         self.assertEqual(verify_draft.check_release_identity(release, record), "c" * 40)
 
+    def test_candidate_identity_matches_all_immutable_fields(self):
+        expected = {
+            "line": self.RECORD["line"],
+            "pr_number": self.RECORD["pr_number"],
+            "base_sha": self.RECORD["base_sha"],
+            "source_sha": self.RECORD["source_sha"],
+            "build_sha": self.RECORD["build_sha"],
+            "source_snapshot": self.RECORD["source_snapshot"],
+            "phase": self.RECORD["phase"],
+            "version": self.RECORD["version"],
+            "channel": "stable",
+        }
+        verify_draft.check_candidate_identity(self.RECORD, expected)
+
+    def test_candidate_identity_mismatch_fails_closed(self):
+        expected = {
+            "line": self.RECORD["line"],
+            "pr_number": self.RECORD["pr_number"],
+            "base_sha": self.RECORD["base_sha"],
+            "source_sha": self.RECORD["source_sha"],
+            "build_sha": "c" * 40,
+            "source_snapshot": self.RECORD["source_snapshot"],
+            "phase": self.RECORD["phase"],
+            "version": self.RECORD["version"],
+            "channel": "stable",
+        }
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "build_sha"):
+            verify_draft.check_candidate_identity(self.RECORD, expected)
+
+    def test_candidate_identity_channel_must_match_phase(self):
+        expected = {
+            "line": self.RECORD["line"],
+            "pr_number": self.RECORD["pr_number"],
+            "base_sha": self.RECORD["base_sha"],
+            "source_sha": self.RECORD["source_sha"],
+            "build_sha": self.RECORD["build_sha"],
+            "source_snapshot": self.RECORD["source_snapshot"],
+            "phase": self.RECORD["phase"],
+            "version": self.RECORD["version"],
+            "channel": "testing",
+        }
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "channel"):
+            verify_draft.check_candidate_identity(self.RECORD, expected)
+
 
 class ManifestDigestTests(unittest.TestCase):
     def test_manifest_sha256_mismatch_is_rejected(self):

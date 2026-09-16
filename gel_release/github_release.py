@@ -158,6 +158,142 @@ class CandidateIdentity:
         )
 
 
+def _coerce_identity(identity: CandidateIdentity | Mapping[str, object]) -> CandidateIdentity:
+    if isinstance(identity, CandidateIdentity):
+        return identity
+    if isinstance(identity, Mapping):
+        return CandidateIdentity.from_dict(identity)
+    raise ValueError("candidate identity must be a CandidateIdentity or JSON object")
+
+
+def assert_live_identity(
+    identity: CandidateIdentity | Mapping[str, object], live_pr: Mapping[str, object]
+) -> None:
+    """Require a live pull request to still describe an immutable candidate.
+
+    A staging run may take long enough for the PR head, base, labels, or
+    prepared metadata to move.  Stable record publication calls this check
+    immediately before pushing the record to the generated PR branch.
+    """
+
+    expected = _coerce_identity(identity)
+    if not isinstance(live_pr, Mapping):
+        raise ValueError("live release PR must be a JSON object")
+    base = live_pr.get("base")
+    if not isinstance(base, Mapping):
+        raise ValueError("live release PR has no base identity")
+    base_repo = base.get("repo")
+    repository = base_repo.get("full_name") if isinstance(base_repo, Mapping) else None
+    if not isinstance(repository, str) or not repository:
+        raise ValueError("live release PR has no base repository")
+    live = release_state.validate_pr(dict(live_pr), repository)
+
+    checks: tuple[tuple[str, object, object], ...] = (
+        ("PR number", live.number, expected.pr_number),
+        ("release line", live.base_ref, expected.line),
+        ("base SHA", live.base_sha, expected.base_sha),
+        ("source SHA", live.head_sha, expected.source_sha),
+        ("prepared version", _prepared_version(live_pr), expected.version),
+        ("source snapshot", _source_snapshot(live_pr), expected.source_snapshot),
+        ("phase", release_state.phase_from_labels(_labels(live_pr)), expected.phase),
+    )
+    live_build_sha = _field(live_pr, "build_sha")
+    if live_build_sha is not None:
+        checks += (("build SHA", live_build_sha, expected.build_sha),)
+    live_channel = _field(live_pr, "channel")
+    if live_channel is not None:
+        checks += (("channel", live_channel, expected.channel),)
+    for name, actual, wanted in checks:
+        if actual != wanted:
+            raise ValueError(f"live PR {name} {actual!r} does not match candidate {wanted!r}")
+    expected_channel = "testing" if expected.phase is not None else "stable"
+    if expected.channel != expected_channel:
+        raise ValueError(
+            f"candidate channel {expected.channel!r} does not match its phase {expected.phase!r}"
+        )
+
+
+def _body_identity(release: Mapping[str, object]) -> Mapping[str, object] | None:
+    """Extract a candidate identity from a release body or API wrapper."""
+
+    value: object = release.get("candidate_identity")
+    if not isinstance(value, str) and not isinstance(value, Mapping):
+        value = release.get("body")
+    if isinstance(value, Mapping):
+        nested = value.get("candidate_identity")
+        return nested if isinstance(nested, Mapping) else value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        start, end = value.find("{"), value.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(value[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(parsed, Mapping):
+        return None
+    nested = parsed.get("candidate_identity")
+    return nested if isinstance(nested, Mapping) else parsed
+
+
+def find_reusable_draft(
+    releases: list[Mapping[str, object]],
+    identity: CandidateIdentity | Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """Find the one unpublished draft whose tag and identity exactly match.
+
+    A release with the same tag but a different line or candidate identity is
+    an unsafe collision.  Published releases and malformed old drafts fail
+    closed so a retry cannot replace immutable release bytes.
+    """
+
+    expected = _coerce_identity(identity)
+    if not isinstance(releases, list):
+        raise ValueError("GitHub releases must be a list")
+    expected_tag = expected.tag
+    reusable: Mapping[str, object] | None = None
+    for index, release in enumerate(releases):
+        if not isinstance(release, Mapping):
+            raise ValueError(f"release entry {index} is not an object")
+        payload = _body_identity(release)
+        identity_line = payload.get("line") if payload is not None else None
+        tag_matches = release.get("tag_name") == expected_tag or release.get("name") == expected_tag
+        line_matches = identity_line == expected.line
+        if not tag_matches and not line_matches:
+            continue
+        if release.get("tag_name") != expected_tag or release.get("name") != expected_tag:
+            raise ValueError(f"release for candidate line {expected.line} has a tag/name mismatch")
+        if release.get("draft") is not True:
+            raise ValueError(f"release {expected_tag} is published; refusing to reuse it")
+        if payload is None:
+            raise ValueError(f"draft {expected_tag} has no candidate identity")
+        try:
+            actual = CandidateIdentity.from_dict(payload)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"draft {expected_tag} has an invalid candidate identity") from error
+        if actual.as_dict() != expected.as_dict():
+            raise ValueError(
+                f"draft {expected_tag} candidate identity does not match selected identity"
+            )
+        expected_prerelease = expected.phase is not None
+        if release.get("prerelease") is not expected_prerelease:
+            raise ValueError(f"draft {expected_tag} prerelease flag does not match candidate phase")
+        if reusable is not None:
+            raise ValueError(f"more than one reusable draft exists for {expected_tag}")
+        reusable = release
+    return reusable
+
+
+def candidate_identity_body(identity: CandidateIdentity | Mapping[str, object]) -> str:
+    """Serialize an identity for the release body used by retry checks."""
+
+    return json.dumps({"candidate_identity": _coerce_identity(identity).as_dict()}, sort_keys=True)
+
+
 def _labels(pr: Mapping[str, object]) -> list[str]:
     raw = pr.get("labels", [])
     if not isinstance(raw, list):
@@ -182,8 +318,9 @@ def _field(value: Mapping[str, object], *names: str) -> object | None:
 
 def _prepared_version(pr: Mapping[str, object]) -> str:
     value = _field(pr, "prepared_version", "cargo_version", "version")
-    if value is None and isinstance(pr.get("head"), Mapping):
-        value = _field(pr["head"], "prepared_version", "cargo_version", "version")
+    head = pr.get("head")
+    if value is None and isinstance(head, Mapping):
+        value = _field(head, "prepared_version", "cargo_version", "version")
     if not isinstance(value, str) or not value:
         raise ValueError("live PR does not include its prepared Cargo version")
     return value
@@ -191,8 +328,9 @@ def _prepared_version(pr: Mapping[str, object]) -> str:
 
 def _source_snapshot(pr: Mapping[str, object]) -> str:
     value = _field(pr, "source_snapshot", "meaningful_tree", "snapshot")
-    if value is None and isinstance(pr.get("head"), Mapping):
-        value = _field(pr["head"], "source_snapshot", "meaningful_tree", "snapshot")
+    head = pr.get("head")
+    if value is None and isinstance(head, Mapping):
+        value = _field(head, "source_snapshot", "meaningful_tree", "snapshot")
     if not isinstance(value, str) or _SNAPSHOT.fullmatch(value) is None:
         raise ValueError("live PR does not include a valid meaningful source snapshot")
     return value

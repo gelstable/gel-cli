@@ -241,3 +241,43 @@ class WorkflowSafetyContractTests(unittest.TestCase):
             "contents": "read",
             "attestations": "read",
         }
+
+
+class StableMergeWorkflowContractTests(unittest.TestCase):
+    def test_stable_gate_runs_for_all_release_pr_state_changes(self):
+        workflow = _workflow("release-candidate-check.yml")
+        triggers = workflow["on"]
+        assert triggers["pull_request"]["types"] == [
+            "opened",
+            "synchronize",
+            "reopened",
+            "labeled",
+            "unlabeled",
+        ]
+        assert triggers["pull_request"]["branches"] == ["release/v*.x"]
+        assert "candidate" in workflow["jobs"]
+        assert workflow["jobs"]["candidate"]["name"] == "stable merge gate"
+
+    def test_stable_gate_reads_live_pr_merge_ref_and_candidate_record(self):
+        workflow = _workflow("release-candidate-check.yml")
+        text = _run_text(workflow["jobs"]["candidate"])
+        assert "pulls/$PR_NUMBER" in text
+        assert "refs/pull/$PR_NUMBER/merge" in text
+        assert "packaging/release-candidate.json" in text
+        assert "check_stable_merge" in text
+        assert "Cargo.toml" in text
+        assert "Cargo.lock" in text
+
+    def test_stable_gate_uses_read_only_permissions_and_pinned_actions(self):
+        workflow = _workflow("release-candidate-check.yml")
+        assert workflow["permissions"] == {"contents": "read"}
+        assert workflow["jobs"]["candidate"]["permissions"] == {
+            "contents": "read",
+            "pull-requests": "read",
+            "attestations": "read",
+        }
+        text = (WORKFLOWS / "release-candidate-check.yml").read_text()
+        for line in text.splitlines():
+            if "uses:" not in line or "./" in line:
+                continue
+            assert re.search(r"uses:\s+[^@\s]+@[0-9a-f]{40}\s+#\s+.+$", line)

@@ -23,7 +23,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import preview, release_state
+from . import assets, candidate, preview, release_state, source_equivalence, verify_draft
+from .models import CandidateRecord
 
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SNAPSHOT = re.compile(r"^[0-9a-f]{64}$")
@@ -211,6 +212,105 @@ def assert_live_identity(
         raise ValueError(
             f"candidate channel {expected.channel!r} does not match its phase {expected.phase!r}"
         )
+
+
+def check_stable_merge(
+    record: CandidateRecord,
+    live_pr: dict,
+    merge_sha: str,
+    repo: Path,
+) -> None:
+    """Validate every identity boundary required before a stable merge.
+
+    The candidate record was produced from a reviewed draft on the generated
+    PR head. This check re-reads the live PR, the prospective merge tree, both
+    Cargo version files, and the draft release before allowing the PR to merge.
+    Generated distribution metadata is ignored only by ``source_equivalence``'s
+    explicit four-path allowlist.
+    """
+
+    validated = candidate.validate_record(record)
+    if validated.phase is not None:
+        raise ValueError(
+            f"stable merge candidate must have no active phase; record has {validated.phase!r}"
+        )
+    if not isinstance(repo, Path):
+        raise ValueError(f"candidate source repository must be a Path, got {repo!r}")
+    if not isinstance(merge_sha, str) or _GIT_SHA.fullmatch(merge_sha) is None:
+        raise ValueError(f"prospective merge revision has an invalid SHA {merge_sha!r}")
+
+    live = release_state.validate_pr(live_pr, assets.REPOSITORY)
+    active_phase = release_state.phase_from_labels(_labels(live_pr))
+    if active_phase is not None:
+        raise ValueError(f"stable merge candidate cannot have active phase label {active_phase!r}")
+
+    checks: tuple[tuple[str, object, object], ...] = (
+        ("PR number", live.number, validated.pr_number),
+        ("release line", live.base_ref, validated.line),
+        ("base SHA", live.base_sha, validated.base_sha),
+        ("source SHA", live.head_sha, validated.source_sha),
+    )
+    for name, actual, expected in checks:
+        if actual != expected:
+            raise ValueError(f"live PR {name} {actual!r} does not match candidate {expected!r}")
+
+    version_fields = ("prepared_version", "cargo_version", "version")
+    head = live_pr.get("head")
+    has_version = any(name in live_pr for name in version_fields) or (
+        isinstance(head, Mapping) and any(name in head for name in version_fields)
+    )
+    live_version = _prepared_version(live_pr) if has_version else None
+    if live_version is not None and live_version != validated.version:
+        raise ValueError(
+            f"live PR prepared version {live_version!r} does not match candidate "
+            f"{validated.version!r}"
+        )
+
+    snapshot_fields = ("source_snapshot", "meaningful_tree", "snapshot")
+    has_snapshot = any(name in live_pr for name in snapshot_fields) or (
+        isinstance(head, Mapping) and any(name in head for name in snapshot_fields)
+    )
+    live_snapshot = _source_snapshot(live_pr) if has_snapshot else None
+    if live_snapshot is not None and live_snapshot != validated.source_snapshot:
+        raise ValueError(
+            f"live PR source snapshot {live_snapshot!r} does not match candidate "
+            f"{validated.source_snapshot!r}"
+        )
+
+    try:
+        source_equivalence.assert_snapshot(validated.source_snapshot, validated.source_sha, repo)
+        source_equivalence.assert_merge_equivalent(validated.source_sha, merge_sha, repo)
+    except source_equivalence.SourceDrift as error:
+        raise ValueError(f"stable merge source check failed: {error}") from error
+
+    # The source-equivalence check includes Cargo files, but checking both
+    # revisions explicitly also proves that the files resolve to the plain
+    # stable version expected by the candidate record.
+    verify_draft.check_cargo_version(validated.source_sha, validated.version, repo)
+    verify_draft.check_cargo_version(merge_sha, validated.version, repo)
+
+    expected_identity = {
+        "line": validated.line,
+        "pr_number": validated.pr_number,
+        "base_sha": validated.base_sha,
+        "source_sha": validated.source_sha,
+        "build_sha": validated.build_sha,
+        "source_snapshot": validated.source_snapshot,
+        "phase": None,
+        "version": validated.version,
+        "channel": "stable",
+    }
+    with tempfile.TemporaryDirectory(prefix="stable-merge-gate-") as directory:
+        try:
+            verify_draft.verify(
+                validated,
+                Path(directory),
+                repo=assets.REPOSITORY,
+                verify_attestations_flag=True,
+                expected_identity=expected_identity,
+            )
+        except verify_draft.DraftVerificationError as error:
+            raise ValueError(f"stable candidate draft verification failed: {error}") from error
 
 
 def _body_identity(release: Mapping[str, object]) -> Mapping[str, object] | None:

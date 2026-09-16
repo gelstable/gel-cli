@@ -5,10 +5,12 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
-from gel_release import cli, github_release, release_state
+from gel_release import cli, github_release, release_state, source_equivalence, verify_draft
+from gel_release.models import CandidateRecord
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY = "gelstable/gel-cli"
@@ -340,6 +342,169 @@ class CandidateIdentityBoundaryTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "published|draft"):
             github_release.find_reusable_draft([release], identity)
+
+
+class StableMergeGateTests(unittest.TestCase):
+    """The stable required check binds the PR, candidate, draft, and merge tree."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        self._git("init", "-q", ".")
+        self._git("config", "user.email", "test@example.com")
+        self._git("config", "user.name", "Stable Gate Test")
+        self._git("config", "commit.gpgsign", "false")
+        (self.repo / "Cargo.toml").write_text('[package]\nname = "gel-cli"\nversion = "7.1.0"\n')
+        (self.repo / "Cargo.lock").write_text(
+            'version = 4\n\n[[package]]\nname = "gel-cli"\nversion = "7.1.0"\n'
+        )
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "main.rs").write_text("fn main() {}\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "release line base")
+        self.base_sha = self._git("rev-parse", "HEAD")
+
+        (self.repo / "README.md").write_text("prepared release\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "prepared stable candidate")
+        self.source_sha = self._git("rev-parse", "HEAD")
+        self.snapshot = source_equivalence.meaningful_tree(self.source_sha, self.repo)
+        self.record = self._record()
+        self.live = _live_pr(
+            base_sha=self.base_sha,
+            head_sha=self.source_sha,
+            snapshot=self.snapshot,
+        )
+
+    def _git(self, *argv: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *argv],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def _record(self, **overrides: object) -> CandidateRecord:
+        value: dict[str, object] = {
+            "schema_version": 2,
+            "line": BASE_REF,
+            "pr_number": 101,
+            "phase": None,
+            "version": "7.1.0",
+            "tag": "v7.1.0",
+            "draft_release_id": 123456,
+            "source_sha": self.source_sha,
+            "source_snapshot": self.snapshot,
+            "build_sha": self.source_sha,
+            "base_sha": self.base_sha,
+            "build_date": "2026-09-16T00:00:00+00:00",
+            "workflow_runs": [],
+            "attestation": {
+                "predicate_type": "https://slsa.dev/provenance/v1",
+                "subject_count": 1,
+            },
+            "assets": [
+                {
+                    "id": 1,
+                    "name": "candidate.tar.gz",
+                    "size": 1,
+                    "sha256": "0" * 64,
+                    "blake2b512": "0" * 128,
+                }
+            ],
+        }
+        value.update(overrides)
+        return CandidateRecord.model_validate(value)
+
+    def _merge_sha(self, *generated: tuple[str, str]) -> str:
+        for path, contents in generated:
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(contents)
+        self._git("add", "-A")
+        self._git("commit", "-qm", "merge generated metadata")
+        return self._git("rev-parse", "HEAD")
+
+    def _check(self, live: dict | None = None, merge_sha: str | None = None) -> None:
+        with mock.patch("gel_release.verify_draft.verify"):
+            github_release.check_stable_merge(
+                self.record,
+                live or self.live,
+                merge_sha or self.source_sha,
+                self.repo,
+            )
+
+    def test_current_same_repository_generated_pr_with_verified_draft_is_accepted(self):
+        self._check()
+
+    def test_generated_metadata_only_merge_tree_is_accepted(self):
+        merge_sha = self._merge_sha(
+            ("Formula/gel.rb", "class Gel < Formula\nend\n"),
+            ("bucket/gel.json", "{}\n"),
+            ("packaging/aur/PKGBUILD", "pkgname=gel-cli-bin\n"),
+            ("packaging/release-candidate.json", "{}\n"),
+        )
+        self._check(merge_sha=merge_sha)
+
+    def test_forked_head_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "fork|repository"):
+            self._check(
+                {**self.live, "head": {**self.live["head"], "repo": {"full_name": "fork/gel-cli"}}}
+            )
+
+    def test_wrong_head_or_base_names_are_rejected(self):
+        for key, value, pattern in (
+            ("head", {"ref": "feature/release-v7.x"}, "head|identity"),
+            ("base", {"ref": "master"}, "base|line|identity"),
+        ):
+            with self.subTest(key=key):
+                live = {**self.live, key: {**self.live[key], **value}}
+                with self.assertRaisesRegex(ValueError, pattern):
+                    self._check(live)
+
+    def test_moved_release_line_base_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "base"):
+            self._check({**self.live, "base": {**self.live["base"], "sha": "d" * 40}})
+
+    def test_label_swap_cannot_keep_stale_stable_record_green(self):
+        with self.assertRaisesRegex(ValueError, "phase"):
+            self._check({**self.live, "labels": [{"name": "prerelease:beta"}]})
+
+    def test_prepared_version_major_mismatch_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "version|major"):
+            self._check({**self.live, "prepared_version": "8.1.0"})
+
+    def test_missing_candidate_record_is_rejected(self):
+        with mock.patch("gel_release.verify_draft.verify"):
+            with self.assertRaisesRegex(ValueError, "record|candidate"):
+                github_release.check_stable_merge(
+                    None,  # type: ignore[arg-type]
+                    self.live,
+                    self.source_sha,
+                    self.repo,
+                )
+
+    def test_changed_draft_assets_fail_the_gate(self):
+        with mock.patch(
+            "gel_release.verify_draft.verify",
+            side_effect=verify_draft.DraftVerificationError("asset bytes changed"),
+        ):
+            with self.assertRaisesRegex(ValueError, "draft|asset|bytes"):
+                github_release.check_stable_merge(
+                    self.record,
+                    self.live,
+                    self.source_sha,
+                    self.repo,
+                )
+
+    def test_prospective_merge_tree_with_source_change_is_rejected(self):
+        (self.repo / "src" / "main.rs").write_text('fn main() { println!("changed"); }\n')
+        self._git("add", "-A")
+        self._git("commit", "-qm", "source change in merge")
+        merge_sha = self._git("rev-parse", "HEAD")
+        with self.assertRaisesRegex(ValueError, "source|drift|equivalent"):
+            self._check(merge_sha=merge_sha)
 
 
 class PreviewCommitTests(unittest.TestCase):

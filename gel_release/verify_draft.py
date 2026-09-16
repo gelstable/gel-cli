@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -19,10 +20,101 @@ from .models import CandidateRecord, GithubAsset
 DISTRIBUTION_SUFFIXES = (".tar.gz", ".zip", ".deb", ".rpm")
 DIGEST_MANIFEST_NAMES = (assets.SHA256SUMS_NAME, assets.BLAKE2B_SUMS_NAME)
 SHA1_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
+STABLE_VERSION_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
 
 
 class DraftVerificationError(ValueError):
     """The staged release does not match the reviewed candidate."""
+
+
+def _git_blob(revision: str, path: str, repo: Path) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{revision}:{path}"],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = (
+            error.stderr.decode(errors="replace").strip()
+            if isinstance(error, subprocess.CalledProcessError)
+            else str(error)
+        )
+        raise DraftVerificationError(
+            f"could not read {path} from candidate revision {revision}: {detail}"
+        ) from error
+    return completed.stdout
+
+
+def _package_version(cargo: Mapping[str, object]) -> object:
+    package = cargo.get("package")
+    if not isinstance(package, Mapping):
+        raise DraftVerificationError("Cargo.toml has no package table")
+    if package.get("name") != "gel-cli":
+        raise DraftVerificationError(
+            f"Cargo.toml package is {package.get('name')!r}, expected 'gel-cli'"
+        )
+    version = package.get("version")
+    if isinstance(version, str):
+        return version
+    if isinstance(version, Mapping) and version.get("workspace") is True:
+        workspace = cargo.get("workspace")
+        workspace_package = workspace.get("package") if isinstance(workspace, Mapping) else None
+        if isinstance(workspace_package, Mapping):
+            return workspace_package.get("version")
+    return None
+
+
+def check_cargo_version(revision: str, expected: str, repo: Path = Path(".")) -> None:
+    """Require Cargo.toml and Cargo.lock at ``revision`` to resolve stably.
+
+    The stable merge gate reads both files from the exact prospective merge
+    tree. This keeps the check independent of whichever checkout happened to
+    be left on the runner and rejects prerelease or otherwise unsupported
+    versions before the PR can merge.
+    """
+
+    if not isinstance(expected, str) or STABLE_VERSION_PATTERN.fullmatch(expected) is None:
+        raise DraftVerificationError(
+            f"stable candidate version {expected!r} is not a plain SemVer version"
+        )
+    try:
+        cargo = tomllib.loads(_git_blob(revision, "Cargo.toml", repo).decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise DraftVerificationError(f"Cargo.toml at {revision} is not UTF-8: {error}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise DraftVerificationError(f"Cargo.toml at {revision} is invalid: {error}") from error
+
+    actual_cargo = _package_version(cargo)
+    if actual_cargo != expected:
+        raise DraftVerificationError(
+            f"Cargo.toml at {revision} resolves gel-cli version {actual_cargo!r}, "
+            f"expected {expected!r}"
+        )
+
+    try:
+        lock = tomllib.loads(_git_blob(revision, "Cargo.lock", repo).decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise DraftVerificationError(f"Cargo.lock at {revision} is not UTF-8: {error}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise DraftVerificationError(f"Cargo.lock at {revision} is invalid: {error}") from error
+
+    packages = lock.get("package")
+    matches = [
+        package
+        for package in packages or []
+        if isinstance(package, Mapping) and package.get("name") == "gel-cli"
+    ]
+    if len(matches) != 1:
+        raise DraftVerificationError(
+            f"Cargo.lock at {revision} has {len(matches)} gel-cli package entries"
+        )
+    actual_lock = matches[0].get("version")
+    if actual_lock != expected:
+        raise DraftVerificationError(
+            f"Cargo.lock at {revision} resolves gel-cli version {actual_lock!r}, "
+            f"expected {expected!r}"
+        )
 
 
 _IDENTITY_FIELDS = (

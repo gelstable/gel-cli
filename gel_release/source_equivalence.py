@@ -112,3 +112,16 @@ def assert_equivalent(base_rev: str, head_rev: str, repo: Path = Path(".")) -> N
             f"{head_rev} is not source-equivalent to {base_rev}:\n"
             + "\n".join(f"  {line}" for line in differences)
         )
+
+
+def assert_merge_equivalent(
+    tested_source: str, merge_revision: str, repo: Path = Path(".")
+) -> None:
+    """Require a prospective merge tree to preserve the tested source tree.
+
+    ``compare`` already excludes the four generated paths exactly. Keeping a
+    named merge helper makes that invariant explicit at the stable gate call
+    site and ensures callers do not accidentally compare only a commit diff.
+    """
+
+    assert_equivalent(tested_source, merge_revision, repo)

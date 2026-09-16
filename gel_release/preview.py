@@ -46,12 +46,16 @@ def _validate_phase(phase: str) -> None:
         raise ValueError(f"unsupported preview phase: {phase!r}")
 
 
-def _published_snapshot_exists(phase: str, already_published: set[tuple[str, str]]) -> bool:
+def _published_snapshot_exists(
+    phase: str,
+    current_snapshot: str,
+    already_published: set[tuple[str, str]],
+) -> bool:
     """Return whether the caller has already published this phase snapshot.
 
     The snapshot digest is selected by the controller from the current PR
-    head.  The version selector receives the set for that current identity;
-    any matching phase entry therefore means this exact snapshot is complete.
+    head.  Compare both fields so an older snapshot in the same phase does not
+    suppress a new preview.
     """
 
     for entry in already_published:
@@ -60,7 +64,7 @@ def _published_snapshot_exists(phase: str, already_published: set[tuple[str, str
         entry_phase, snapshot = entry
         if not isinstance(entry_phase, str) or not isinstance(snapshot, str):
             raise ValueError(f"invalid published snapshot entry: {entry!r}")
-        if entry_phase == phase:
+        if entry_phase == phase and snapshot == current_snapshot:
             return True
     return False
 
@@ -70,6 +74,7 @@ def next_preview_version(
     phase: str,
     published_tags: list[str],
     already_published: set[tuple[str, str]],
+    current_snapshot: str,
 ) -> str | None:
     """Select the next unpublished preview version for a base and phase.
 
@@ -83,7 +88,9 @@ def next_preview_version(
         raise ValueError("published tags must be a list of strings")
     if not isinstance(already_published, set):
         raise ValueError("already published snapshots must be a set")
-    if _published_snapshot_exists(phase, already_published):
+    if not isinstance(current_snapshot, str) or not current_snapshot:
+        raise ValueError("current snapshot must be a non-empty string")
+    if _published_snapshot_exists(phase, current_snapshot, already_published):
         return None
 
     highest = 0

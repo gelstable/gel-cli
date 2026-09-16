@@ -35,18 +35,22 @@ class StableVersionTests(unittest.TestCase):
 class PreviewVersionTests(unittest.TestCase):
     def test_alpha_suffix_starts_at_one_and_advances_from_published_tags(self):
         self.assertEqual(
-            preview.next_preview_version("7.1.1", "alpha", [], set()),
+            preview.next_preview_version("7.1.1", "alpha", [], set(), "tree-1"),
             "7.1.1-alpha.1",
         )
         self.assertEqual(
-            preview.next_preview_version("7.1.1", "alpha", ["v7.1.1-alpha.1"], set()),
+            preview.next_preview_version("7.1.1", "alpha", ["v7.1.1-alpha.1"], set(), "tree-1"),
             "7.1.1-alpha.2",
         )
 
     def test_switching_phase_starts_at_one_for_the_same_source(self):
         self.assertEqual(
             preview.next_preview_version(
-                "7.1.1", "beta", ["v7.1.1-alpha.1", "v7.1.1-alpha.2"], set()
+                "7.1.1",
+                "beta",
+                ["v7.1.1-alpha.1", "v7.1.1-alpha.2"],
+                set(),
+                "tree-1",
             ),
             "7.1.1-beta.1",
         )
@@ -54,15 +58,35 @@ class PreviewVersionTests(unittest.TestCase):
     def test_changing_base_version_resets_phase_suffix(self):
         self.assertEqual(
             preview.next_preview_version(
-                "7.1.2", "alpha", ["v7.1.1-alpha.1", "v7.1.1-alpha.2"], set()
+                "7.1.2",
+                "alpha",
+                ["v7.1.1-alpha.1", "v7.1.1-alpha.2"],
+                set(),
+                "tree-2",
             ),
             "7.1.2-alpha.1",
         )
 
-    def test_published_phase_and_snapshot_returns_no_work(self):
+    def test_old_snapshot_allows_the_next_suffix(self):
+        self.assertEqual(
+            preview.next_preview_version(
+                "7.1.1",
+                "alpha",
+                ["v7.1.1-alpha.1"],
+                {("alpha", "old-tree")},
+                "new-tree",
+            ),
+            "7.1.1-alpha.2",
+        )
+
+    def test_published_phase_and_current_snapshot_returns_no_work(self):
         self.assertIsNone(
             preview.next_preview_version(
-                "7.1.1", "alpha", ["v7.1.1-alpha.1"], {("alpha", "snapshot-1")}
+                "7.1.1",
+                "alpha",
+                ["v7.1.1-alpha.1"],
+                {("alpha", "snapshot-1")},
+                "snapshot-1",
             )
         )
 
@@ -76,15 +100,15 @@ class PreviewVersionTests(unittest.TestCase):
             "v7.1.1-dev.8",
         ]
         self.assertEqual(
-            preview.next_preview_version("7.1.1", "alpha", tags, set()),
+            preview.next_preview_version("7.1.1", "alpha", tags, set(), "tree-1"),
             "7.1.1-alpha.2",
         )
 
     def test_unsupported_base_and_phase_are_rejected(self):
         with self.assertRaises(ValueError):
-            preview.next_preview_version("7.1.1-dev.1", "alpha", [], set())
+            preview.next_preview_version("7.1.1-dev.1", "alpha", [], set(), "tree-1")
         with self.assertRaises(ValueError):
-            preview.next_preview_version("7.1.1", "preview", [], set())
+            preview.next_preview_version("7.1.1", "preview", [], set(), "tree-1")
 
 
 class PreviewCliTests(unittest.TestCase):
@@ -127,6 +151,8 @@ class PreviewCliTests(unittest.TestCase):
                 "7.1.1",
                 "--phase",
                 "alpha",
+                "--snapshot",
+                "new-tree",
                 "--tags-json",
                 str(tags),
                 "--published-json",
@@ -135,6 +161,30 @@ class PreviewCliTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "7.1.1-alpha.2")
+
+    def test_preview_version_cli_returns_no_work_for_current_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tags = Path(tmp) / "tags.json"
+            published = Path(tmp) / "published.json"
+            tags.write_text(json.dumps(["v7.1.1-alpha.1"]))
+            published.write_text(json.dumps([["alpha", "current-tree"]]))
+
+            completed = self._run(
+                "preview-version",
+                "--base",
+                "7.1.1",
+                "--phase",
+                "alpha",
+                "--snapshot",
+                "current-tree",
+                "--tags-json",
+                str(tags),
+                "--published-json",
+                str(published),
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
 
 
 if __name__ == "__main__":

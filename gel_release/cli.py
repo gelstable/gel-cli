@@ -82,6 +82,9 @@ def _parser() -> argparse.ArgumentParser:
     preview_version = commands.add_parser("preview-version")
     preview_version.add_argument("--base", required=True)
     preview_version.add_argument("--phase", required=True)
+    preview_version.add_argument(
+        "--snapshot", "--current-snapshot", dest="current_snapshot", required=True
+    )
     preview_version.add_argument("--tags-json", required=True, type=Path)
     preview_version.add_argument("--published-json", required=True, type=Path)
     draft = commands.add_parser("verify-draft")
@@ -211,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.phase,
                 _read_tags(args.tags_json),
                 _read_published_snapshots(args.published_json),
+                args.current_snapshot,
             )
             if selected is not None:
                 print(selected)

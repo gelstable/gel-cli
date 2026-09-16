@@ -7,6 +7,7 @@ packaging-only diff. This module compares complete trees instead.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -47,6 +48,26 @@ def tree_entries(rev: str, repo: Path = Path(".")) -> dict[str, str]:
         mode, objectname, path = record.split(" ", 2)
         entries[path] = f"{mode} {objectname}"
     return entries
+
+
+def meaningful_tree(rev: str, repo: Path = Path(".")) -> str:
+    """Return a stable digest of the source-relevant tree at ``rev``.
+
+    Git tree object IDs include every file, including generated release
+    metadata.  Preview identity must ignore exactly those generated paths, so
+    hash the remaining mode, path, and blob object ID entries in a canonical
+    order instead.
+    """
+
+    entries = tree_entries(rev, repo)
+    canonical: list[str] = []
+    for path, value in entries.items():
+        if path in ALLOWLIST:
+            continue
+        mode, objectname = value.split(" ", 1)
+        canonical.append(f"{mode} {path} {objectname}\n")
+    canonical.sort()
+    return hashlib.sha256("".join(canonical).encode("utf-8")).hexdigest()
 
 
 def compare(base_rev: str, head_rev: str, repo: Path = Path(".")) -> list[str]:

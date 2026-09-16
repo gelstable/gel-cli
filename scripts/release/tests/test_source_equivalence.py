@@ -93,6 +93,35 @@ class EquivalenceTests(unittest.TestCase):
             ],
         )
 
+    def test_meaningful_tree_ignores_generated_candidate_and_distribution_files(self):
+        baseline = source_equivalence.meaningful_tree(self.base, self.repo)
+
+        (self.repo / "Formula").mkdir()
+        (self.repo / "Formula" / "gel.rb").write_text("class Gel < Formula\nend\n")
+        (self.repo / "bucket").mkdir()
+        (self.repo / "bucket" / "gel.json").write_text("{}\n")
+        (self.repo / "packaging" / "release-candidate.json").write_text("{}\n")
+        (self.repo / "packaging" / "aur").mkdir()
+        (self.repo / "packaging" / "aur" / "PKGBUILD").write_text("pkgname=gel-cli-bin\n")
+        generated = self._commit("generated candidate and distribution files")
+
+        self.assertEqual(source_equivalence.meaningful_tree(generated, self.repo), baseline)
+
+    def test_meaningful_tree_changes_for_source_and_prepared_metadata(self):
+        baseline = source_equivalence.meaningful_tree(self.base, self.repo)
+
+        (self.repo / "src" / "main.rs").write_text("fn main() { println!(); }\n")
+        source_change = self._commit("source change")
+        self.assertNotEqual(source_equivalence.meaningful_tree(source_change, self.repo), baseline)
+
+        (self.repo / "Cargo.toml").write_text('[package]\nname = "gel"\nversion = "7.1.1"\n')
+        (self.repo / "Cargo.lock").write_text("version = 4\n")
+        prepared_change = self._commit("prepare version")
+        self.assertNotEqual(
+            source_equivalence.meaningful_tree(prepared_change, self.repo),
+            source_equivalence.meaningful_tree(source_change, self.repo),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

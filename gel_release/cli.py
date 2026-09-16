@@ -15,6 +15,7 @@ from . import (
     candidate,
     linux_packages,
     package_target,
+    preview,
     registry_manifest,
     release_state,
     source_equivalence,
@@ -75,6 +76,14 @@ def _parser() -> argparse.ArgumentParser:
     source.add_argument("--base", required=True)
     source.add_argument("--head", required=True)
     source.add_argument("--repo", default=Path("."), type=Path)
+    snapshot = commands.add_parser("snapshot")
+    snapshot.add_argument("--rev", required=True)
+    snapshot.add_argument("--repo", default=Path("."), type=Path)
+    preview_version = commands.add_parser("preview-version")
+    preview_version.add_argument("--base", required=True)
+    preview_version.add_argument("--phase", required=True)
+    preview_version.add_argument("--tags-json", required=True, type=Path)
+    preview_version.add_argument("--published-json", required=True, type=Path)
     draft = commands.add_parser("verify-draft")
     draft.add_argument("--record", default=candidate.CANDIDATE_PATH, type=Path)
     draft.add_argument("--download-dir", required=True, type=Path)
@@ -98,6 +107,39 @@ def _matrix(kind: str) -> dict[str, list[dict[str, object]]]:
             for t in targets
         ]
     }
+
+
+def _read_tags(path: Path) -> list[str]:
+    value = json.loads(path.read_text())
+    if isinstance(value, dict):
+        value = value.get("tags")
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{path} must contain a JSON list of tag strings")
+    return value
+
+
+def _read_published_snapshots(path: Path) -> set[tuple[str, str]]:
+    value = json.loads(path.read_text())
+    if isinstance(value, dict):
+        value = value.get("published")
+    if not isinstance(value, list):
+        raise ValueError(f"{path} must contain a JSON list of published snapshots")
+
+    result: set[tuple[str, str]] = set()
+    for entry in value:
+        if isinstance(entry, list) and len(entry) == 2:
+            phase, snapshot = entry
+        elif isinstance(entry, dict):
+            phase = entry.get("phase")
+            snapshot = entry.get("snapshot", entry.get("meaningful_tree"))
+            if snapshot is None:
+                snapshot = entry.get("source_snapshot")
+        else:
+            raise ValueError(f"{path} contains an invalid published snapshot entry")
+        if not isinstance(phase, str) or not isinstance(snapshot, str):
+            raise ValueError(f"{path} contains an invalid published snapshot entry")
+        result.add((phase, snapshot))
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -161,6 +203,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "source-equivalence":
             source_equivalence.assert_equivalent(args.base, args.head, args.repo)
             print(f"{args.head} is source-equivalent to {args.base} outside the allowlist")
+        elif args.command == "snapshot":
+            print(source_equivalence.meaningful_tree(args.rev, args.repo))
+        elif args.command == "preview-version":
+            selected = preview.next_preview_version(
+                args.base,
+                args.phase,
+                _read_tags(args.tags_json),
+                _read_published_snapshots(args.published_json),
+            )
+            if selected is not None:
+                print(selected)
         elif args.command == "verify-draft":
             verify_draft.verify(
                 candidate.load(args.record),

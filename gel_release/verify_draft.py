@@ -101,7 +101,8 @@ def _is_http_404(error: subprocess.CalledProcessError) -> bool:
         for value in (error.stdout, error.stderr)
         if value
     )
-    return re.search(r"\b404\b", output) is not None
+    statuses = set(re.findall(r"\bHTTP[ \t]+(\d{3})\b", output, flags=re.IGNORECASE))
+    return statuses == {"404"}
 
 
 def resolve_tag_commit(tag: str, repo: str = assets.REPOSITORY) -> str | None:

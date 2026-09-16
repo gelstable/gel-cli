@@ -119,9 +119,7 @@ class ReleaseIdentityTests(unittest.TestCase):
     def test_lightweight_tag_source_matches_candidate(self, gh_json):
         resolved = verify_draft.check_release_identity(self.RELEASE, self.RECORD)
         self.assertEqual(resolved, "a" * 40)
-        gh_json.assert_called_once_with(
-            "api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0"
-        )
+        gh_json.assert_called_once_with("api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0")
 
     @mock.patch(
         "gel_release.verify_draft._gh_json",
@@ -161,9 +159,7 @@ class ReleaseIdentityTests(unittest.TestCase):
     def test_uncreated_draft_tag_is_not_proven_by_release_body(self, gh_json):
         resolved = verify_draft.check_release_identity(self.RELEASE, self.RECORD)
         self.assertIsNone(resolved)
-        gh_json.assert_called_once_with(
-            "api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0"
-        )
+        gh_json.assert_called_once_with("api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0")
 
     @mock.patch(
         "gel_release.verify_draft._gh_json",
@@ -185,15 +181,38 @@ class ReleaseIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(verify_draft.DraftVerificationError, "lookup"):
             verify_draft.check_release_identity(self.RELEASE, self.RECORD)
 
+    def test_tag_lookup_ignores_unrelated_404(self):
+        for stderr in (
+            "gh: Forbidden (HTTP 403)\nRequest ID: 404",
+            "gh: Internal Server Error (HTTP 500)\nRequest ID: 404",
+            "gh: lookup failed\nRequest ID: 404",
+        ):
+            with self.subTest(stderr=stderr):
+                error = subprocess.CalledProcessError(1, ["gh", "api"], stderr=stderr)
+                with mock.patch("gel_release.verify_draft._gh_json", side_effect=error):
+                    with self.assertRaisesRegex(verify_draft.DraftVerificationError, "lookup"):
+                        verify_draft.check_release_identity(self.RELEASE, self.RECORD)
+
+    def test_tag_lookup_rejects_conflicting_http_statuses(self):
+        for stderr in ("gh: Forbidden (HTTP 403)", "gh: Forbidden HTTP 403"):
+            with self.subTest(stderr=stderr):
+                error = subprocess.CalledProcessError(
+                    1,
+                    ["gh", "api"],
+                    output="gh: Not Found (HTTP 404)",
+                    stderr=stderr,
+                )
+                with mock.patch("gel_release.verify_draft._gh_json", side_effect=error):
+                    with self.assertRaisesRegex(verify_draft.DraftVerificationError, "lookup"):
+                        verify_draft.check_release_identity(self.RELEASE, self.RECORD)
+
     @mock.patch("gel_release.verify_draft.resolve_tag_commit", return_value=None)
     @mock.patch("gel_release.verify_draft.get_release", return_value=RELEASE)
     def test_skip_attestations_rejects_uncreated_draft_tag(self, get_release, resolve_tag):
         record = {**self.RECORD, "version": "7.11.0", "draft_release_id": 1}
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(verify_draft.DraftVerificationError, "not created"):
-                verify_draft.verify(
-                    record, Path(tmp), verify_attestations_flag=False
-                )
+                verify_draft.verify(record, Path(tmp), verify_attestations_flag=False)
 
 
 class ManifestDigestTests(unittest.TestCase):

@@ -436,6 +436,34 @@ class GithubReleaseCliTests(unittest.TestCase):
         self.assertIn("gh workflow run", rendered)
         self.assertNotIn("cargo build", rendered)
 
+    def test_release_controller_normalizes_all_paginated_release_pages(self):
+        steps = yaml.safe_load(
+            (REPO_ROOT / ".github" / "workflows" / "release-controller.yml").read_text()
+        )["jobs"]["resolve"]["steps"]
+        release_step = next(
+            step for step in steps if step.get("name") == "Read published tags and release records"
+        )
+        run = release_step["run"]
+        self.assertIn("gh api --paginate --slurp", run)
+        self.assertIn("| jq 'add' > \"$RUNNER_TEMP/releases.json\"", run)
+
+    def test_release_controller_keys_preview_ref_by_build_sha_without_force_push(self):
+        steps = yaml.safe_load(
+            (REPO_ROOT / ".github" / "workflows" / "release-controller.yml").read_text()
+        )["jobs"]["resolve"]["steps"]
+        preview_step = next(
+            step
+            for step in steps
+            if step.get("name") == "Derive and preserve the preview build commit"
+        )
+        run = preview_step["run"]
+        self.assertIn(
+            'preview_ref="refs/heads/gel-preview-build/${preview_line}/${TAG}/${build_sha}"',
+            run,
+        )
+        self.assertIn('git push origin "$build_sha:$preview_ref"', run)
+        self.assertNotIn("git push --force", run)
+
 
 if __name__ == "__main__":
     unittest.main()

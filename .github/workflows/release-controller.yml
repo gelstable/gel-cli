@@ -140,8 +140,8 @@ jobs:
           gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
             --jq '.[].ref | sub("^refs/tags/"; "")' \
             | jq -Rsc 'split("\n") | map(select(length > 0))' > "$RUNNER_TEMP/published-tags.json"
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-            > "$RUNNER_TEMP/releases.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" \
+            | jq 'add' > "$RUNNER_TEMP/releases.json"
 
       - name: Read published preview candidate records
         env:
@@ -277,9 +277,9 @@ jobs:
           build_sha="$(uv run --frozen gel-release derive-preview-commit \
             --source-sha "$SOURCE_SHA" --version "${TAG#v}" --repo-root .)"
           preview_line="${LINE//\//-}"
-          preview_ref="refs/heads/gel-preview-build/${preview_line}/${TAG}"
+          preview_ref="refs/heads/gel-preview-build/${preview_line}/${TAG}/${build_sha}"
           git update-ref "$preview_ref" "$build_sha"
-          git push --force origin "$build_sha:$preview_ref"
+          git push origin "$build_sha:$preview_ref"
           jq --arg build_sha "$build_sha" '.build_sha = $build_sha' \
             "$RUNNER_TEMP/identity.json" > "$RUNNER_TEMP/identity-with-build.json"
           mv "$RUNNER_TEMP/identity-with-build.json" "$RUNNER_TEMP/identity.json"

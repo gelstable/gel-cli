@@ -45,38 +45,30 @@ def _run_text(job: dict) -> str:
 
 
 class CandidateInputContractTests(unittest.TestCase):
-    def test_candidate_is_dispatchable_and_reusable_with_immutable_identity(self):
+    def test_candidate_only_accepts_a_dispatched_json_identity(self):
         workflow = _workflow("release-candidate.yml")
         triggers = workflow["on"]
         assert "workflow_dispatch" in triggers
-        assert "workflow_call" in triggers
+        # `workflow_call` would bypass the immutable-ref check, which is gated
+        # on `github.event_name == 'workflow_dispatch'`. Nothing calls this
+        # workflow; the controller dispatches it with `gh workflow run`.
+        assert "workflow_call" not in triggers
 
         dispatch_inputs = triggers["workflow_dispatch"]["inputs"]
-        call_inputs = triggers["workflow_call"]["inputs"]
-        expected = {
-            "identity",
-            "line",
-            "pr_number",
-            "base_sha",
-            "source_sha",
-            "build_sha",
-            "source_snapshot",
-            "phase",
-            "version",
-            "channel",
-        }
-        assert expected <= set(dispatch_inputs)
-        assert expected <= set(call_inputs)
-        for name in expected - {"identity"}:
-            assert call_inputs[name]["type"] == "string"
+        assert set(dispatch_inputs) == {"identity", "line"}
+        assert dispatch_inputs["identity"]["required"] is True
 
-    def test_candidate_outputs_draft_and_verified_record(self):
+        # The explicit-field assembly branch is gone with its inputs.
+        identity_text = _run_text(workflow["jobs"]["identity"])
+        assert "INPUT_SOURCE_SNAPSHOT" not in identity_text
+
+    def test_candidate_stages_and_verifies_the_draft(self):
         workflow = _workflow("release-candidate.yml")
-        outputs = workflow["on"]["workflow_call"]["outputs"]
-        assert {"draft_release_id", "verified_candidate"} <= set(outputs)
         assert "jobs" in workflow
         assert "stage" in workflow["jobs"]
         assert "verify" in workflow["jobs"]
+        assert "draft_release_id" in workflow["jobs"]["stage"]["outputs"]
+        assert "verified_candidate" in workflow["jobs"]["verify"]["outputs"]
 
     def test_controller_dispatch_matches_candidate_identity_input(self):
         controller = (WORKFLOWS / "release-controller.yml").read_text()
@@ -94,7 +86,9 @@ class CandidateInputContractTests(unittest.TestCase):
             step.get("if") == "github.event_name == 'workflow_dispatch'"
             for step in _steps(workflow["jobs"]["identity"])
         )
-        assert 'test "$GITHUB_SHA" = "$BUILD_SHA"' in identity_text
+        assert '"$GITHUB_SHA" != "$BUILD_SHA"' in identity_text
+        # The gate names expected and actual instead of failing silently.
+        assert "is not the build SHA" in identity_text
 
     def test_json_identity_normalization_keeps_the_object(self):
         identity_text = _run_text(_workflow("release-candidate.yml")["jobs"]["identity"])
@@ -118,17 +112,25 @@ class CandidateInputContractTests(unittest.TestCase):
             if step.get("name") == "Write the immutable candidate record"
         )
         assert record["env"]["GH_TOKEN"] == "${{ github.token }}"
-        assert "find_replaceable_draft" in _run_text(stage)
+        assert "select-draft" in _run_text(stage)
         assert "git/ref/tags/$TAG" in _run_text(stage)
         assert "git/refs/tags/$TAG" in _run_text(stage)
         assert "git/tags/$tag_target" in _run_text(stage)
 
-    def test_stage_revalidation_python_block_is_executable_after_yaml_folding(self):
+    def test_stage_revalidates_the_draft_against_fresh_state_before_replacing_assets(self):
+        # Asset replacement is only safe against the draft that was selected,
+        # so the stage job re-fetches that one release and re-runs the same
+        # selector before mutating it. Both calls go through the CLI, so no
+        # workflow imports a module-private selector.
         workflow = _workflow("release-candidate.yml")
         text = _run_text(workflow["jobs"]["stage"])
-        match = re.search(r"python -c '(?P<source>.*?)\n\s*' \"\$RUNNER_TEMP", text, re.S)
-        assert match, "missing inline draft revalidation script"
-        compile(match.group("source"), "release-candidate.yml: draft revalidation", "exec")
+        assert text.count("gel-release select-draft") == 2
+        assert "releases/$existing" in text
+        assert '--releases-json "$RUNNER_TEMP/reusable-release.json"' in text
+        assert "the selected draft changed before asset replacement" in text
+        assert "_body_identity" not in text
+        assert "find_replaceable_draft" not in text
+        assert "find_reusable_draft" not in text
 
     def test_candidate_cleanup_keeps_successful_preview_ref_until_publication(self):
         workflow = _workflow("release-candidate.yml")
@@ -349,25 +351,100 @@ class StableMergeWorkflowContractTests(unittest.TestCase):
         text = _run_text(workflow["jobs"]["candidate"])
         assert "release-head" in text
         assert "packaging/release-candidate.json" in text
-        assert "packaging/gel-candidate.json" in text
+        # Preview records are release assets; the repo path never exists.
+        assert "packaging/gel-candidate.json" not in text
         assert "generated" in text
         assert "candidate record" in text
 
-    def test_stable_gate_is_dispatchable_and_dispatched_around_the_record_push(self):
+    def test_stable_gate_is_dispatched_on_the_pr_head_branch(self):
+        """A dispatched check run attaches to the head SHA of its ref.
+
+        Branch protection evaluates the required context on the generated PR's
+        head commit, so the gate has to be dispatched on the PR head branch.
+        Dispatching on a fixed branch (`master`, `$CONTROLLER_REF`, ...) posts
+        the result on that branch and can never satisfy the required check.
+        """
         check = _workflow("release-candidate-check.yml")
         triggers = check["on"]
         assert "workflow_dispatch" in triggers
         assert "pr_number" in triggers["workflow_dispatch"]["inputs"]
 
         candidate_workflow = _workflow("release-candidate.yml")
-        commit_text = _run_text(candidate_workflow["jobs"]["commit-stable"])
-        assert "gh workflow run release-candidate-check.yml" in commit_text
-        assert '-f pr_number="$PR_NUMBER"' in commit_text
         assert candidate_workflow["jobs"]["commit-stable"]["permissions"]["actions"] == "write"
 
-        controller = (WORKFLOWS / "release-controller.yml").read_text()
-        assert "release-candidate-check.yml" in controller
-        assert "packaging/release-candidate.json" in controller
+        sources = {
+            "release-candidate.yml": _run_text(candidate_workflow["jobs"]["commit-stable"]),
+            "release-controller.yml": (WORKFLOWS / "release-controller.yml").read_text(),
+        }
+        dispatches = 0
+        for name, text in sources.items():
+            for match in re.finditer(
+                r"gh workflow run release-candidate-check\.yml"
+                r"(?P<args>(?:[^\n]*\\\n)+[^\n]*)",
+                text,
+            ):
+                dispatches += 1
+                args = match.group("args")
+                with self.subTest(workflow=name):
+                    ref = re.search(r'--ref\s+"(?P<ref>[^"]+)"', args)
+                    assert ref, f"{name} dispatches the gate without an explicit --ref"
+                    # The head branch of the live PR, never a fixed branch.
+                    self.assertEqual(ref.group("ref"), "$head_ref")
+                    assert "-f pr_number=" in args
+                    assert "head.ref" in text
+
+        assert dispatches == 2, f"expected both dispatch sites, found {dispatches}"
+
+        # The dispatched run must refuse to report on a commit it did not
+        # verify, so dispatching on a moving branch cannot produce a passing
+        # result for the wrong head.
+        gate = _run_text(check["jobs"]["candidate"])
+        assert '"$GITHUB_SHA" != "$HEAD_SHA"' in gate
+        pin = next(
+            step
+            for step in _steps(check["jobs"]["candidate"])
+            if "GITHUB_SHA" in str(step.get("run", ""))
+        )
+        assert pin.get("if") == "github.event_name == 'workflow_dispatch'"
+        assert "head_sha" in str(check["jobs"]["candidate"]["steps"])
+
+    def test_event_firing_token_has_no_default_token_fallback(self):
+        """`GITHUB_TOKEN` pushes fire no events, so the gate would never run."""
+        for name in ("release-candidate.yml", "release-controller.yml", "release-pr.yml"):
+            text = (WORKFLOWS / name).read_text()
+            with self.subTest(workflow=name):
+                assert "RELEASE_BOT_TOKEN" in text
+                assert "RELEASE_BOT_TOKEN || github.token" not in text
+
+        for name, job in (
+            ("release-candidate.yml", "commit-stable"),
+            ("release-controller.yml", "resolve"),
+        ):
+            steps = _steps(_workflow(name)["jobs"][job])
+            with self.subTest(workflow=name):
+                assert "RELEASE_BOT_TOKEN is not configured" in "\n".join(
+                    str(step.get("run", "")) for step in steps
+                )
+
+    def test_controller_and_candidate_report_selection_to_operators(self):
+        controller = _run_text(_workflow("release-controller.yml")["jobs"]["resolve"])
+        assert "GITHUB_STEP_SUMMARY" in controller
+        for field in ("- line: ", "- version: ", "- source SHA: ", "- phase: "):
+            assert field in controller
+        assert "release rejected: " in controller
+
+        candidate = "\n".join(
+            _run_text(job)
+            for job in _workflow("release-candidate.yml")["jobs"].values()
+            if isinstance(job, dict)
+        )
+        assert "GITHUB_STEP_SUMMARY" in candidate
+        assert "- draft release id: " in candidate
+        assert "candidate rejected: " in candidate
+
+        publish = _run_text(_workflow("release-publish.yml")["jobs"]["publish"])
+        assert "publication rejected: " in publish
+        assert "GITHUB_STEP_SUMMARY" in publish
 
 
 class ReleaseMigrationDocumentationContractTests(unittest.TestCase):

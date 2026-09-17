@@ -484,6 +484,100 @@ class ResolveCandidateTests(unittest.TestCase):
         self.assertEqual(identity.source_sha, moved)
 
 
+class PublishedSnapshotTests(unittest.TestCase):
+    """A published (phase, snapshot) pair must never become unprovable."""
+
+    def test_published_prerelease_record_supplies_the_pair(self):
+        self.assertEqual(
+            github_release.published_snapshots([_published_preview("7.1.0-alpha.1", SNAPSHOT)]),
+            {("alpha", SNAPSHOT)},
+        )
+
+    def test_unreadable_published_record_fails_closed(self):
+        # Skipping these would let the same phase and snapshot publish again
+        # under the next suffix, which the design forbids.
+        for broken in (
+            {"phase": "alpha"},
+            {"phase": "alpha", "source_snapshot": "not-a-digest"},
+            {"source_snapshot": SNAPSHOT},
+            {"phase": "nightly", "source_snapshot": SNAPSHOT},
+            "gel-candidate.json",
+            [],
+        ):
+            release = _published_preview("7.1.0-alpha.1", SNAPSHOT)
+            release["candidate"] = broken
+            with self.subTest(broken=broken), self.assertRaises(ValueError):
+                github_release.published_snapshots([release])
+
+    def test_unreadable_published_record_stops_candidate_resolution(self):
+        release = _published_preview("7.1.0-alpha.1", SNAPSHOT)
+        release["candidate"] = {"phase": "alpha"}
+        with self.assertRaisesRegex(ValueError, "candidate record"):
+            github_release.resolve_candidate(
+                _release_pr(),
+                _live_pr(labels=["prerelease:alpha"]),
+                ["v7.1.0-alpha.1"],
+                [release],
+            )
+
+    def test_published_stable_releases_predating_the_pipeline_are_skipped(self):
+        # v7.10.0/1/2 shipped before this pipeline: they are not prereleases
+        # and carry no gel-candidate.json asset for the controller to attach.
+        releases = [
+            {
+                "tag_name": f"v7.10.{patch}",
+                "name": f"v7.10.{patch}",
+                "draft": False,
+                "prerelease": False,
+            }
+            for patch in (0, 1, 2)
+        ]
+        self.assertEqual(github_release.published_snapshots(releases), set())
+
+    def test_published_prerelease_without_any_record_is_skipped(self):
+        # A prerelease published before this pipeline has no candidate asset,
+        # so the controller attaches nothing and it reserves no snapshot.
+        release = _published_preview("7.1.0-alpha.1", SNAPSHOT)
+        del release["candidate"]
+        self.assertEqual(github_release.published_snapshots([release]), set())
+
+    def test_draft_preview_records_reserve_nothing(self):
+        release = _published_preview("7.1.0-alpha.1", SNAPSHOT, draft=True)
+        release["candidate"] = {"phase": "alpha"}
+        self.assertEqual(github_release.published_snapshots([release]), set())
+
+
+class LivePrPayloadTests(unittest.TestCase):
+    """The workflows enrich the PR JSON with exactly two extra top-level keys."""
+
+    def test_prepared_version_and_snapshot_are_read_from_the_top_level_only(self):
+        pr = _live_pr()
+        self.assertEqual(github_release._prepared_version(pr), "7.1.0")
+        self.assertEqual(github_release._source_snapshot(pr), SNAPSHOT)
+
+    def test_legacy_aliases_and_head_nesting_are_rejected(self):
+        for key, value in (
+            ("cargo_version", "7.1.0"),
+            ("version", "7.1.0"),
+        ):
+            pr = _live_pr()
+            del pr["prepared_version"]
+            pr[key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "prepared_version"):
+                github_release._prepared_version(pr)
+        for key in ("meaningful_tree", "snapshot"):
+            pr = _live_pr()
+            del pr["source_snapshot"]
+            pr[key] = SNAPSHOT
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "source_snapshot"):
+                github_release._source_snapshot(pr)
+        nested = _live_pr()
+        del nested["source_snapshot"]
+        nested["head"] = {**nested["head"], "source_snapshot": SNAPSHOT}
+        with self.assertRaisesRegex(ValueError, "source_snapshot"):
+            github_release._source_snapshot(nested)
+
+
 class CandidateIdentityBoundaryTests(unittest.TestCase):
     IDENTITY = {
         "line": BASE_REF,
@@ -521,38 +615,38 @@ class CandidateIdentityBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "build SHA"):
             github_release.assert_live_identity(identity, live_pr)
 
-    def test_matching_draft_can_be_reused_only_when_body_identity_matches(self):
-        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+    def _draft(self, identity: dict[str, object], **overrides: object) -> dict:
+        """Build the draft exactly as release-candidate.yml creates it."""
+
         release = {
             "id": 123,
-            "tag_name": identity.tag,
-            "name": identity.tag,
+            "tag_name": f"v{identity['version']}",
+            "name": f"v{identity['version']}",
             "draft": True,
-            "prerelease": False,
-            "body": json.dumps({"candidate_identity": identity.as_dict()}),
+            "prerelease": identity["phase"] is not None,
+            "body": json.dumps({"candidate_identity": identity}),
         }
-        self.assertEqual(
-            github_release.find_reusable_draft([release], identity),
-            release,
-        )
+        release.update(overrides)
+        return release
+
+    def test_matching_draft_is_selected_for_reuse_when_body_identity_matches(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        release = self._draft(identity.as_dict())
+        selection = github_release.select_draft([release], identity)
+        self.assertIsNotNone(selection)
+        self.assertIs(selection.release, release)
+        self.assertTrue(selection.reusable)
+        self.assertEqual(selection.as_dict(), {"id": 123, "stale_build_sha": ""})
 
     def test_draft_with_same_tag_but_different_line_fails_closed(self):
         identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
         other = {**identity.as_dict(), "line": "release/v8.x"}
-        release = {
-            "id": 123,
-            "tag_name": identity.tag,
-            "name": identity.tag,
-            "draft": True,
-            "prerelease": False,
-            "body": json.dumps({"candidate_identity": other}),
-        }
         with self.assertRaisesRegex(ValueError, "identity|line"):
-            github_release.find_reusable_draft([release], identity)
+            github_release.select_draft([self._draft(other)], identity)
 
     def test_older_drafts_and_published_releases_on_same_line_do_not_block_new_tag(self):
         identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
-        older = {**identity.as_dict(), "version": "7.0.0", "tag": "v7.0.0"}
+        older = {**identity.as_dict(), "version": "7.0.0"}
         releases = [
             {
                 "id": 90,
@@ -562,34 +656,22 @@ class CandidateIdentityBoundaryTests(unittest.TestCase):
                 "prerelease": False,
                 "body": json.dumps({"candidate_identity": older}),
             },
-            {
-                "id": 91,
-                "tag_name": "v7.0.0",
-                "name": identity.tag,
-                "draft": True,
-                "prerelease": False,
-                "body": json.dumps({"candidate_identity": older}),
-            },
+            self._draft(older, id=91),
         ]
 
-        self.assertIsNone(github_release.find_reusable_draft(releases, identity))
+        self.assertIsNone(github_release.select_draft(releases, identity))
 
     def test_same_tag_source_refresh_is_replaceable_only_for_same_line_and_pr(self):
         identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
         stale = {**identity.as_dict(), "source_sha": "d" * 40, "build_sha": "d" * 40}
-        release = {
-            "id": 123,
-            "tag_name": identity.tag,
-            "name": identity.tag,
-            "draft": True,
-            "prerelease": False,
-            "body": json.dumps({"candidate_identity": stale}),
-        }
+        release = self._draft(stale)
 
-        self.assertEqual(
-            github_release.find_replaceable_draft([release], identity),
-            release,
-        )
+        selection = github_release.select_draft([release], identity)
+        self.assertIs(selection.release, release)
+        self.assertFalse(selection.reusable)
+        self.assertEqual(selection.stale_build_sha, "d" * 40)
+        self.assertEqual(selection.as_dict(), {"id": 123, "stale_build_sha": "d" * 40})
+
         for changed in ("line", "pr_number"):
             different = dict(stale)
             different[changed] = "release/v8.x" if changed == "line" else 102
@@ -598,34 +680,34 @@ class CandidateIdentityBoundaryTests(unittest.TestCase):
                 self.subTest(changed=changed),
                 self.assertRaisesRegex(ValueError, "identity|line|PR"),
             ):
-                github_release.find_replaceable_draft([changed_release], identity)
+                github_release.select_draft([changed_release], identity)
 
     def test_same_tag_source_refresh_rejects_wrong_release_kind(self):
         identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
         stale = {**identity.as_dict(), "source_sha": "d" * 40, "build_sha": "d" * 40}
-        release = {
-            "id": 123,
-            "tag_name": identity.tag,
-            "name": identity.tag,
-            "draft": True,
-            "prerelease": True,
-            "body": json.dumps({"candidate_identity": stale}),
-        }
+        release = self._draft(stale, prerelease=True)
         with self.assertRaisesRegex(ValueError, "prerelease"):
-            github_release.find_replaceable_draft([release], identity)
+            github_release.select_draft([release], identity)
 
     def test_published_matching_tag_fails_closed(self):
         identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
-        release = {
-            "id": 123,
-            "tag_name": identity.tag,
-            "name": identity.tag,
-            "draft": False,
-            "prerelease": False,
-            "body": json.dumps({"candidate_identity": identity.as_dict()}),
-        }
+        release = self._draft(identity.as_dict(), draft=False)
         with self.assertRaisesRegex(ValueError, "published|draft"):
-            github_release.find_reusable_draft([release], identity)
+            github_release.select_draft([release], identity)
+
+    def test_draft_body_must_carry_a_candidate_identity_object(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        # Prose, a bare identity object, and an API-wrapper key are none of
+        # them shapes the staging workflow ever writes to a draft body.
+        for body in (
+            "staged candidate",
+            "",
+            json.dumps(identity.as_dict()),
+            json.dumps({"candidate": {"candidate_identity": identity.as_dict()}}),
+        ):
+            release = self._draft(identity.as_dict(), body=body)
+            with self.subTest(body=body[:40]), self.assertRaises(ValueError):
+                github_release.select_draft([release], identity)
 
 
 class StableMergeGateTests(unittest.TestCase):
@@ -1041,19 +1123,19 @@ class PublicationTests(unittest.TestCase):
         record: CandidateRecord,
         *,
         draft: bool = True,
-        tag_target: str | None = None,
     ) -> dict:
-        value = {
+        # The publish workflows pass `gh api repos/:owner/:repo/releases/:id`
+        # straight through: the identity lives in the body and no bytes are
+        # inlined.  A tag target is resolved from the Git ref, not the payload.
+        del record
+        return {
             "id": 123456,
             "tag_name": f"v{identity['version']}",
             "name": f"v{identity['version']}",
             "draft": draft,
             "prerelease": identity["phase"] is not None,
             "body": github_release.candidate_identity_body(identity),
-            "tag_target": tag_target,
-            "asset_bytes": {"gel-candidate.json": candidate.dump(record)},
         }
-        return value
 
     def test_preview_rejects_removed_phase_before_mutation(self):
         identity = self._preview_identity()
@@ -1091,7 +1173,7 @@ class PublicationTests(unittest.TestCase):
     def test_preview_same_published_snapshot_retry_does_not_mutate(self):
         identity = self._preview_identity()
         record = self._record(identity)
-        release = self._release(identity, record, draft=False, tag_target=identity["build_sha"])
+        release = self._release(identity, record, draft=False)
         with mock.patch.object(
             verify_draft, "resolve_tag_commit", return_value=identity["build_sha"]
         ):
@@ -1102,23 +1184,31 @@ class PublicationTests(unittest.TestCase):
     def test_preview_rejects_immutable_mismatched_existing_tag(self):
         identity = self._preview_identity()
         record = self._record(identity)
-        release = self._release(identity, record, tag_target="e" * 40)
+        release = self._release(identity, record)
         with mock.patch.object(verify_draft, "resolve_tag_commit", return_value="e" * 40):
             with self.assertRaisesRegex(ValueError, "tag|commit|target"):
                 github_release.publish_preview(identity, record, self._preview_pr(), release)
 
-    def test_preview_rejects_changed_inline_distribution_bytes(self):
+    def test_preview_rejects_changed_draft_bytes(self):
+        # Draft bytes are only ever read back through the authenticated asset
+        # API; a GitHub release payload never carries them inline.
         identity = self._preview_identity()
         record = self._record(identity)
         release = self._release(identity, record)
-        release["asset_bytes"]["candidate.tar.gz"] = b"x"
-        with self.assertRaisesRegex(ValueError, "asset|bytes|SHA"):
-            github_release.publish_preview(identity, record, self._preview_pr(), release)
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with mock.patch.object(
+                verify_draft,
+                "verify",
+                side_effect=verify_draft.DraftVerificationError("asset bytes changed"),
+            ):
+                with self.assertRaisesRegex(ValueError, "draft|asset|bytes"):
+                    github_release.publish_preview(identity, record, self._preview_pr(), release)
+            mutate.assert_not_called()
 
     def test_preview_creates_derived_commit_tag_and_publishes_existing_draft(self):
         identity = self._preview_identity()
         record = self._record(identity)
-        release = self._release(identity, record, tag_target=None)
+        release = self._release(identity, record)
         with mock.patch.object(github_release, "_gh_mutate") as mutate:
             with mock.patch.object(verify_draft, "verify"):
                 github_release.publish_preview(identity, record, self._preview_pr(), release)
@@ -1143,7 +1233,7 @@ class PublicationTests(unittest.TestCase):
     def test_preview_patch_failure_can_retry_existing_unpublished_tag(self):
         identity = self._preview_identity()
         record = self._record(identity)
-        release = self._release(identity, record, tag_target=identity["build_sha"])
+        release = self._release(identity, record)
         with mock.patch.object(
             verify_draft, "resolve_tag_commit", return_value=identity["build_sha"]
         ):
@@ -1237,7 +1327,7 @@ class PublicationTests(unittest.TestCase):
     def test_squash_push_without_a_matching_merged_pr_is_a_noop(self):
         identity = self._stable_identity()
         record = self._record(identity)
-        release = self._release(identity, record, tag_target="e" * 40)
+        release = self._release(identity, record)
         release["published_stable_versions"] = ["7.1.0"]
         with mock.patch.object(github_release, "_gh_json", return_value=None):
             with mock.patch.object(github_release, "_gh_mutate") as mutate:
@@ -1283,7 +1373,6 @@ class PublicationTests(unittest.TestCase):
         _repo, push_sha, _record_sha, _identity, record, release = self._stable_scenario(
             real_topology=True
         )
-        release["tag_target"] = "f" * 40
         with mock.patch.object(verify_draft, "resolve_tag_commit", return_value="f" * 40):
             with self.assertRaisesRegex(ValueError, "tag|target|commit"):
                 github_release.publish_stable(record, push_sha, release)
@@ -1352,7 +1441,7 @@ class PublicationTests(unittest.TestCase):
         record_sha: str,
         draft: bool = True,
     ) -> dict:
-        value = self._release(identity, record, draft=draft, tag_target=push_sha)
+        value = self._release(identity, record, draft=draft)
         value["merged_pr"] = {
             "number": 101,
             "state": "closed",
@@ -1511,14 +1600,8 @@ class PublicationTests(unittest.TestCase):
     def test_tag_target_resolves_the_actual_ref_when_release_has_sha_metadata(self):
         identity = self._stable_identity()
         record = self._record(identity)
-        release = {
-            "tag_name": record.tag,
-            "name": record.tag,
-            "target_commitish": "f" * 40,
-            "tag": {"object": {"type": "commit", "sha": "f" * 40}},
-        }
         with mock.patch.object(verify_draft, "resolve_tag_commit", return_value=None) as resolve:
-            self.assertIsNone(github_release._tag_target(record.tag, release))
+            self.assertIsNone(github_release._tag_target(record.tag))
         resolve.assert_called_once_with(record.tag, REPOSITORY)
 
     def test_stable_rejects_moved_merge_base(self):

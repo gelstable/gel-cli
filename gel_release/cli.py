@@ -444,8 +444,11 @@ def _parser() -> argparse.ArgumentParser:
         default=Path("."),
         help="Working copy used to detect an already staged stable record",
     )
-    resolve.add_argument("--prepared-version")
-    resolve.add_argument("--source-snapshot")
+    select = commands.add_parser("select-draft")
+    select.add_argument("--releases-json", required=True, type=Path)
+    select.add_argument(
+        "--identity-json", "--identity", dest="identity_json", required=True, type=Path
+    )
     derive = commands.add_parser("derive-preview-commit")
     derive.add_argument("--source-sha", required=True)
     derive.add_argument("--version", required=True)
@@ -530,6 +533,8 @@ def _parser() -> argparse.ArgumentParser:
     snapshot = commands.add_parser("snapshot")
     snapshot.add_argument("--rev", required=True)
     snapshot.add_argument("--repo", default=Path("."), type=Path)
+    # Operator-facing: the plan mandates this command, and the controller
+    # reaches the same selection through resolve-candidate.
     preview_version = commands.add_parser("preview-version")
     preview_version.add_argument("--base", required=True)
     preview_version.add_argument("--phase", required=True)
@@ -567,6 +572,8 @@ def _parser() -> argparse.ArgumentParser:
     draft.add_argument("--build-sha")
     draft.add_argument("--source-snapshot", "--snapshot", dest="source_snapshot")
     draft.add_argument("--base-sha")
+    # Operator-facing: the plan names verify-public in the common CLI for
+    # checking an already published release outside any workflow.
     public = commands.add_parser("verify-public")
     public.add_argument("--record", default=candidate.CANDIDATE_PATH, type=Path)
     public.add_argument("--download-dir", required=True, type=Path)
@@ -588,42 +595,37 @@ def _matrix(kind: str) -> dict[str, list[dict[str, object]]]:
 
 
 def _read_tags(path: Path) -> list[str]:
+    """Read the tag inventory the controller builds with ``jq -Rsc split``."""
+
     value = json.loads(path.read_text())
-    if isinstance(value, dict):
-        value = value.get("tags")
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{path} must contain a JSON list of tag strings")
     return value
 
 
 def _read_published_snapshots(path: Path) -> set[tuple[str, str]]:
+    """Read published ``[phase, snapshot]`` pairs for ``preview-version``."""
+
     value = json.loads(path.read_text())
-    if isinstance(value, dict):
-        value = value.get("published")
     if not isinstance(value, list):
-        raise ValueError(f"{path} must contain a JSON list of published snapshots")
+        raise ValueError(f"{path} must contain a JSON list of [phase, snapshot] pairs")
 
     result: set[tuple[str, str]] = set()
     for entry in value:
-        if isinstance(entry, list) and len(entry) == 2:
-            phase, snapshot = entry
-        elif isinstance(entry, dict):
-            phase = entry.get("phase")
-            snapshot = entry.get("snapshot", entry.get("meaningful_tree"))
-            if snapshot is None:
-                snapshot = entry.get("source_snapshot")
-        else:
-            raise ValueError(f"{path} contains an invalid published snapshot entry")
-        if not isinstance(phase, str) or not isinstance(snapshot, str):
-            raise ValueError(f"{path} contains an invalid published snapshot entry")
-        result.add((phase, snapshot))
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or not all(isinstance(item, str) for item in entry)
+        ):
+            raise ValueError(f"{path} entries must each be a [phase, snapshot] pair of strings")
+        result.add((entry[0], entry[1]))
     return result
 
 
 def _read_releases(path: Path) -> list[dict]:
+    """Read the release inventory the workflows build with ``jq add``."""
+
     value = json.loads(path.read_text())
-    if isinstance(value, dict):
-        value = value.get("releases")
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         raise ValueError(f"{path} must contain a JSON list of release objects")
     return value
@@ -631,8 +633,6 @@ def _read_releases(path: Path) -> list[dict]:
 
 def _read_versions(path: Path) -> list[str]:
     value = json.loads(path.read_text())
-    if isinstance(value, dict):
-        value = value.get("versions", value.get("published_stable_versions"))
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{path} must contain a JSON list of published version strings")
     return value
@@ -669,10 +669,6 @@ def main(argv: list[str] | None = None) -> int:
             live_pr = json.loads(args.live_pr_json.read_bytes())
             if not isinstance(live_pr, dict):
                 raise ValueError("live PR JSON must be an object")
-            if args.prepared_version is not None:
-                live_pr["prepared_version"] = args.prepared_version
-            if args.source_snapshot is not None:
-                live_pr["source_snapshot"] = args.source_snapshot
             identity = github_release.resolve_candidate(
                 pr,
                 live_pr,
@@ -682,6 +678,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             if identity is not None:
                 print(json.dumps(identity.as_dict(), separators=(",", ":"), sort_keys=True))
+        elif args.command == "select-draft":
+            selection = github_release.select_draft(
+                _read_releases(args.releases_json),
+                json.loads(args.identity_json.read_bytes()),
+            )
+            if selection is not None:
+                print(json.dumps(selection.as_dict(), separators=(",", ":"), sort_keys=True))
         elif args.command == "derive-preview-commit":
             print(
                 github_release.derive_preview_commit(

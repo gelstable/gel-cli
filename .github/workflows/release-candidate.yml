@@ -5,103 +5,12 @@ name: Release candidate
     inputs:
       identity:
         description: JSON CandidateIdentity selected by the release controller
-        required: false
+        required: true
         type: string
       line:
-        description: Release line when explicit identity fields are supplied
+        description: Release line the candidate belongs to
         required: false
         type: string
-      pr_number:
-        description: Release pull request number
-        required: false
-        type: string
-      base_sha:
-        description: Release line base commit SHA
-        required: false
-        type: string
-      source_sha:
-        description: Original pull request head SHA
-        required: false
-        type: string
-      build_sha:
-        description: Immutable commit checked out by every build job
-        required: false
-        type: string
-      source_snapshot:
-        description: Meaningful source tree snapshot
-        required: false
-        type: string
-      phase:
-        description: Preview phase, when present
-        required: false
-        type: string
-      version:
-        description: Candidate version
-        required: false
-        type: string
-      channel:
-        description: Candidate channel
-        required: false
-        type: string
-  workflow_call:
-    inputs:
-      identity:
-        description: JSON CandidateIdentity selected by the release controller
-        required: false
-        type: string
-        default: ""
-      line:
-        description: Release line when explicit identity fields are supplied
-        required: false
-        type: string
-        default: ""
-      pr_number:
-        description: Release pull request number
-        required: false
-        type: string
-        default: ""
-      base_sha:
-        description: Release line base commit SHA
-        required: false
-        type: string
-        default: ""
-      source_sha:
-        description: Original pull request head SHA
-        required: false
-        type: string
-        default: ""
-      build_sha:
-        description: Immutable commit checked out by every build job
-        required: false
-        type: string
-        default: ""
-      source_snapshot:
-        description: Meaningful source tree snapshot
-        required: false
-        type: string
-        default: ""
-      phase:
-        description: Preview phase, when present
-        required: false
-        type: string
-        default: ""
-      version:
-        description: Candidate version
-        required: false
-        type: string
-        default: ""
-      channel:
-        description: Candidate channel
-        required: false
-        type: string
-        default: ""
-    outputs:
-      draft_release_id:
-        description: GitHub draft release id containing the verified bytes
-        value: ${{ jobs.stage.outputs.draft_release_id }}
-      verified_candidate:
-        description: Path or release asset name of the verified candidate record
-        value: ${{ jobs.verify.outputs.verified_candidate }}
 
 permissions:
   contents: read
@@ -132,52 +41,27 @@ jobs:
       version: ${{ steps.identity.outputs.version }}
       channel: ${{ steps.identity.outputs.channel }}
     steps:
-      - name: Normalize JSON or explicit immutable inputs
+      - name: Normalize the immutable candidate identity
         id: identity
         env:
           IDENTITY_JSON: ${{ inputs.identity }}
-          INPUT_LINE: ${{ inputs.line }}
-          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
-          INPUT_BASE_SHA: ${{ inputs.base_sha }}
-          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
-          INPUT_BUILD_SHA: ${{ inputs.build_sha }}
-          INPUT_SOURCE_SNAPSHOT: ${{ inputs.source_snapshot }}
-          INPUT_PHASE: ${{ inputs.phase }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- candidate rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
           identity_file="$RUNNER_TEMP/candidate-identity.json"
-          if [[ -n "$IDENTITY_JSON" ]]; then
-            printf '%s' "$IDENTITY_JSON" | jq -e \
-              'if type == "object" then . else error("candidate identity must be an object") end' \
-              > "$identity_file"
-            jq '.build_sha = (.build_sha // .source_sha)' "$identity_file" > "$identity_file.tmp"
-            mv "$identity_file.tmp" "$identity_file"
-          else
-            for required in INPUT_LINE INPUT_PR_NUMBER INPUT_BASE_SHA INPUT_SOURCE_SHA \
-              INPUT_BUILD_SHA INPUT_SOURCE_SNAPSHOT INPUT_VERSION INPUT_CHANNEL; do
-              if [[ -z "${!required}" ]]; then
-                echo "missing explicit candidate identity input ${required#INPUT_}" >&2
-                exit 1
-              fi
-            done
-            jq -n \
-              --arg line "$INPUT_LINE" \
-              --arg pr_number "$INPUT_PR_NUMBER" \
-              --arg base_sha "$INPUT_BASE_SHA" \
-              --arg source_sha "$INPUT_SOURCE_SHA" \
-              --arg build_sha "$INPUT_BUILD_SHA" \
-              --arg source_snapshot "$INPUT_SOURCE_SNAPSHOT" \
-              --arg phase "$INPUT_PHASE" \
-              --arg version "$INPUT_VERSION" \
-              --arg channel "$INPUT_CHANNEL" \
-              '{line: $line, pr_number: ($pr_number | tonumber), base_sha: $base_sha,
-                source_sha: $source_sha, build_sha: $build_sha,
-                source_snapshot: $source_snapshot,
-                phase: (if $phase == "" then null else $phase end),
-                version: $version, channel: $channel}' > "$identity_file"
+          if [[ -z "$IDENTITY_JSON" ]]; then
+            fail "expected a JSON CandidateIdentity in the identity input, got an empty value"
           fi
+          printf '%s' "$IDENTITY_JSON" | jq -e \
+            'if type == "object" then . else error("candidate identity must be an object") end' \
+            > "$identity_file"
+          jq '.build_sha = (.build_sha // .source_sha)' "$identity_file" > "$identity_file.tmp"
+          mv "$identity_file.tmp" "$identity_file"
 
           jq -e '
             (.line | type == "string" and test("^release/v[1-9][0-9]*\\.x$")) and
@@ -193,12 +77,10 @@ jobs:
           phase="$(jq -r '.phase // empty' "$identity_file")"
           channel="$(jq -r '.channel' "$identity_file")"
           if [[ -z "$phase" && "$channel" != stable ]]; then
-            echo "stable candidates must use the stable channel" >&2
-            exit 1
+            fail "stable candidates must use the stable channel, got $channel"
           fi
           if [[ -n "$phase" && "$channel" != testing ]]; then
-            echo "preview candidates must use the testing channel" >&2
-            exit 1
+            fail "preview candidates must use the testing channel, got $channel"
           fi
           identity="$(jq -c . "$identity_file")"
           {
@@ -215,6 +97,19 @@ jobs:
               "channel=" + .channel
             ' "$identity_file"
           } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Release candidate"
+            echo
+            jq -r '
+              "- line: " + .line,
+              "- pull request: #" + (.pr_number | tostring),
+              "- phase: " + (.phase // "stable"),
+              "- channel: " + .channel,
+              "- version: " + .version,
+              "- source SHA: " + .source_sha,
+              "- build SHA: " + .build_sha
+            ' "$identity_file"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       - name: Confirm dispatch ref is the immutable build commit
         if: github.event_name == 'workflow_dispatch'
@@ -222,7 +117,16 @@ jobs:
           BUILD_SHA: ${{ steps.identity.outputs.build_sha }}
         run: |
           set -euo pipefail
-          test "$GITHUB_SHA" = "$BUILD_SHA"
+          # The dispatch ref pins GITHUB_SHA, and every job checks out
+          # build_sha; they must be the same commit or the provenance subject
+          # and the built bytes would describe different sources.
+          if [[ "$GITHUB_SHA" != "$BUILD_SHA" ]]; then
+            printf '%s\n' \
+              "dispatch ref resolved to $GITHUB_SHA but the candidate build SHA is $BUILD_SHA" >&2
+            printf -- '- candidate rejected: dispatch ref %s is not the build SHA %s\n' \
+              "$GITHUB_SHA" "$BUILD_SHA" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          fi
 
   plan:
     name: plan immutable candidate
@@ -263,7 +167,11 @@ jobs:
           BUILD_SHA: ${{ needs.identity.outputs.build_sha }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$BUILD_SHA"
+          checkout_sha="$(git rev-parse HEAD)"
+          if [[ "$checkout_sha" != "$BUILD_SHA" ]]; then
+            echo "checked out $checkout_sha, expected the candidate build SHA $BUILD_SHA" >&2
+            exit 1
+          fi
           printf '%s' "$IDENTITY_JSON" > "$RUNNER_TEMP/candidate-identity.json"
           PYTHONPATH=. uv run --frozen python - "$RUNNER_TEMP/candidate-identity.json" <<'PY'
           import json
@@ -308,7 +216,11 @@ jobs:
       - name: Generate shell completions once for every target
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+          checkout_sha="$(git rev-parse HEAD)"
+          if [[ "$checkout_sha" != "${{ needs.identity.outputs.build_sha }}" ]]; then
+            echo "checked out $checkout_sha, expected the candidate build SHA ${{ needs.identity.outputs.build_sha }}" >&2
+            exit 1
+          fi
           cargo build --locked --bin gel
           PYTHONPATH=. uv run --frozen gel-release completions \
             --binary target/debug/gel --out-dir target/completions
@@ -343,7 +255,13 @@ jobs:
 
       - name: Confirm immutable checkout
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+        run: |
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          if [[ "$checkout_sha" != "${{ needs.identity.outputs.build_sha }}" ]]; then
+            echo "checked out $checkout_sha, expected the candidate build SHA ${{ needs.identity.outputs.build_sha }}" >&2
+            exit 1
+          fi
 
       - name: Install musl toolchain
         if: startsWith(matrix.runner, 'ubuntu')
@@ -436,7 +354,11 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+          checkout_sha="$(git rev-parse HEAD)"
+          if [[ "$checkout_sha" != "${{ needs.identity.outputs.build_sha }}" ]]; then
+            echo "checked out $checkout_sha, expected the candidate build SHA ${{ needs.identity.outputs.build_sha }}" >&2
+            exit 1
+          fi
           stem="gel-v$VERSION-$TARGET"
           mkdir -p smoke
           if [[ -f "dist/$stem.tar.gz" ]]; then
@@ -500,7 +422,11 @@ jobs:
           BUILD_DATE: ${{ needs.plan.outputs.build_date }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+          checkout_sha="$(git rev-parse HEAD)"
+          if [[ "$checkout_sha" != "${{ needs.identity.outputs.build_sha }}" ]]; then
+            echo "checked out $checkout_sha, expected the candidate build SHA ${{ needs.identity.outputs.build_sha }}" >&2
+            exit 1
+          fi
           PYTHONPATH=. uv run --frozen gel-release assemble-stage \
             --version "$VERSION" --build-date "$BUILD_DATE" --dist-dir dist
 
@@ -543,6 +469,12 @@ jobs:
           IDENTITY_JSON: ${{ needs.plan.outputs.identity }}
         run: |
           set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- draft selection rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
           printf '%s' "$IDENTITY_JSON" > "$RUNNER_TEMP/candidate-identity.json"
           gh api --paginate --slurp \
             "/repos/$GITHUB_REPOSITORY/releases" | jq 'add' > "$RUNNER_TEMP/releases.json"
@@ -555,35 +487,9 @@ jobs:
           print(candidate_identity_body(identity))
           PY
           )"
-          selection="$(PYTHONPATH=. uv run --frozen python - \
-            "$RUNNER_TEMP/releases.json" "$RUNNER_TEMP/candidate-identity.json" <<'PY'
-          import json
-          import sys
-          from gel_release.github_release import (
-              _body_identity,
-              find_replaceable_draft,
-              find_reusable_draft,
-          )
-
-          releases = json.load(open(sys.argv[1]))
-          identity = json.load(open(sys.argv[2]))
-          replaceable = find_replaceable_draft(releases, identity)
-          try:
-              draft = find_reusable_draft(releases, identity)
-          except ValueError:
-              if replaceable is None:
-                  raise
-              draft = None
-          if draft is not None:
-              print(json.dumps({"id": draft["id"], "stale_build_sha": ""}))
-          elif replaceable is not None:
-              payload = _body_identity(replaceable) or {}
-              print(json.dumps({
-                  "id": replaceable["id"],
-                  "stale_build_sha": payload.get("build_sha", ""),
-              }))
-          PY
-          )"
+          selection="$(PYTHONPATH=. uv run --frozen gel-release select-draft \
+            --releases-json "$RUNNER_TEMP/releases.json" \
+            --identity-json "$RUNNER_TEMP/candidate-identity.json")"
           existing=""
           stale_build_sha=""
           if [[ -n "$selection" ]]; then
@@ -602,27 +508,15 @@ jobs:
             # Replacing assets is safe only after the release is proved to be
             # the exact retry draft or an unpublished same-line/PR draft that
             # may be superseded under this workflow's mutation lock.
-            gh api "/repos/$GITHUB_REPOSITORY/releases/$existing" \
+            # select-draft takes a JSON list, so wrap the single release.
+            gh api "/repos/$GITHUB_REPOSITORY/releases/$existing" | jq -s '.' \
               > "$RUNNER_TEMP/reusable-release.json"
-            PYTHONPATH=. uv run --frozen python -c '
-          import json
-          import sys
-          from gel_release.github_release import find_replaceable_draft, find_reusable_draft
-
-          release = json.load(open(sys.argv[1]))
-          identity = json.load(open(sys.argv[2]))
-          replaceable = find_replaceable_draft([release], identity)
-          try:
-              reusable = find_reusable_draft([release], identity)
-          except ValueError:
-              if replaceable is None:
-                  raise
-              reusable = None
-          selected = reusable or replaceable
-          if selected is None or str(selected.get("id")) != sys.argv[3]:
-              raise SystemExit("the selected draft changed before asset replacement")
-            ' "$RUNNER_TEMP/reusable-release.json" \
-              "$RUNNER_TEMP/candidate-identity.json" "$existing"
+            reselected="$(PYTHONPATH=. uv run --frozen gel-release select-draft \
+              --releases-json "$RUNNER_TEMP/reusable-release.json" \
+              --identity-json "$RUNNER_TEMP/candidate-identity.json")"
+            [[ "$(jq -r '.id // empty' <<< "$reselected")" == "$existing" ]] || \
+              fail "the selected draft changed before asset replacement:" \
+                "expected draft $existing"
             if [[ -n "$stale_build_sha" ]]; then
               tag_error="$RUNNER_TEMP/tag-error.txt"
               if tag_json="$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>"$tag_error")"; then
@@ -644,9 +538,12 @@ jobs:
                       ;;
                   esac
                 done
-                [[ "$tag_type" == commit ]]
+                if [[ "$tag_type" != commit ]]; then
+                  echo "unpublished tag $TAG still resolves to a $tag_type object after 8 hops, expected a commit" >&2
+                  exit 1
+                fi
                 if [[ "$tag_target" != "$stale_build_sha" ]]; then
-                  echo "unpublished tag $TAG does not point at the stale candidate" >&2
+                  echo "unpublished tag $TAG points at $tag_target, expected the stale candidate $stale_build_sha" >&2
                   exit 1
                 fi
                 gh api -X DELETE "/repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" >/dev/null
@@ -665,8 +562,13 @@ jobs:
                     "/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
                 done
           fi
-          test "$existing" != ""
+          if [[ -z "$existing" ]]; then
+            echo "expected a draft release id for $TAG, got an empty value" >&2
+            exit 1
+          fi
           echo "draft_release_id=$existing" >> "$GITHUB_OUTPUT"
+          printf -- '- draft release id: %s (%s)\n' "$existing" "$TAG" \
+            >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       - name: Upload every distribution asset
         env:
@@ -808,7 +710,11 @@ jobs:
           IDENTITY_JSON: ${{ needs.plan.outputs.identity }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ needs.identity.outputs.build_sha }}"
+          checkout_sha="$(git rev-parse HEAD)"
+          if [[ "$checkout_sha" != "${{ needs.identity.outputs.build_sha }}" ]]; then
+            echo "checked out $checkout_sha, expected the candidate build SHA ${{ needs.identity.outputs.build_sha }}" >&2
+            exit 1
+          fi
           record=packaging/release-candidate.json
           phase_args=()
           if [[ -n "$PHASE" ]]; then
@@ -852,14 +758,29 @@ jobs:
       contents: write
       pull-requests: read
       actions: write
-    env:
-      CONTROLLER_REF: master
     steps:
+      - name: Require the release bot token
+        env:
+          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The record push below must fire pull_request/synchronize so the
+          # required stable merge gate re-runs on the new head. GITHUB_TOKEN
+          # pushes never fire workflow events, so falling back to it would
+          # produce a release PR that can never become mergeable. Fail here
+          # instead of silently selecting that configuration.
+          if [[ -z "$RELEASE_BOT_TOKEN" ]]; then
+            echo "RELEASE_BOT_TOKEN is not configured; it must be a PAT or GitHub App token whose pushes trigger workflow events" >&2
+            printf -- '- candidate rejected: RELEASE_BOT_TOKEN is not configured\n' \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          fi
+
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           ref: ${{ needs.identity.outputs.build_sha }}
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -867,7 +788,7 @@ jobs:
           path: packaging
       - name: Recheck the live PR before committing metadata
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
           EXPECTED_SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
           EXPECTED_BASE_SHA: ${{ needs.plan.outputs.base_sha }}
@@ -904,12 +825,18 @@ jobs:
 
       - name: Push the stable record to the exact live PR head
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
           SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
           IDENTITY_JSON: ${{ needs.plan.outputs.identity }}
         run: |
           set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- stable record push rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/live-pr-final.json"
           final_source_sha="$(jq -r '.head.sha' "$RUNNER_TEMP/live-pr-final.json")"
           version="$(cargo metadata --locked --format-version 1 --no-deps \
@@ -929,14 +856,22 @@ jobs:
           identity = CandidateIdentity.from_dict(json.load(open(sys.argv[2])))
           assert_live_identity(identity, json.load(open(sys.argv[1])))
           PY
-          [[ "$final_source_sha" == "$SOURCE_SHA" ]]
+          if [[ "$final_source_sha" != "$SOURCE_SHA" ]]; then
+            fail "live PR head is $final_source_sha, expected the candidate source SHA $SOURCE_SHA"
+          fi
           head_ref="$(jq -r '.head.ref' "$RUNNER_TEMP/live-pr-final.json")"
-          test -n "$head_ref"
+          if [[ -z "$head_ref" ]]; then
+            fail "expected a head branch on PR #$PR_NUMBER, got an empty value"
+          fi
           git fetch --no-tags origin "refs/heads/$head_ref:refs/remotes/origin/$head_ref"
           remote_head="$(git rev-parse "refs/remotes/origin/$head_ref^{commit}")"
-          [[ "$remote_head" == "$SOURCE_SHA" ]]
+          if [[ "$remote_head" != "$SOURCE_SHA" ]]; then
+            fail "remote $head_ref is at $remote_head, expected the candidate source SHA $SOURCE_SHA"
+          fi
           git switch -C "$head_ref" "$SOURCE_SHA"
-          test -s packaging/release-candidate.json
+          if [[ ! -s packaging/release-candidate.json ]]; then
+            fail "expected a non-empty packaging/release-candidate.json in the candidate-record artifact"
+          fi
           git add packaging/release-candidate.json
           if git diff --cached --quiet; then
             echo "stable candidate record already committed at the live PR head"
@@ -947,21 +882,39 @@ jobs:
           git commit -m "chore: stage release candidate v${{ needs.plan.outputs.version }}"
           git push --force-with-lease="refs/heads/$head_ref:$remote_head" \
             origin "HEAD:refs/heads/$head_ref"
+          printf -- '- pushed the stable candidate record to %s (%s)\n' \
+            "$head_ref" "$(git rev-parse HEAD)" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       - name: Require the stable merge gate on the record head
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
         run: |
           set -euo pipefail
-          # The record push may not fire pull_request events, and branch
-          # protection requires the stable merge gate on the new head.
-          # Dispatch the gate explicitly; the workflow rechecks the live PR
-          # and verifies this exact head.
+          # Branch protection evaluates the required context on the PR head
+          # commit, and a workflow_dispatch check run attaches to the head SHA
+          # of the ref it was dispatched on. Dispatching on a fixed branch such
+          # as master would therefore post the result on master and never on
+          # the record head. Dispatch on the generated head branch instead, so
+          # the run's GITHUB_SHA is the PR head commit.
+          #
+          # If that branch moves between this dispatch and the run starting,
+          # the gate refuses to pass: it compares GITHUB_SHA against the live
+          # PR head and fails when they differ. The newer push fires
+          # pull_request/synchronize under the release bot token, and the
+          # controller re-dispatches on the new head, so the current commit
+          # always gets its own run without needing a lock here.
+          head_ref="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.head.ref')"
+          if [[ -z "$head_ref" ]]; then
+            echo "expected a head branch on PR #$PR_NUMBER, got an empty value" >&2
+            exit 1
+          fi
           gh workflow run release-candidate-check.yml \
             --repo "$GITHUB_REPOSITORY" \
-            --ref "$CONTROLLER_REF" \
+            --ref "$head_ref" \
             -f pr_number="$PR_NUMBER"
+          printf -- '- dispatched the stable merge gate on %s for PR #%s\n' \
+            "$head_ref" "$PR_NUMBER" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
   cleanup-temporary-refs:
     name: clean up temporary release refs
@@ -976,7 +929,7 @@ jobs:
     steps:
       - name: Remove candidate and preview refs
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           CANDIDATE_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail

@@ -7,3 +7,6 @@
 # Nix
 result
 .direnv
+
+# Agent workspace; the durable record lives under docs/
+.superpowers

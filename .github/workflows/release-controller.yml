@@ -45,11 +45,27 @@ jobs:
       version: ${{ steps.identity.outputs.version }}
       build_sha: ${{ steps.identity.outputs.build_sha }}
     steps:
+      - name: Require the release bot token
+        env:
+          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The pipeline depends on pushes made by this token firing workflow
+          # events: the generated PR head must re-run the required stable merge
+          # gate. GITHUB_TOKEN pushes never fire events, so falling back to it
+          # silently produces a release PR that can never become mergeable.
+          if [[ -z "$RELEASE_BOT_TOKEN" ]]; then
+            echo "RELEASE_BOT_TOKEN is not configured; it must be a PAT or GitHub App token whose pushes trigger workflow events" >&2
+            printf -- '- release rejected: RELEASE_BOT_TOKEN is not configured\n' \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          fi
+
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           fetch-depth: 0
           ref: ${{ env.CONTROLLER_REF }}
-          token: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -70,15 +86,20 @@ jobs:
           INPUT_LINE: ${{ inputs.line }}
           DISPATCH_PR: ${{ github.event.client_payload.pr }}
           DISPATCH_LINE: ${{ github.event.client_payload.base_ref || github.event.client_payload.line }}
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: |
           set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- release rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
           pr_number="${EVENT_PR:-${INPUT_PR:-${DISPATCH_PR:-}}}"
           line="${EVENT_LINE:-${INPUT_LINE:-${DISPATCH_LINE:-}}}"
           if [[ -z "$pr_number" ]]; then
             if [[ -z "$line" ]]; then
-              echo "a release line or pull request is required" >&2
-              exit 1
+              fail "a release line or pull request is required, got neither"
             fi
             head_ref="$(uv run --frozen gel-release release-head --line "$line")"
             pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
@@ -86,8 +107,7 @@ jobs:
               --json number --limit 2 | jq -r 'if length == 1 then .[0].number else empty end')"
           fi
           if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
-            echo "invalid release pull request number: $pr_number" >&2
-            exit 1
+            fail "expected a positive release pull request number, got '$pr_number'"
           fi
           if [[ -z "$line" ]]; then
             line="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq '.base.ref')"
@@ -100,16 +120,21 @@ jobs:
       - name: Fetch and validate the live pull request
         id: live
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           PR_NUMBER: ${{ steps.request.outputs.number }}
           REQUESTED_LINE: ${{ steps.request.outputs.line }}
         run: |
           set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- release rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/live-pr.json"
           live_line="$(jq -r '.base.ref // empty' "$RUNNER_TEMP/live-pr.json")"
           if [[ "$live_line" != "$REQUESTED_LINE" ]]; then
-            echo "requested release line $REQUESTED_LINE does not match live PR base $live_line" >&2
-            exit 1
+            fail "requested release line $REQUESTED_LINE but PR #$PR_NUMBER targets $live_line"
           fi
           uv run --frozen gel-release pr-identity \
             --pr-json "$RUNNER_TEMP/live-pr.json" \
@@ -142,7 +167,7 @@ jobs:
 
       - name: Read published tags and release records
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: |
           set -euo pipefail
           gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
@@ -153,7 +178,7 @@ jobs:
 
       - name: Read published preview candidate records
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: |
           set -euo pipefail
           while IFS=$'\t' read -r release_id asset_id; do
@@ -174,10 +199,16 @@ jobs:
       - name: Verify the active phase was authorized by a maintainer
         if: steps.source.outputs.version != ''
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           PR_NUMBER: ${{ steps.request.outputs.number }}
         run: |
           set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- release rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
           phase="$(jq -r '[.labels[]?.name] | map(select(. == "prerelease:alpha" or . == "prerelease:beta" or . == "prerelease:rc")) | if length == 1 then .[0] | split(":")[1] else empty end' "$RUNNER_TEMP/live-pr-enriched.json")"
           if [[ -z "$phase" ]]; then
             exit 0
@@ -193,14 +224,13 @@ jobs:
             --phase "$phase" \
             --permissions-json "$RUNNER_TEMP/phase-permissions.json")"
           if [[ "$authorized" != true ]]; then
-            echo "phase $phase was not added by an authorized maintainer" >&2
-            exit 1
+            fail "phase $phase on PR #$PR_NUMBER was not added by an authorized maintainer"
           fi
 
       - name: Resolve the immutable candidate identity from live state
         id: identity
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: |
           set -euo pipefail
           uv run --frozen gel-release resolve-candidate \
@@ -210,23 +240,48 @@ jobs:
             --releases-json "$RUNNER_TEMP/releases.json" \
             --repo "$GITHUB_REPOSITORY" \
             --checkout . > "$RUNNER_TEMP/identity.json"
+          summary() {
+            printf -- '%s\n' "$*" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          }
+          pr_number="$(jq -r '.number' "$RUNNER_TEMP/live-pr.json")"
+          line="$(jq -r '.base.ref' "$RUNNER_TEMP/live-pr.json")"
           if [[ ! -s "$RUNNER_TEMP/identity.json" ]]; then
             # Empty resolution means the preview snapshot is already published
             # or the stable record is already staged at the PR head. A staged
             # record is the staging fixed point; make sure the required gate
-            # runs on that head even when the record push could not fire
-            # pull_request events.
+            # runs on that head.
             head_sha="$(jq -r '.head.sha' "$RUNNER_TEMP/live-pr-enriched.json")"
+            head_ref="$(jq -r '.head.ref' "$RUNNER_TEMP/live-pr-enriched.json")"
+            summary "## Release controller"
+            summary ""
+            summary "- line: $line"
+            summary "- pull request: #$pr_number"
+            summary "- head: $head_ref@$head_sha"
             if gh api \
               "repos/$GITHUB_REPOSITORY/contents/packaging/release-candidate.json?ref=$head_sha" \
               > /dev/null 2>&1; then
+              # Branch protection evaluates the required context on the PR head
+              # commit, and a workflow_dispatch check run attaches to the head
+              # SHA of the ref it is dispatched on. Dispatch on the generated
+              # head branch so the gate's result lands on the commit branch
+              # protection reads, not on the controller ref.
+              #
+              # If the head branch moves between this dispatch and the run
+              # starting, the gate compares GITHUB_SHA against the live PR head
+              # and fails rather than reporting a result for a commit it did not
+              # verify. The push that moved the branch fires
+              # pull_request/synchronize under the release bot token, so the new
+              # head still gets its own run; no lock is needed here.
               gh workflow run release-candidate-check.yml \
                 --repo "$GITHUB_REPOSITORY" \
-                --ref "$CONTROLLER_REF" \
-                -f pr_number="$(jq -r '.number' "$RUNNER_TEMP/live-pr.json")"
-              echo "stable candidate record is staged; dispatched the stable merge gate"
+                --ref "$head_ref" \
+                -f pr_number="$pr_number"
+              echo "stable candidate record is staged; dispatched the stable merge gate on $head_ref"
+              summary "- no new candidate: the stable record is already staged at the PR head"
+              summary "- dispatched the stable merge gate on $head_ref"
             else
               echo "the current phase and source snapshot are already published"
+              summary "- no new candidate: the current phase and source snapshot are already published"
             fi
             exit 0
           fi
@@ -236,16 +291,35 @@ jobs:
             echo "version=$(jq -r '.version' "$RUNNER_TEMP/identity.json")"
             echo "build_sha=$(jq -r '.build_sha' "$RUNNER_TEMP/identity.json")"
           } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Release controller"
+            echo
+            echo "- pull request: #$pr_number"
+            jq -r '
+              "- line: " + .line,
+              "- phase: " + (.phase // "stable"),
+              "- channel: " + .channel,
+              "- version: " + .version,
+              "- source SHA: " + .source_sha,
+              "- build SHA: " + (.build_sha // .source_sha)
+            ' "$RUNNER_TEMP/identity.json"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       - name: Recheck the live pull request before deriving or dispatching
         if: steps.identity.outputs.identity != ''
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           PR_NUMBER: ${{ steps.request.outputs.number }}
           EXPECTED_BASE_SHA: ${{ fromJSON(steps.identity.outputs.identity).base_sha }}
           EXPECTED_SOURCE_SHA: ${{ fromJSON(steps.identity.outputs.identity).source_sha }}
         run: |
           set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- release rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/live-pr-final.json"
           uv run --frozen gel-release pr-identity \
             --pr-json "$RUNNER_TEMP/live-pr-final.json" \
@@ -253,14 +327,12 @@ jobs:
           final_base_sha="$(jq -r '.base_sha' "$RUNNER_TEMP/pr-identity-final.json")"
           final_source_sha="$(jq -r '.head_sha' "$RUNNER_TEMP/pr-identity-final.json")"
           if [[ "$final_base_sha" != "$EXPECTED_BASE_SHA" || "$final_source_sha" != "$EXPECTED_SOURCE_SHA" ]]; then
-            echo "the release PR changed while the candidate was resolving" >&2
-            exit 1
+            fail "PR #$PR_NUMBER moved while the candidate was resolving: base $EXPECTED_BASE_SHA -> $final_base_sha, head $EXPECTED_SOURCE_SHA -> $final_source_sha"
           fi
           expected_phase="$(jq -r '.phase // empty' "$RUNNER_TEMP/identity.json")"
           final_phase="$(jq -r '[.labels[]?.name] | map(select(. == "prerelease:alpha" or . == "prerelease:beta" or . == "prerelease:rc")) | if length == 1 then .[0] | split(":")[1] else empty end' "$RUNNER_TEMP/live-pr-final.json")"
           if [[ "$final_phase" != "$expected_phase" ]]; then
-            echo "the release PR phase changed while the candidate was resolving" >&2
-            exit 1
+            fail "PR #$PR_NUMBER phase changed while the candidate was resolving: expected '${expected_phase:-stable}', found '${final_phase:-stable}'"
           fi
           if [[ -n "$final_phase" ]]; then
             gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/timeline" \
@@ -274,8 +346,7 @@ jobs:
               --phase "$final_phase" \
               --permissions-json "$RUNNER_TEMP/phase-permissions-final.json")"
             if [[ "$authorized" != true ]]; then
-              echo "phase $final_phase is no longer authorized" >&2
-              exit 1
+              fail "phase $final_phase on PR #$PR_NUMBER is no longer authorized by a maintainer"
             fi
           fi
 
@@ -283,7 +354,7 @@ jobs:
         if: steps.identity.outputs.identity != '' && fromJSON(steps.identity.outputs.identity).phase != null
         id: preview
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           LINE: ${{ fromJSON(steps.identity.outputs.identity).line }}
           TAG: v${{ fromJSON(steps.identity.outputs.identity).version }}
           SOURCE_SHA: ${{ fromJSON(steps.identity.outputs.identity).source_sha }}
@@ -304,7 +375,7 @@ jobs:
         if: steps.identity.outputs.identity != ''
         id: dispatch
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: |
           set -euo pipefail
           # A workflow_dispatch run's GITHUB_SHA comes from its ref, not from
@@ -319,7 +390,7 @@ jobs:
       - name: Dispatch immutable candidate staging
         if: steps.identity.outputs.identity != ''
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           DISPATCH_REF: ${{ steps.dispatch.outputs.candidate_ref }}
         run: |
           set -euo pipefail

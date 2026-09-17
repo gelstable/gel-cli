@@ -127,6 +127,36 @@ an unpublished draft with the same tag, line, and generated PR is replaced
 when its source identity is stale; published tags and releases remain
 immutable.
 
+Release automation token
+------------------------
+
+The release workflows authenticate as `secrets.RELEASE_BOT_TOKEN`. It must be a
+personal access token or a GitHub App installation token with write access to
+contents, pull requests, and actions on this repository. The default
+`GITHUB_TOKEN` is not a valid substitute and the workflows no longer fall back
+to it.
+
+The reason is event delivery, not permissions. Candidate staging pushes
+`packaging/release-candidate.json` onto the generated `knope/release-vN.x`
+head, and branch protection requires the `Release candidate check / stable
+merge gate` context to pass on that new head commit. Pushes made with
+`GITHUB_TOKEN` never trigger workflow events, so no `pull_request`
+`synchronize` run would start for the commit the branch rule evaluates, and
+the release PR could never become mergeable. A PAT or App token fires the
+event normally.
+
+The workflows also dispatch the gate explicitly on the generated head branch
+after pushing the record. A `workflow_dispatch` check run attaches to the head
+commit of the ref it was dispatched on, so dispatching on `master` would post
+the result on `master` and never on the release PR head. If the head branch
+moves between the dispatch and the run, the gate compares `GITHUB_SHA` with
+the live PR head and fails rather than reporting a result for a commit it did
+not verify; the push that moved the branch starts a fresh run of its own.
+
+With the secret unset, the controller and the candidate commit job fail on
+their first step with an explicit message instead of proceeding into a
+configuration that cannot merge.
+
 Stable merge and publication
 ----------------------------
 

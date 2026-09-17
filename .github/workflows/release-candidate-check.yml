@@ -51,6 +51,33 @@ jobs:
             echo "head_sha=$(jq -r '.head.sha' "$RUNNER_TEMP/live-pr.json")"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Pin a dispatched run to the commit branch protection evaluates
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          HEAD_SHA: ${{ steps.live.outputs.head_sha }}
+          HEAD_REF: ${{ steps.live.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- stable merge gate failed: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
+          # A workflow_dispatch check run attaches to the head SHA of the ref it
+          # was dispatched on, while every boundary below resolves through the
+          # live PR. Callers therefore dispatch this workflow on the generated
+          # head branch. If that branch moved between the dispatch and this run,
+          # GITHUB_SHA is the older commit and the live PR head is the newer one;
+          # passing here would record a result on a commit that was never
+          # verified. Fail instead: the push that moved the branch fires
+          # pull_request/synchronize (the release bot token is a PAT or App
+          # token), and the controller re-dispatches the gate on the new head,
+          # so the fresh commit gets its own run.
+          if [[ "$GITHUB_SHA" != "$HEAD_SHA" ]]; then
+            fail "dispatched ref resolved to $GITHUB_SHA but the live head of $HEAD_REF is $HEAD_SHA; dispatch the gate again on the current head"
+          fi
+
       - name: Check out the generated PR head
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -84,7 +111,7 @@ jobs:
           git fetch --no-tags origin \
             "refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
           changed_records="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
-            packaging/release-candidate.json packaging/gel-candidate.json)"
+            packaging/release-candidate.json)"
           if [[ -n "$changed_records" ]]; then
             echo "ordinary backport changes a candidate record: $changed_records" >&2
             exit 1

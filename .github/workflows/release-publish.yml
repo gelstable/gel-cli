@@ -94,17 +94,27 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- publication rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
           # The CLI command below delegates to publish_preview; its latest
           # comparison counterpart is should_make_latest.
           if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
-            [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            if [[ ! "$RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              fail "expected a positive candidate run id, got '$RUN_ID'"
+            fi
             artifact_dir="$RUNNER_TEMP/candidate-record"
             mkdir -p "$artifact_dir"
             gh run download "$RUN_ID" --name candidate-record --dir "$artifact_dir"
             RECORD_PATH="$(find "$artifact_dir" -type f \( \
               -name gel-candidate.json -o -name release-candidate.json \
             \) -print -quit)"
-            test -s "$RECORD_PATH"
+            if [[ ! -s "$RECORD_PATH" ]]; then
+              fail "no candidate record named gel-candidate.json or release-candidate.json in the candidate-record artifact of run $RUN_ID"
+            fi
             phase="$(jq -r '.phase // empty' "$RECORD_PATH")"
             if [[ -z "$phase" ]]; then
               echo "successful candidate has no preview phase; stable publication waits for a line push"
@@ -115,10 +125,18 @@ jobs:
             PR_NUMBER="$(jq -r '.pr_number' "$RECORD_PATH")"
             RELEASE_ID="$(jq -r '.draft_release_id' "$RECORD_PATH")"
           else
-            test -n "$IDENTITY_JSON"
-            [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
-            [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
-            test -s "$RECORD_PATH"
+            if [[ -z "$IDENTITY_JSON" ]]; then
+              fail "preview publication needs a JSON CandidateIdentity in the identity input, got an empty value"
+            fi
+            if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+              fail "expected a positive pull request number, got '$PR_NUMBER'"
+            fi
+            if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+              fail "expected a positive draft release id, got '$RELEASE_ID'"
+            fi
+            if [[ ! -s "$RECORD_PATH" ]]; then
+              fail "expected a non-empty candidate record at $RECORD_PATH"
+            fi
           fi
           printf '%s' "$IDENTITY_JSON" > "$RUNNER_TEMP/identity.json"
           phase="${phase:-$(jq -r '.phase // empty' "$RUNNER_TEMP/identity.json")}"
@@ -177,6 +195,12 @@ jobs:
           RECORD_PATH: ${{ inputs.record_path }}
         run: |
           set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- publication rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
           # The CLI command below delegates to publish_stable.
           # publish_stable performs the authenticated verify-draft check before
           # allowing a tag or release state mutation.
@@ -190,7 +214,9 @@ jobs:
             exit 0
           fi
           release_id="$(jq -r '.draft_release_id' "$record")"
-          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+          if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            fail "candidate record $record has draft_release_id '$release_id', expected a positive id"
+          fi
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$RUNNER_TEMP/release.json"
           pr_number="$(jq -r '.pr_number' "$record")"
           gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" > "$RUNNER_TEMP/merged-pr.json"
@@ -213,6 +239,15 @@ jobs:
             --release-json "$RUNNER_TEMP/release-with-pr.json"
           echo "publish=true" >> "$GITHUB_OUTPUT"
           echo "published candidate $version"
+          {
+            echo "## Release publish"
+            echo
+            echo "- line push: $GITHUB_SHA"
+            echo "- pull request: #$pr_number"
+            echo "- version: $version"
+            echo "- source SHA: $source_sha"
+            echo "- draft release id: $release_id"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
   cleanup-temporary-refs:
     name: clean up temporary candidate refs

@@ -226,6 +226,88 @@ class CliBoundaryTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertNotIn("Traceback", completed.stderr)
 
+    def _identity(self) -> dict[str, object]:
+        return {
+            "line": "release/v7.x",
+            "pr_number": 101,
+            "base_sha": "b" * 40,
+            "source_sha": "a" * 40,
+            "build_sha": "a" * 40,
+            "source_snapshot": "d" * 64,
+            "phase": None,
+            "version": "7.1.0",
+            "channel": "stable",
+        }
+
+    def _select_draft(self, tmp: Path, releases: object, identity: dict[str, object]):
+        releases_json = tmp / "releases.json"
+        identity_json = tmp / "identity.json"
+        releases_json.write_text(json.dumps(releases))
+        identity_json.write_text(json.dumps(identity))
+        return self._run(
+            "select-draft",
+            "--releases-json",
+            str(releases_json),
+            "--identity-json",
+            str(identity_json),
+        )
+
+    def test_select_draft_is_the_workflow_boundary_for_draft_reuse(self):
+        identity = self._identity()
+        draft = {
+            "id": 42,
+            "tag_name": "v7.1.0",
+            "name": "v7.1.0",
+            "draft": True,
+            "prerelease": False,
+            "body": json.dumps({"candidate_identity": identity}),
+        }
+        stale = {
+            **draft,
+            "id": 43,
+            "body": json.dumps(
+                {"candidate_identity": {**identity, "source_sha": "c" * 40, "build_sha": "c" * 40}}
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reuse = self._select_draft(root, [draft], identity)
+            self.assertEqual(reuse.returncode, 0, reuse.stderr)
+            self.assertEqual(json.loads(reuse.stdout), {"id": 42, "stale_build_sha": ""})
+
+            replace = self._select_draft(root, [stale], identity)
+            self.assertEqual(replace.returncode, 0, replace.stderr)
+            self.assertEqual(json.loads(replace.stdout), {"id": 43, "stale_build_sha": "c" * 40})
+
+            none = self._select_draft(root, [], identity)
+            self.assertEqual(none.returncode, 0, none.stderr)
+            self.assertEqual(none.stdout, "")
+
+    def test_select_draft_fails_closed_on_a_published_release(self):
+        identity = self._identity()
+        published = {
+            "id": 42,
+            "tag_name": "v7.1.0",
+            "name": "v7.1.0",
+            "draft": False,
+            "prerelease": False,
+            "body": json.dumps({"candidate_identity": identity}),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = self._select_draft(Path(tmp), [published], identity)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("published", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_release_and_tag_inputs_require_the_shape_the_workflows_emit(self):
+        # The workflows build these with `jq add` and `jq -Rsc split`, so a
+        # bare JSON list is the only accepted shape.
+        identity = self._identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = self._select_draft(Path(tmp), {"releases": []}, identity)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("JSON list of release objects", completed.stderr)
+
     def test_internal_modules_do_not_expose_standalone_clis(self):
         for name in (
             "candidate",

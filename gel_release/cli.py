@@ -438,6 +438,8 @@ def _parser() -> argparse.ArgumentParser:
     matrix.add_argument("kind", choices=("build", "smoke"))
     channel = commands.add_parser("channel")
     channel.add_argument("--version", required=True)
+    release_head = commands.add_parser("release-head")
+    release_head.add_argument("--line", required=True)
     completions = commands.add_parser("completions")
     completions.add_argument("--binary", required=True, type=Path)
     completions.add_argument("--out-dir", required=True, type=Path)
@@ -672,6 +674,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(_matrix(args.kind), separators=(",", ":")))
         elif args.command == "channel":
             print(registry_manifest.release_channel(args.version))
+        elif args.command == "release-head":
+            print(release_state.expected_head_for_line(args.line))
         elif args.command == "completions":
             package_target.generate_completions(args.binary, args.out_dir)
         elif args.command == "package-target":
@@ -747,6 +751,7 @@ def main(argv: list[str] | None = None) -> int:
                 candidate.load(args.record),
                 json.loads(args.live_pr_json.read_bytes()),
                 json.loads(args.release_json.read_bytes()),
+                refresh_live_pr=github_release.fetch_live_preview_pr,
             )
         elif args.command in {"publish-stable", "publish_stable"}:
             github_release.publish_stable(

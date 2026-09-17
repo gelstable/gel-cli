@@ -8,8 +8,8 @@ use different merge controls.
 
 ## Required check
 
-Every pull request targeting `release/v*.x` must require the status check
-shown by GitHub as:
+Every generated release PR targeting `release/v*.x` must require the status
+check shown by GitHub as:
 
 `Release candidate check / stable merge gate`
 
@@ -20,12 +20,29 @@ PR head and current prospective merge tree before allowing merge. Require the
 branch to be up to date with its base before merging, and require a pull
 request with the repository's normal review and conversation rules.
 
+The protected branch rule still requires this status context for every PR;
+ordinary backports receive their passing result from the safe path below.
+
+An ordinary backport PR targeting a release line gets the safe passing path
+when it cannot add or modify `packaging/release-candidate.json` or
+`packaging/gel-candidate.json`. The workflow identifies the generated release
+PR by its shared line-to-head helper and runs the full stable merge gate for
+that PR. A candidate record change on an ordinary backport fails the check.
+
 Do not allow bypassing the required status check, including for repository
 administrators or release automation. Disable force pushes and branch
 deletion for `master` and active release lines. The release bot may update its
 generated `knope/release-vN.x` branch through the workflow's narrowly scoped
 token; that generated branch is not a protected release line and is never a
 substitute for the required check on `release/vN.x`.
+
+## Workflow trust boundary
+
+The controller dispatches a candidate ref whose workflow YAML and release
+tooling can run with write privileges during staging. Treat that candidate ref
+as a trust boundary: protect generated workflow/tooling changes and review the
+generated release PR before allowing it to merge. The `candidate ref` is
+temporary and is removed after each candidate run, including failed runs.
 
 ## Re-evaluation events
 

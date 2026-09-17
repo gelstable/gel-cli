@@ -19,7 +19,7 @@ import subprocess
 import tarfile
 import tempfile
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -378,9 +378,9 @@ def find_reusable_draft(
 ) -> Mapping[str, object] | None:
     """Find the one unpublished draft whose tag and identity exactly match.
 
-    A release with the same tag but a different line or candidate identity is
-    an unsafe collision.  Published releases and malformed old drafts fail
-    closed so a retry cannot replace immutable release bytes.
+    Releases for other candidate tags are unrelated, even when they belong to
+    the same release line.  Only a release carrying this exact candidate tag
+    is validated for identity and mutability.
     """
 
     expected = _coerce_identity(identity)
@@ -391,16 +391,14 @@ def find_reusable_draft(
     for index, release in enumerate(releases):
         if not isinstance(release, Mapping):
             raise ValueError(f"release entry {index} is not an object")
-        payload = _body_identity(release)
-        identity_line = payload.get("line") if payload is not None else None
-        tag_matches = release.get("tag_name") == expected_tag or release.get("name") == expected_tag
-        line_matches = identity_line == expected.line
-        if not tag_matches and not line_matches:
+        tag_matches = release.get("tag_name") == expected_tag
+        if not tag_matches:
             continue
         if release.get("tag_name") != expected_tag or release.get("name") != expected_tag:
-            raise ValueError(f"release for candidate line {expected.line} has a tag/name mismatch")
+            raise ValueError(f"release for candidate tag {expected_tag} has a tag/name mismatch")
         if release.get("draft") is not True:
             raise ValueError(f"release {expected_tag} is published; refusing to reuse it")
+        payload = _body_identity(release)
         if payload is None:
             raise ValueError(f"draft {expected_tag} has no candidate identity")
         try:
@@ -418,6 +416,60 @@ def find_reusable_draft(
             raise ValueError(f"more than one reusable draft exists for {expected_tag}")
         reusable = release
     return reusable
+
+
+def find_replaceable_draft(
+    releases: list[Mapping[str, object]],
+    identity: CandidateIdentity | Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """Find an unpublished same-line candidate that may be superseded.
+
+    A source refresh keeps the prepared version and candidate tag but changes
+    the source identity.  Under the line mutation lock that old draft may be
+    invalidated and restaged when it belongs to the same authorized line and
+    generated PR.  Published releases, unrelated PRs, and malformed records
+    remain hard failures.
+    """
+
+    expected = _coerce_identity(identity)
+    if not isinstance(releases, list):
+        raise ValueError("GitHub releases must be a list")
+    expected_tag = expected.tag
+    replaceable: Mapping[str, object] | None = None
+    for index, release in enumerate(releases):
+        if not isinstance(release, Mapping):
+            raise ValueError(f"release entry {index} is not an object")
+        tag_matches = release.get("tag_name") == expected_tag
+        if not tag_matches:
+            continue
+        if release.get("tag_name") != expected_tag or release.get("name") != expected_tag:
+            raise ValueError(f"release for candidate tag {expected_tag} has a tag/name mismatch")
+        if release.get("draft") is not True:
+            raise ValueError(f"release {expected_tag} is published; refusing to replace it")
+        payload = _body_identity(release)
+        if payload is None:
+            raise ValueError(f"draft {expected_tag} has no candidate identity")
+        try:
+            actual = CandidateIdentity.from_dict(payload)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"draft {expected_tag} has an invalid candidate identity") from error
+        if actual.as_dict() == expected.as_dict():
+            continue
+        if actual.line != expected.line or actual.pr_number != expected.pr_number:
+            raise ValueError(
+                f"draft {expected_tag} candidate identity does not match authorized line/PR"
+            )
+        if actual.base_sha != expected.base_sha:
+            raise ValueError(
+                f"draft {expected_tag} candidate base {actual.base_sha} does not match current line"
+            )
+        expected_prerelease = expected.phase is not None
+        if release.get("prerelease") is not expected_prerelease:
+            raise ValueError(f"draft {expected_tag} prerelease flag does not match candidate phase")
+        if replaceable is not None:
+            raise ValueError(f"more than one replaceable draft exists for {expected_tag}")
+        replaceable = release
+    return replaceable
 
 
 def candidate_identity_body(identity: CandidateIdentity | Mapping[str, object]) -> str:
@@ -554,6 +606,30 @@ def published_snapshots(releases: list[dict]) -> set[tuple[str, str]]:
     return result
 
 
+def _published_tag_inventory(tags: list[str], releases: list[dict]) -> list[str]:
+    """Ignore Git tags that are still attached only to draft releases."""
+
+    if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+        raise ValueError("published tags must be a list of strings")
+    if not isinstance(releases, list):
+        raise ValueError("published releases must be a list")
+    release_tags = {
+        release.get("tag_name")
+        for release in releases
+        if isinstance(release, Mapping) and isinstance(release.get("tag_name"), str)
+    }
+    if not release_tags:
+        return list(tags)
+    published = {
+        release["tag_name"]
+        for release in releases
+        if isinstance(release, Mapping)
+        and release.get("draft") is not True
+        and isinstance(release.get("tag_name"), str)
+    }
+    return [tag for tag in tags if tag in published]
+
+
 def resolve_candidate(
     pr: release_state.ReleasePr,
     live_pr: dict,
@@ -607,7 +683,7 @@ def resolve_candidate(
     selected = preview.next_preview_version(
         stable,
         phase,
-        tags,
+        _published_tag_inventory(tags, releases),
         published,
         snapshot,
     )
@@ -1167,11 +1243,92 @@ def _preview_authorized(live_pr: Mapping[str, object], phase: str) -> None:
     raise ValueError(f"preview phase {phase} has no fresh authorization proof")
 
 
+def _flatten_api_pages(value: object) -> list[object]:
+    if not isinstance(value, list):
+        return [value]
+    entries: list[object] = []
+    for page in value:
+        entries.extend(page if isinstance(page, list) else [page])
+    return entries
+
+
+def _cargo_version_at_revision(revision: str, repo: Path = Path(".")) -> str:
+    try:
+        document = tomllib.loads(_run_git(repo, "show", f"{revision}:Cargo.toml"))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"could not read Cargo.toml at {revision}: {error}") from error
+    package = document.get("package")
+    if not isinstance(package, Mapping) or package.get("name") != "gel-cli":
+        raise ValueError(f"Cargo.toml at {revision} has no gel-cli package")
+    version = package.get("version")
+    if not isinstance(version, str) or not version:
+        raise ValueError(f"Cargo.toml at {revision} has no gel-cli version")
+    return version
+
+
+def fetch_live_preview_pr(
+    identity: CandidateIdentity,
+    _initial: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Fetch and enrich the PR state used immediately before preview mutation."""
+
+    raw = _gh_json(
+        "api",
+        f"/repos/{assets.REPOSITORY}/pulls/{identity.pr_number}",
+    )
+    if not isinstance(raw, Mapping):
+        raise ValueError("fresh preview PR response is not an object")
+    fresh = dict(raw)
+    head = fresh.get("head")
+    if not isinstance(head, Mapping) or not isinstance(head.get("sha"), str):
+        raise ValueError("fresh preview PR has no head SHA")
+    source_sha = head["sha"]
+    if _GIT_SHA.fullmatch(source_sha) is None:
+        raise ValueError(f"fresh preview PR has invalid head SHA {source_sha!r}")
+    fresh["prepared_version"] = _cargo_version_at_revision(source_sha)
+    try:
+        fresh["source_snapshot"] = source_equivalence.meaningful_tree(source_sha, Path("."))
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+        raise ValueError(f"could not compute fresh preview source snapshot: {error}") from error
+
+    timeline_payload = _gh_json(
+        "api",
+        "--paginate",
+        "--slurp",
+        f"/repos/{assets.REPOSITORY}/issues/{identity.pr_number}/timeline",
+    )
+    timeline = [
+        entry for entry in _flatten_api_pages(timeline_payload) if isinstance(entry, Mapping)
+    ]
+    permissions: dict[str, str] = {}
+    actors = {
+        login
+        for entry in timeline
+        for actor in [entry.get("actor", entry.get("user"))]
+        if isinstance(actor, Mapping)
+        for login in [actor.get("login")]
+        if isinstance(login, str) and login and not login.endswith("[bot]")
+    }
+    for login in sorted(actors):
+        permission = _gh_json(
+            "api",
+            f"/repos/{assets.REPOSITORY}/collaborators/{login}/permission",
+        )
+        if isinstance(permission, Mapping) and isinstance(permission.get("permission"), str):
+            permissions[login] = permission["permission"]
+    fresh["timeline"] = timeline
+    fresh["permissions"] = permissions
+    return fresh
+
+
 def publish_preview(
     identity: CandidateIdentity | Mapping[str, object],
     record: CandidateRecord | Mapping[str, object],
     live_pr: Mapping[str, object],
     release: Mapping[str, object],
+    *,
+    refresh_live_pr: Callable[[CandidateIdentity, Mapping[str, object]], Mapping[str, object]]
+    | None = None,
 ) -> None:
     """Publish an already verified preview draft after fresh identity checks.
 
@@ -1218,6 +1375,13 @@ def publish_preview(
 
     # Draft API readback is the final byte/draft gate before either mutation.
     _verify_draft_before_publication(validated, expected)
+    if refresh_live_pr is not None:
+        try:
+            live_pr = refresh_live_pr(expected, live_pr)
+            assert_live_identity(expected, dict(live_pr))
+            _preview_authorized(live_pr, expected.phase)
+        except ValueError as error:
+            raise ValueError(f"preview live state changed before mutation: {error}") from error
     _ensure_tag(expected.tag, expected.build_sha, release)
     _publish_release(validated, prerelease=True, make_latest=False)
     print(

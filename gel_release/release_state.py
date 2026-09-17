@@ -64,6 +64,12 @@ def expected_head(major: int) -> str:
     return f"knope/release-v{major}.x"
 
 
+def expected_head_for_line(line: str) -> str:
+    """Return the generated branch for a validated release-line name."""
+
+    return expected_head(parse_line(line))
+
+
 def phase_from_labels(labels: list[str]) -> str | None:
     """Resolve the one active prerelease phase from exact label names."""
 

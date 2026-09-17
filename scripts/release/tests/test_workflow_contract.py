@@ -101,6 +101,51 @@ class CandidateInputContractTests(unittest.TestCase):
         assert 'if type == "object" then . else error(' in identity_text
         assert ".build_sha = (.build_sha // .source_sha)" in identity_text
 
+    def test_stage_uploads_use_authenticated_cli_and_share_mutation_lock(self):
+        workflow = _workflow("release-candidate.yml")
+        stage = workflow["jobs"]["stage"]
+        assert stage["concurrency"] == {
+            "group": "release-mutation",
+            "cancel-in-progress": False,
+        }
+        upload = next(
+            step for step in _steps(stage) if step.get("name") == "Upload every distribution asset"
+        )
+        assert upload["env"]["GH_TOKEN"] == "${{ github.token }}"
+        record = next(
+            step
+            for step in _steps(stage)
+            if step.get("name") == "Write the immutable candidate record"
+        )
+        assert record["env"]["GH_TOKEN"] == "${{ github.token }}"
+        assert "find_replaceable_draft" in _run_text(stage)
+        assert "git/ref/tags/$TAG" in _run_text(stage)
+        assert "git/refs/tags/$TAG" in _run_text(stage)
+        assert "git/tags/$tag_target" in _run_text(stage)
+
+    def test_stage_revalidation_python_block_is_executable_after_yaml_folding(self):
+        workflow = _workflow("release-candidate.yml")
+        text = _run_text(workflow["jobs"]["stage"])
+        match = re.search(r"python -c '(?P<source>.*?)\n\s*' \"\$RUNNER_TEMP", text, re.S)
+        assert match, "missing inline draft revalidation script"
+        compile(match.group("source"), "release-candidate.yml: draft revalidation", "exec")
+
+    def test_candidate_cleanup_keeps_successful_preview_ref_until_publication(self):
+        workflow = _workflow("release-candidate.yml")
+        cleanup = workflow["jobs"]["cleanup-temporary-refs"]
+        assert "always()" in cleanup["if"]
+        text = _run_text(cleanup)
+        assert "STAGE_RESULT" in text
+        assert "VERIFY_RESULT" in text
+        assert "preview_ref" in text
+        assert "v${{ needs.identity.outputs.version }}" in str(cleanup["steps"])
+
+    def test_controller_rejects_a_requested_line_that_does_not_match_live_pr(self):
+        workflow = (WORKFLOWS / "release-controller.yml").read_text()
+        assert "REQUESTED_LINE" in workflow
+        assert ".base.ref" in workflow
+        assert "requested release line" in workflow
+
 
 class CandidateGraphContractTests(unittest.TestCase):
     def test_target_and_smoke_matrices_are_derived_from_release_cli(self):
@@ -256,6 +301,10 @@ class WorkflowSafetyContractTests(unittest.TestCase):
             "group": "release-publish",
             "cancel-in-progress": False,
         }
+        assert workflow["jobs"]["publish"]["concurrency"] == {
+            "group": "release-mutation",
+            "cancel-in-progress": False,
+        }
 
     def test_publication_rechecks_and_only_patches_existing_releases(self):
         workflow = _workflow("release-publish.yml")
@@ -281,6 +330,17 @@ class WorkflowSafetyContractTests(unittest.TestCase):
             "gh api -X DELETE",
         ):
             assert forbidden not in text
+
+    def test_preview_publication_refreshes_live_state_and_cleans_refs(self):
+        workflow = _workflow("release-publish.yml")
+        preview = _run_text(workflow["jobs"]["publish"])
+        assert "fetch_live_preview_pr" in preview
+        assert "release-candidate.json" in preview
+        assert "gel-candidate.json" in preview
+        cleanup = workflow["jobs"]["cleanup-temporary-refs"]
+        assert "always()" in cleanup["if"]
+        assert "workflow_run.head_branch" in str(cleanup)
+        assert "preview_ref" in _run_text(cleanup)
 
 
 class StableMergeWorkflowContractTests(unittest.TestCase):
@@ -321,6 +381,15 @@ class StableMergeWorkflowContractTests(unittest.TestCase):
             if "uses:" not in line or "./" in line:
                 continue
             assert re.search(r"uses:\s+[^@\s]+@[0-9a-f]{40}\s+#\s+.+$", line)
+
+    def test_ordinary_backport_has_safe_path_and_generated_pr_keeps_full_gate(self):
+        workflow = _workflow("release-candidate-check.yml")
+        text = _run_text(workflow["jobs"]["candidate"])
+        assert "release-head" in text
+        assert "packaging/release-candidate.json" in text
+        assert "packaging/gel-candidate.json" in text
+        assert "generated" in text
+        assert "candidate record" in text
 
 
 class ReleaseMigrationDocumentationContractTests(unittest.TestCase):
@@ -380,3 +449,17 @@ class ReleaseMigrationDocumentationContractTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, text)
+
+    def test_documents_backport_and_workflow_trust_boundaries(self):
+        branch_text = BRANCH_PROTECTION.read_text()
+        readme_text = README.read_text()
+        for text in (branch_text, readme_text):
+            for required in (
+                "ordinary backport",
+                "candidate record",
+                "generated release PR",
+                "trust boundary",
+                "candidate ref",
+            ):
+                with self.subTest(text=text[:20], required=required):
+                    self.assertIn(required, text)

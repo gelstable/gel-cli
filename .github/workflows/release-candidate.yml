@@ -470,6 +470,9 @@ jobs:
     name: stage verified distribution
     needs: [identity, plan, build, smoke, install]
     runs-on: ubuntu-24.04
+    concurrency:
+      group: release-mutation
+      cancel-in-progress: false
     permissions:
       contents: write
       id-token: write
@@ -552,19 +555,41 @@ jobs:
           print(candidate_identity_body(identity))
           PY
           )"
-          existing="$(PYTHONPATH=. uv run --frozen python - \
+          selection="$(PYTHONPATH=. uv run --frozen python - \
             "$RUNNER_TEMP/releases.json" "$RUNNER_TEMP/candidate-identity.json" <<'PY'
           import json
           import sys
-          from gel_release.github_release import find_reusable_draft
+          from gel_release.github_release import (
+              _body_identity,
+              find_replaceable_draft,
+              find_reusable_draft,
+          )
 
           releases = json.load(open(sys.argv[1]))
           identity = json.load(open(sys.argv[2]))
-          draft = find_reusable_draft(releases, identity)
+          replaceable = find_replaceable_draft(releases, identity)
+          try:
+              draft = find_reusable_draft(releases, identity)
+          except ValueError:
+              if replaceable is None:
+                  raise
+              draft = None
           if draft is not None:
-              print(draft["id"])
+              print(json.dumps({"id": draft["id"], "stale_build_sha": ""}))
+          elif replaceable is not None:
+              payload = _body_identity(replaceable) or {}
+              print(json.dumps({
+                  "id": replaceable["id"],
+                  "stale_build_sha": payload.get("build_sha", ""),
+              }))
           PY
           )"
+          existing=""
+          stale_build_sha=""
+          if [[ -n "$selection" ]]; then
+            existing="$(jq -r '.id // empty' <<< "$selection")"
+            stale_build_sha="$(jq -r '.stale_build_sha // empty' <<< "$selection")"
+          fi
           phase="$(jq -r '.phase // empty' "$RUNNER_TEMP/candidate-identity.json")"
           prerelease=false
           [[ -n "$phase" ]] && prerelease=true
@@ -574,22 +599,65 @@ jobs:
               -F draft=true -F prerelease="$prerelease" \
               -f body="$body" --jq '.id')"
           else
-            # Replacing assets is safe only after find_reusable_draft proved that
-            # the release is still a draft with exactly this tag and identity.
+            # Replacing assets is safe only after the release is proved to be
+            # the exact retry draft or an unpublished same-line/PR draft that
+            # may be superseded under this workflow's mutation lock.
             gh api "/repos/$GITHUB_REPOSITORY/releases/$existing" \
               > "$RUNNER_TEMP/reusable-release.json"
             PYTHONPATH=. uv run --frozen python -c '
-            import json
-            import sys
-            from gel_release.github_release import find_reusable_draft
+          import json
+          import sys
+          from gel_release.github_release import find_replaceable_draft, find_reusable_draft
 
-            release = json.load(open(sys.argv[1]))
-            identity = json.load(open(sys.argv[2]))
-            reusable = find_reusable_draft([release], identity)
-            if reusable is None or str(reusable.get("id")) != sys.argv[3]:
-                raise SystemExit("the selected draft changed before asset replacement")
+          release = json.load(open(sys.argv[1]))
+          identity = json.load(open(sys.argv[2]))
+          replaceable = find_replaceable_draft([release], identity)
+          try:
+              reusable = find_reusable_draft([release], identity)
+          except ValueError:
+              if replaceable is None:
+                  raise
+              reusable = None
+          selected = reusable or replaceable
+          if selected is None or str(selected.get("id")) != sys.argv[3]:
+              raise SystemExit("the selected draft changed before asset replacement")
             ' "$RUNNER_TEMP/reusable-release.json" \
               "$RUNNER_TEMP/candidate-identity.json" "$existing"
+            if [[ -n "$stale_build_sha" ]]; then
+              tag_error="$RUNNER_TEMP/tag-error.txt"
+              if tag_json="$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>"$tag_error")"; then
+                tag_type="$(jq -r '.object.type // empty' <<< "$tag_json")"
+                tag_target="$(jq -r '.object.sha // empty' <<< "$tag_json")"
+                for _ in {1..8}; do
+                  case "$tag_type" in
+                    commit)
+                      break
+                      ;;
+                    tag)
+                      tag_json="$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$tag_target")"
+                      tag_type="$(jq -r '.object.type // empty' <<< "$tag_json")"
+                      tag_target="$(jq -r '.object.sha // empty' <<< "$tag_json")"
+                      ;;
+                    *)
+                      echo "unpublished tag $TAG has unsupported object type $tag_type" >&2
+                      exit 1
+                      ;;
+                  esac
+                done
+                [[ "$tag_type" == commit ]]
+                if [[ "$tag_target" != "$stale_build_sha" ]]; then
+                  echo "unpublished tag $TAG does not point at the stale candidate" >&2
+                  exit 1
+                fi
+                gh api -X DELETE "/repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" >/dev/null
+              elif ! grep -q 'HTTP 404' "$tag_error"; then
+                cat "$tag_error" >&2
+                exit 1
+              fi
+              gh api -X PATCH "/repos/$GITHUB_REPOSITORY/releases/$existing" \
+                -f tag_name="$TAG" -f name="$TAG" -F draft=true \
+                -F prerelease="$prerelease" -f body="$body" >/dev/null
+            fi
             gh api --paginate \
               "/repos/$GITHUB_REPOSITORY/releases/$existing/assets" --jq '.[].id' \
               | while read -r asset_id; do
@@ -629,6 +697,7 @@ jobs:
       - name: Write the immutable candidate record
         id: record
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.plan.outputs.version }}
           LINE: ${{ needs.plan.outputs.line }}
           PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
@@ -875,3 +944,36 @@ jobs:
           git commit -m "chore: stage release candidate v${{ needs.plan.outputs.version }}"
           git push --force-with-lease="refs/heads/$head_ref:$remote_head" \
             origin "HEAD:refs/heads/$head_ref"
+
+  cleanup-temporary-refs:
+    name: clean up temporary release refs
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs: [identity, plan, stage, verify, commit-stable]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Remove candidate and preview refs
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          CANDIDATE_REF: ${{ github.ref_name }}
+          LINE: ${{ needs.identity.outputs.line }}
+          TAG: v${{ needs.identity.outputs.version }}
+          BUILD_SHA: ${{ needs.identity.outputs.build_sha }}
+          STAGE_RESULT: ${{ needs.stage.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$CANDIDATE_REF" == gel-release-candidate/* ]]; then
+            gh api -X DELETE \
+              "/repos/$GITHUB_REPOSITORY/git/refs/heads/$CANDIDATE_REF" \
+              >/dev/null || echo "candidate ref already removed: $CANDIDATE_REF"
+          fi
+          if [[ "$STAGE_RESULT" != success || "$VERIFY_RESULT" != success ]] \
+            && [[ -n "$LINE" && -n "$TAG" && -n "$BUILD_SHA" ]]; then
+            preview_line="${LINE//\//-}"
+            preview_ref="gel-preview-build/$preview_line/$TAG/$BUILD_SHA"
+            gh api -X DELETE \
+              "/repos/$GITHUB_REPOSITORY/git/refs/heads/$preview_ref" \
+              >/dev/null || echo "preview ref already removed: $preview_ref"
+          fi

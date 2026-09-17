@@ -79,8 +79,9 @@ jobs:
               echo "a release line or pull request is required" >&2
               exit 1
             fi
+            head_ref="$(uv run --frozen gel-release release-head --line "$line")"
             pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
-              --base "$line" --head "knope/release-v${line#release/v}.x" \
+              --base "$line" --head "$head_ref" \
               --json number --limit 2 | jq -r 'if length == 1 then .[0].number else empty end')"
           fi
           if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
@@ -100,9 +101,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
           PR_NUMBER: ${{ steps.request.outputs.number }}
+          REQUESTED_LINE: ${{ steps.request.outputs.line }}
         run: |
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/live-pr.json"
+          live_line="$(jq -r '.base.ref // empty' "$RUNNER_TEMP/live-pr.json")"
+          if [[ "$live_line" != "$REQUESTED_LINE" ]]; then
+            echo "requested release line $REQUESTED_LINE does not match live PR base $live_line" >&2
+            exit 1
+          fi
           uv run --frozen gel-release pr-identity \
             --pr-json "$RUNNER_TEMP/live-pr.json" \
             --repo "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/pr-identity.json"
@@ -314,4 +321,5 @@ jobs:
           gh workflow run release-candidate.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref "$candidate_ref" \
+            -f line="$(jq -r '.line' "$RUNNER_TEMP/identity.json")" \
             -f identity="$identity"

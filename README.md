@@ -72,13 +72,19 @@ Day-to-day line releases
 ------------------------
 
 Every release change on a line needs a `.changeset/*.md` file. Fixes normally
-land on `master` first and are cherry-picked onto the line when needed:
+land on `master` first and are cherry-picked onto the line through an ordinary
+backport PR when needed:
 
 ```
-git switch release/v8.x
+git switch -c backport/fix-name release/v8.x
 git cherry-pick <master-commit>
-git push origin release/v8.x
+git push origin backport/fix-name
+gh pr create --base release/v8.x --head backport/fix-name
 ```
+
+An ordinary backport PR passes the safe release-line check when it cannot add
+or modify a candidate record. A generated release PR keeps the full stable
+merge gate and is the only PR that can carry the reviewed candidate record.
 
 The line-specific `Release PR` workflow validates the line's current base and
 version, and prepares one pull request from `knope/release-vN.x`. A line with
@@ -100,9 +106,10 @@ Candidate staging creates the draft release and reads all staged assets back
 through the GitHub API. If a draft is stale, leave published releases and tags
 untouched, refresh the line PR from its current line tip, and retry the same
 line. Preparation removes an old `packaging/release-candidate.json` from the
-refreshed generated branch before replacing it. A draft is reusable only when
-its tag and candidate identity still match; an identity mismatch is a stop for
-maintainer investigation rather than an opportunity to replace bytes.
+refreshed generated branch before replacing it. Under the line mutation lock,
+an unpublished draft with the same tag, line, and generated PR is replaced
+when its source identity is stale; published tags and releases remain
+immutable.
 
 Stable merge and publication
 ----------------------------
@@ -164,6 +171,12 @@ registry root or a pinned snapshot. The release migration does not change the
 legacy package-root path: with no configured source, the built-in default is
 still `https://packages.geldata.com`, and `GEL_PKG_ROOT` plus the legacy
 `EDGEDB_PKG_ROOT` overrides and the `nightly` channel continue to work.
+
+The workflow trust boundary is the immutable candidate ref dispatched by the
+controller. Its checked-in workflow YAML and candidate-owned tooling execute
+staging with write privileges, so protect generated workflow/tooling changes
+and review the generated release PR. The candidate ref is removed after a run,
+including failed runs.
 
 Retiring the old release workflow
 ---------------------------------

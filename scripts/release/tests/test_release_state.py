@@ -44,6 +44,10 @@ class LineIdentityTests(unittest.TestCase):
     def test_release_line_maps_to_major_and_generated_head(self):
         self.assertEqual(release_state.parse_line("release/v7.x"), 7)
         self.assertEqual(release_state.expected_head(7), "knope/release-v7.x")
+        self.assertEqual(
+            release_state.expected_head_for_line("release/v7.x"),
+            "knope/release-v7.x",
+        )
 
     def test_master_is_not_a_release_line(self):
         with self.assertRaisesRegex(ValueError, "master"):

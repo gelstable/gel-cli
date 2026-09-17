@@ -151,6 +151,23 @@ class ResolveCandidateTests(unittest.TestCase):
         self.assertEqual(identity.version, "7.1.0-alpha.2")
         self.assertEqual(identity.source_snapshot, newer_snapshot)
 
+    def test_unpublished_tag_from_failed_patch_does_not_advance_suffix(self):
+        identity = github_release.resolve_candidate(
+            _release_pr(),
+            _live_pr(labels=["prerelease:alpha"]),
+            ["v7.1.0-alpha.1"],
+            [
+                {
+                    "tag_name": "v7.1.0-alpha.1",
+                    "draft": True,
+                    "prerelease": True,
+                }
+            ],
+        )
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        self.assertEqual(identity.version, "7.1.0-alpha.1")
+
     def test_generated_record_only_update_does_not_trigger_preview(self):
         identity = github_release.resolve_candidate(
             _release_pr(head_sha="d" * 40),
@@ -336,6 +353,70 @@ class CandidateIdentityBoundaryTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "identity|line"):
             github_release.find_reusable_draft([release], identity)
+
+    def test_older_drafts_and_published_releases_on_same_line_do_not_block_new_tag(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        older = {**identity.as_dict(), "version": "7.0.0", "tag": "v7.0.0"}
+        releases = [
+            {
+                "id": 90,
+                "tag_name": "v7.0.0",
+                "name": "v7.0.0",
+                "draft": False,
+                "prerelease": False,
+                "body": json.dumps({"candidate_identity": older}),
+            },
+            {
+                "id": 91,
+                "tag_name": "v7.0.0",
+                "name": identity.tag,
+                "draft": True,
+                "prerelease": False,
+                "body": json.dumps({"candidate_identity": older}),
+            },
+        ]
+
+        self.assertIsNone(github_release.find_reusable_draft(releases, identity))
+
+    def test_same_tag_source_refresh_is_replaceable_only_for_same_line_and_pr(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        stale = {**identity.as_dict(), "source_sha": "d" * 40, "build_sha": "d" * 40}
+        release = {
+            "id": 123,
+            "tag_name": identity.tag,
+            "name": identity.tag,
+            "draft": True,
+            "prerelease": False,
+            "body": json.dumps({"candidate_identity": stale}),
+        }
+
+        self.assertEqual(
+            github_release.find_replaceable_draft([release], identity),
+            release,
+        )
+        for changed in ("line", "pr_number"):
+            different = dict(stale)
+            different[changed] = "release/v8.x" if changed == "line" else 102
+            changed_release = {**release, "body": json.dumps({"candidate_identity": different})}
+            with (
+                self.subTest(changed=changed),
+                self.assertRaisesRegex(ValueError, "identity|line|PR"),
+            ):
+                github_release.find_replaceable_draft([changed_release], identity)
+
+    def test_same_tag_source_refresh_rejects_wrong_release_kind(self):
+        identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
+        stale = {**identity.as_dict(), "source_sha": "d" * 40, "build_sha": "d" * 40}
+        release = {
+            "id": 123,
+            "tag_name": identity.tag,
+            "name": identity.tag,
+            "draft": True,
+            "prerelease": True,
+            "body": json.dumps({"candidate_identity": stale}),
+        }
+        with self.assertRaisesRegex(ValueError, "prerelease"):
+            github_release.find_replaceable_draft([release], identity)
 
     def test_published_matching_tag_fails_closed(self):
         identity = github_release.CandidateIdentity.from_dict(self.IDENTITY)
@@ -875,6 +956,42 @@ class PublicationTests(unittest.TestCase):
         self.assertIn("make_latest", str(calls[1]))
         self.assertIn("'draft': False", str(calls[1]))
 
+    def test_preview_patch_failure_can_retry_existing_unpublished_tag(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record, tag_target=identity["build_sha"])
+        with mock.patch.object(
+            verify_draft, "resolve_tag_commit", return_value=identity["build_sha"]
+        ):
+            with mock.patch.object(verify_draft, "verify"):
+                with mock.patch.object(
+                    github_release,
+                    "_publish_release",
+                    side_effect=[ValueError("PATCH failed"), None],
+                ) as publish:
+                    with self.assertRaisesRegex(ValueError, "PATCH"):
+                        github_release.publish_preview(
+                            identity, record, self._preview_pr(), release
+                        )
+                    github_release.publish_preview(identity, record, self._preview_pr(), release)
+        self.assertEqual(publish.call_count, 2)
+
+    def test_preview_rechecks_live_state_after_draft_verification(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record)
+        changed = self._preview_pr()
+        changed["head"] = {**changed["head"], "sha": "e" * 40}
+        with mock.patch.object(verify_draft, "verify"):
+            with self.assertRaisesRegex(ValueError, "source|head|identity"):
+                github_release.publish_preview(
+                    identity,
+                    record,
+                    self._preview_pr(),
+                    release,
+                    refresh_live_pr=lambda _identity, _initial: changed,
+                )
+
     def test_stable_backport_without_merge_matching_record_is_a_noop(self):
         identity = self._stable_identity()
         record = self._record(identity)
@@ -928,6 +1045,22 @@ class PublicationTests(unittest.TestCase):
             with mock.patch.object(verify_draft, "verify") as verify:
                 github_release.publish_stable(record, "e" * 40, release)
         self.assertEqual(verify.call_args.kwargs.get("expected_tag_target"), "e" * 40)
+
+    def test_stable_patch_failure_can_retry_existing_unpublished_tag(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        with mock.patch.object(verify_draft, "resolve_tag_commit", return_value="e" * 40):
+            with mock.patch.object(verify_draft, "verify"):
+                with mock.patch.object(
+                    github_release,
+                    "_publish_release",
+                    side_effect=[ValueError("PATCH failed"), None],
+                ) as publish:
+                    with self.assertRaisesRegex(ValueError, "PATCH"):
+                        github_release.publish_stable(record, "e" * 40, release)
+                    github_release.publish_stable(record, "e" * 40, release)
+        self.assertEqual(publish.call_count, 2)
 
     def test_tag_target_resolves_the_actual_ref_when_release_has_sha_metadata(self):
         identity = self._stable_identity()

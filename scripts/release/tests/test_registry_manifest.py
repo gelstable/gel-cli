@@ -1,9 +1,13 @@
+import copy
 import json
 import unittest
 from pathlib import Path
 from typing import Literal, get_type_hints
 
-from gel_release import assets, digests, registry_manifest
+import jsonschema
+from pydantic import ValidationError
+
+from gel_release import assets, digests, models, registry_manifest
 
 FIXTURE = Path("tests/fixtures/registry/release-manifest/gel-registry.json")
 
@@ -187,40 +191,153 @@ class IsolationTests(unittest.TestCase):
             self.assertNotIn(suffix, rendered)
 
 
+# The gel-registry.json asset published on the gelstable/gel-cli v7.10.2 release,
+# reproduced field for field (sha256 of the published bytes:
+# 633e36afc7bae41eacbca91b31dfdb308dd2a9f69f9676f17e21f2af5ddfae8f). Refresh with:
+#   gh release download v7.10.2 --repo gelstable/gel-cli --pattern gel-registry.json
+_V7_10_2_DOWNLOAD = "https://github.com/gelstable/gel-cli/releases/download/v7.10.2/"
+_V7_10_2_REPLACEMENTS = [
+    (
+        "37c2c005dd86d68661d7113a57edfc04c5bb3c5ba091d518266d63d0be571291",
+        "gel-cli-aarch64-pc-windows-msvc.exe",
+    ),
+    (
+        "3ac72ff22ef040d830c72707c8cadbfda102899891e3b006783edb80e4444e0e",
+        "gel-cli-x86_64-pc-windows-msvc.exe",
+    ),
+    (
+        "cfff03e138c2f638472e03362d2b1bc9e6b9252d4601f46a545353d7f289bace",
+        "gel-cli-aarch64-apple-darwin",
+    ),
+    (
+        "d8708ed1ae878ca0d453fabb09cdafb7e8fe1bf7d587e437a7c3b1a8d7b85f53",
+        "gel-cli-aarch64-unknown-linux-musl",
+    ),
+    (
+        "ffa7f157df610dcfa456b97e07ca90277243cd36c9d8b5b26884a39295ef9967",
+        "gel-cli-x86_64-unknown-linux-musl",
+    ),
+]
+PUBLISHED_V7_10_2 = {
+    "indexes": [],
+    "replacements": [
+        {"sha256": sha, "url": _V7_10_2_DOWNLOAD + name} for sha, name in _V7_10_2_REPLACEMENTS
+    ],
+    "schema_version": 1,
+}
+
+
 class LegacyReplacementsTests(unittest.TestCase):
     """Published v7.10.x manifests use replacements instead of indexes."""
 
-    def manifest(self) -> dict:
-        return {
-            "schema_version": 1,
-            "indexes": [],
-            "replacements": [
-                {
-                    "sha256": f"{index:064x}",
-                    "url": (
-                        "https://github.com/gelstable/gel-cli/releases/download/v7.10.2/"
-                        f"gel-cli-target-{index}"
-                    ),
-                }
-                for index in range(2)
-            ],
-        }
-
-    def test_published_v7_replacements_manifest_validates(self):
-        manifest = self.manifest()
+    def test_published_v7_10_2_manifest_validates(self):
+        manifest = copy.deepcopy(PUBLISHED_V7_10_2)
         registry_manifest.validate_manifest(manifest)
-        from gel_release.models import ReleaseManifest
+        models.LegacyReplacementsManifest.model_validate(manifest)
 
-        ReleaseManifest.model_validate(manifest)
+    def test_published_manifest_is_dispatched_to_the_legacy_model(self):
+        self.assertIs(
+            registry_manifest._manifest_model(PUBLISHED_V7_10_2),
+            models.LegacyReplacementsManifest,
+        )
 
     def test_replacements_without_indexes_array_validates(self):
-        manifest = self.manifest()
+        manifest = copy.deepcopy(PUBLISHED_V7_10_2)
         del manifest["indexes"]
         registry_manifest.validate_manifest(manifest)
+
+    def test_legacy_digests_are_accepted_as_published(self):
+        # Historical data: these releases are immutable and no future run
+        # produces another, so the legacy shape only asks for non-empty
+        # strings rather than the digest shapes the new pipeline emits.
+        manifest = copy.deepcopy(PUBLISHED_V7_10_2)
+        manifest["replacements"][0]["sha256"] = "not-a-sha256"
+        models.LegacyReplacementsManifest.model_validate(manifest)
+
+    def test_legacy_shape_may_not_smuggle_indexes(self):
+        manifest = copy.deepcopy(PUBLISHED_V7_10_2)
+        manifest["indexes"] = [{"channel": "stable", "platform": "x", "packages": []}]
+        with self.assertRaises(ValidationError):
+            models.LegacyReplacementsManifest.model_validate(manifest)
 
     def test_empty_manifest_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "indexes or replacements"):
             registry_manifest.validate_manifest({"schema_version": 1})
+
+
+class GeneratedManifestStrictnessTests(unittest.TestCase):
+    """The indexes shape this pipeline generates is held to its own rules.
+
+    The vendored JSON schema tolerates a null sha256, a zero size, and any
+    encoding string so the registry can still read historical documents.
+    Nothing this pipeline generates may look like that, so the model is
+    deliberately stricter than the schema and these cases are rejected by
+    ``validate_manifest`` even though ``jsonschema`` alone would pass them.
+    """
+
+    def manifest(self) -> dict:
+        return registry_manifest.build_manifest(
+            "1.2.3", "2026-09-12T00:00:00+00:00", _entries("1.2.3")
+        )
+
+    def install_ref(self, manifest: dict) -> dict:
+        return manifest["indexes"][0]["packages"][0]["installrefs"][0]
+
+    def test_build_manifest_emits_only_identity_and_zstd_encodings(self):
+        manifest = self.manifest()
+        encodings = {
+            ref["encoding"]
+            for index in manifest["indexes"]
+            for package in index["packages"]
+            for ref in package["installrefs"]
+        }
+        self.assertEqual(encodings, {"identity", "zstd"})
+
+    def test_missing_sha256_is_rejected(self):
+        manifest = self.manifest()
+        del self.install_ref(manifest)["verification"]["sha256"]
+        self.assertIsNone(jsonschema.validate(instance=manifest, schema=self.schema()))
+        with self.assertRaises(ValidationError):
+            registry_manifest.validate_manifest(manifest)
+
+    def test_null_sha256_is_rejected(self):
+        manifest = self.manifest()
+        self.install_ref(manifest)["verification"]["sha256"] = None
+        with self.assertRaises(ValidationError):
+            registry_manifest.validate_manifest(manifest)
+
+    def test_bogus_encoding_is_rejected(self):
+        manifest = self.manifest()
+        self.install_ref(manifest)["encoding"] = "brotli"
+        self.assertIsNone(jsonschema.validate(instance=manifest, schema=self.schema()))
+        with self.assertRaises(ValidationError):
+            registry_manifest.validate_manifest(manifest)
+
+    def test_missing_encoding_is_rejected(self):
+        manifest = self.manifest()
+        del self.install_ref(manifest)["encoding"]
+        with self.assertRaises(ValidationError):
+            registry_manifest.validate_manifest(manifest)
+
+    def test_zero_size_is_rejected(self):
+        manifest = self.manifest()
+        self.install_ref(manifest)["verification"]["size"] = 0
+        self.assertIsNone(jsonschema.validate(instance=manifest, schema=self.schema()))
+        with self.assertRaises(ValidationError):
+            registry_manifest.validate_manifest(manifest)
+
+    def test_generated_manifest_may_not_carry_replacements(self):
+        manifest = self.manifest()
+        manifest["replacements"] = [{"sha256": "0" * 64, "url": "https://example.invalid/a"}]
+        with self.assertRaises(ValidationError):
+            models.ReleaseManifest.model_validate(manifest)
+
+    def test_generated_manifest_needs_at_least_one_index(self):
+        with self.assertRaises(ValidationError):
+            models.ReleaseManifest.model_validate({"schema_version": 1, "indexes": []})
+
+    def schema(self) -> dict:
+        return json.loads(registry_manifest.SCHEMA_PATH.read_bytes())
 
 
 class GoldenFixtureTests(unittest.TestCase):

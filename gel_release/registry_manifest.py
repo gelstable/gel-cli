@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Literal
 
 import jsonschema
+from pydantic import BaseModel
 
 from . import assets, digests
-from .models import ReleaseManifest
+from .models import LegacyReplacementsManifest, ReleaseManifest
 
 SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent / "packaging" / "schema" / "release-manifest.schema.json"
@@ -52,7 +53,11 @@ def release_channel(version: str) -> Literal["stable", "testing"]:
 
 
 def _install_ref(
-    version: str, name: str, target: assets.Target, encoding: str, digest: digests.FileDigest
+    version: str,
+    name: str,
+    target: assets.Target,
+    encoding: Literal["identity", "zstd"],
+    digest: digests.FileDigest,
 ) -> dict:
     return {
         "ref": assets.release_download_url(version, name),
@@ -119,8 +124,28 @@ def build_manifest(version: str, build_date: str, entries: dict[str, digests.Fil
     return {"schema_version": 1, "indexes": indexes}
 
 
+def _manifest_model(manifest: dict) -> type[BaseModel]:
+    """Pick the document model for one manifest.
+
+    Two unrelated documents share ``schema_version: 1``: the ``replacements``
+    form published for v7.10.x, and the ``indexes`` form this pipeline
+    generates. What tells them apart is the presence of a non-empty
+    ``replacements`` array rather than the value of any single field, so
+    Pydantic's discriminated union cannot express the choice. A plain
+    (non-discriminated) union would be worse than an explicit dispatch: a
+    freshly generated manifest with a malformed index would fall through to
+    the permissive legacy branch and be reported as failing both arms, which
+    is exactly the loss of strictness this split exists to prevent.
+    """
+    if manifest.get("replacements"):
+        return LegacyReplacementsManifest
+    if manifest.get("indexes"):
+        return ReleaseManifest
+    raise ValueError("a release manifest must contain indexes or replacements")
+
+
 def validate_manifest(manifest: dict) -> None:
-    ReleaseManifest.model_validate(manifest)
+    _manifest_model(manifest).model_validate(manifest)
     schema = json.loads(SCHEMA_PATH.read_bytes())
     jsonschema.validate(instance=manifest, schema=schema)
 

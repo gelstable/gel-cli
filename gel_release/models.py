@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
@@ -127,15 +127,28 @@ class GithubAsset(StrictModel):
 
 
 class ManifestVerification(StrictModel):
-    size: Annotated[int, Field(strict=True, ge=0)]
+    """Byte verification for an install ref this pipeline generates.
+
+    Deliberately stricter than ``Verification`` in the vendored JSON schema,
+    which leaves ``sha256`` nullable and permits ``size: 0`` so that the
+    registry can still read historical documents. Nothing this pipeline emits
+    may omit a digest or describe a zero-byte artifact, so the model refuses
+    what the schema tolerates. ``validate_manifest`` runs both checks; the
+    model is the binding one for generated manifests.
+    """
+
+    size: PositiveInt
     blake2b: Blake2b512
-    sha256: Sha256 | None = None
+    sha256: Sha256
 
 
 class ManifestInstallRef(StrictModel):
     ref: HttpUrl
     type: Annotated[str, Field(min_length=1)]
-    encoding: Annotated[str, Field(min_length=1)] | None = None
+    # ``build_manifest`` emits exactly these two encodings, one bare executable
+    # and one zstd-compressed. The vendored schema allows any string; this
+    # pipeline does not, so an unknown encoding is a generator bug, not input.
+    encoding: Literal["identity", "zstd"]
     verification: ManifestVerification
 
 
@@ -181,14 +194,39 @@ class Replacement(StrictModel):
 
 
 class ReleaseManifest(StrictModel):
-    # Published v7.10.x manifests carry ``replacements`` instead of ``indexes``;
-    # the vendored JSON schema blesses both shapes, so this model must too.
+    """The ``indexes`` manifest this pipeline generates.
+
+    Strict by construction: every field is something ``build_manifest`` chose,
+    so anything unexpected here is a defect in the generator rather than
+    third-party data to be tolerated. ``replacements`` is not a member of this
+    document at all -- ``extra="forbid"`` rejects it -- because the new
+    pipeline never emits one.
+    """
+
     schema_version: Literal[1]
-    indexes: list[ManifestIndex] = []
-    replacements: list[Replacement] = []
+    indexes: Annotated[list[ManifestIndex], Field(min_length=1)]
+
+
+class LegacyReplacementsManifest(StrictModel):
+    """A published v7.10.x manifest, kept readable exactly as shipped.
+
+    This is historical data: the released assets are immutable and no future
+    run of this pipeline will ever produce another one. Validation is
+    therefore deliberately permissive -- digests and URLs are only required to
+    be non-empty strings -- and its job is to let the registry promoter read
+    the document, not to hold it to the current pipeline's standards.
+
+    Published documents carry an empty ``indexes`` array alongside
+    ``replacements``; a populated one would mean the document is really the
+    new shape and must be validated as ``ReleaseManifest`` instead.
+    """
+
+    schema_version: Literal[1]
+    replacements: Annotated[list[Replacement], Field(min_length=1)]
+    indexes: list[Any] = []
 
     @model_validator(mode="after")
-    def validate_shape(self) -> ReleaseManifest:
-        if not self.indexes and not self.replacements:
-            raise ValueError("a release manifest must contain indexes or replacements")
+    def reject_populated_indexes(self) -> LegacyReplacementsManifest:
+        if self.indexes:
+            raise ValueError("a legacy replacements manifest must not carry indexes")
         return self

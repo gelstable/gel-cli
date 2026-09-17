@@ -115,8 +115,24 @@ preview. The first published preview for a phase receives suffix `.1`; a
 retry with the same phase and source snapshot does nothing, while a changed
 phase or source receives the next published suffix. Failed or stale drafts do
 not consume a suffix because only published preview tags advance the counter.
-Use the controller's line/PR retry dispatch after a transient workflow
-failure; it resolves the current labels and source again before staging.
+Two manual repository dispatches exist for retrying after a transient
+workflow failure. Both resolve the current labels and source again before
+acting, and their event types are deliberately disjoint so one retry cannot
+run a line regeneration and a full candidate staging at the same time. Retry
+the line's release PR workflow with:
+
+```
+gh api repos/<owner>/<repo>/dispatches -f event_type=release-line \
+  -F 'client_payload[line]=release/v7.x'
+```
+
+Retry the candidate controller for an existing generated release PR with
+either the pull request number or the line:
+
+```
+gh api repos/<owner>/<repo>/dispatches -f event_type=release-candidate \
+  -F 'client_payload[pr]=<pull request number>'
+```
 
 Candidate staging creates the draft release and reads all staged assets back
 through the GitHub API. If a draft is stale, leave published releases and tags

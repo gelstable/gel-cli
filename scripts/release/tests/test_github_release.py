@@ -1763,7 +1763,7 @@ class GithubReleaseCliTests(unittest.TestCase):
             {"labeled", "unlabeled", "synchronize", "reopened"},
         )
         self.assertIn("workflow_dispatch", triggers)
-        self.assertEqual(triggers["repository_dispatch"]["types"], ["release-line"])
+        self.assertEqual(triggers["repository_dispatch"]["types"], ["release-candidate"])
         self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
         self.assertIn("release-controller", workflow["concurrency"]["group"])
 

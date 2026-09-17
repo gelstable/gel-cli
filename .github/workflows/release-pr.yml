@@ -88,10 +88,12 @@ jobs:
           head_ref="knope/release-v${major}.x"
           base_sha="${{ steps.changes.outputs.base_sha }}"
 
-          # Read the current generated head before replacing it. A candidate
-          # record on that branch is a stable identity; replacing it is safe
-          # only after this run has started again from the latest line and
-          # removes the old record from the new prepared tree.
+          # Read the current generated head before replacing it; the push step
+          # needs it for --force-with-lease. Resetting the branch from the
+          # line tip is itself the invalidation of any candidate record the
+          # old generated head carried, and the removal below drops the record
+          # a merged line tip carries, so preparation can never keep a stale
+          # record in the tree it prepares.
           git fetch --no-tags origin \
             "refs/heads/${head_ref}:refs/remotes/origin/${head_ref}" \
             2>/dev/null || true
@@ -99,24 +101,11 @@ jobs:
           if git show-ref --verify --quiet "refs/remotes/origin/${head_ref}"; then
             old_head_sha="$(git rev-parse "refs/remotes/origin/${head_ref}^{commit}")"
           fi
-          old_record=false
-          if [[ -n "$old_head_sha" ]] && git cat-file -e \
-            "${old_head_sha}:packaging/release-candidate.json" 2>/dev/null; then
-            old_record=true
-          fi
 
           git fetch --no-tags origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
           git switch -C "$head_ref" "$base_sha"
-          invalidated=false
           if [[ -e packaging/release-candidate.json ]]; then
             git rm -f packaging/release-candidate.json
-            invalidated=true
-          fi
-          if [[ "$old_record" == true ]]; then
-            # The old generated branch may have carried the record even when
-            # the latest line tip does not. Resetting from that tip is itself
-            # the invalidation required before a force-with-lease refresh.
-            invalidated=true
           fi
           git config user.name "gelstable-release"
           git config user.email "release@gelstable.invalid"
@@ -135,10 +124,6 @@ jobs:
           version="$(jq -r '.prepared_version' "$RUNNER_TEMP/prepared-line.json")"
           if [[ "$version" == null || -z "$version" ]]; then
             echo "Knope did not produce a prepared version" >&2
-            exit 1
-          fi
-          if [[ "$old_record" == true && "$invalidated" != true ]]; then
-            echo "refusing to replace $head_ref while its stable candidate record is still valid" >&2
             exit 1
           fi
           {

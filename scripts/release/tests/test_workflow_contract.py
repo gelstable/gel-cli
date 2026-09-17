@@ -96,6 +96,17 @@ class ControllerTriggerContractTests(unittest.TestCase):
                     "is not guarded by the classify decision"
                 )
 
+    def test_repository_dispatch_types_are_disjoint(self):
+        # Nothing in the repository sends these events; they are manual retry
+        # escapes. Sharing one type would let a single operator retry run a
+        # line regeneration and a full candidate staging concurrently.
+        pr_types = set(_workflow("release-pr.yml")["on"]["repository_dispatch"]["types"])
+        controller_types = set(
+            _workflow("release-controller.yml")["on"]["repository_dispatch"]["types"]
+        )
+        self.assertEqual(pr_types, {"release-line"})
+        self.assertEqual(controller_types, {"release-candidate"})
+
 
 class CandidateInputContractTests(unittest.TestCase):
     def test_candidate_only_accepts_a_dispatched_json_identity(self):

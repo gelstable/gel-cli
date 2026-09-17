@@ -18,7 +18,10 @@ name: Release controller
         required: true
         type: string
   repository_dispatch:
-    types: [release-line]
+    # Deliberately disjoint from release-pr.yml's `release-line` type: one
+    # operator retry must not run a line regeneration and a full candidate
+    # staging at the same time.
+    types: [release-candidate]
 
 permissions:
   contents: read

@@ -224,7 +224,9 @@ jobs:
 
   cleanup-temporary-refs:
     name: clean up temporary candidate refs
-    if: always() && github.event_name == 'workflow_run'
+    if: >-
+      always() && github.event_name == 'workflow_run' &&
+      needs.publish.result == 'success'
     needs: [publish]
     runs-on: ubuntu-24.04
     permissions:

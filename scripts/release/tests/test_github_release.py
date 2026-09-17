@@ -168,6 +168,18 @@ class ResolveCandidateTests(unittest.TestCase):
         assert identity is not None
         self.assertEqual(identity.version, "7.1.0-alpha.1")
 
+    def test_tag_without_release_remains_occupied_with_unrelated_published_release(self):
+        identity = github_release.resolve_candidate(
+            _release_pr(),
+            _live_pr(labels=["prerelease:alpha"]),
+            ["v7.1.0-alpha.1", "v8.0.0-beta.1"],
+            [_published_preview("8.0.0-beta.1", "e" * 64, phase="beta")],
+        )
+
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        self.assertEqual(identity.version, "7.1.0-alpha.2")
+
     def test_generated_record_only_update_does_not_trigger_preview(self):
         identity = github_release.resolve_candidate(
             _release_pr(head_sha="d" * 40),

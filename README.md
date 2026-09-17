@@ -175,8 +175,9 @@ still `https://packages.geldata.com`, and `GEL_PKG_ROOT` plus the legacy
 The workflow trust boundary is the immutable candidate ref dispatched by the
 controller. Its checked-in workflow YAML and candidate-owned tooling execute
 staging with write privileges, so protect generated workflow/tooling changes
-and review the generated release PR. The candidate ref is removed after a run,
-including failed runs.
+and review the generated release PR. Successful candidate runs remove their
+candidate refs; failed runs retain them for recovery. Derived preview refs
+remain until publication succeeds, and failed publication retains them.
 
 Retiring the old release workflow
 ---------------------------------

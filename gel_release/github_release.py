@@ -613,13 +613,13 @@ def _published_tag_inventory(tags: list[str], releases: list[dict]) -> list[str]
         raise ValueError("published tags must be a list of strings")
     if not isinstance(releases, list):
         raise ValueError("published releases must be a list")
-    release_tags = {
+    draft_tags = {
         release.get("tag_name")
         for release in releases
-        if isinstance(release, Mapping) and isinstance(release.get("tag_name"), str)
+        if isinstance(release, Mapping)
+        and release.get("draft") is True
+        and isinstance(release.get("tag_name"), str)
     }
-    if not release_tags:
-        return list(tags)
     published = {
         release["tag_name"]
         for release in releases
@@ -627,7 +627,7 @@ def _published_tag_inventory(tags: list[str], releases: list[dict]) -> list[str]
         and release.get("draft") is not True
         and isinstance(release.get("tag_name"), str)
     }
-    return [tag for tag in tags if tag in published]
+    return [tag for tag in tags if tag not in draft_tags or tag in published]
 
 
 def resolve_candidate(

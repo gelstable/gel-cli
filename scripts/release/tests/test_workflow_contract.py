@@ -134,11 +134,10 @@ class CandidateInputContractTests(unittest.TestCase):
         workflow = _workflow("release-candidate.yml")
         cleanup = workflow["jobs"]["cleanup-temporary-refs"]
         assert "always()" in cleanup["if"]
+        assert "needs.stage.result == 'success'" in cleanup["if"]
+        assert "needs.verify.result == 'success'" in cleanup["if"]
         text = _run_text(cleanup)
-        assert "STAGE_RESULT" in text
-        assert "VERIFY_RESULT" in text
-        assert "preview_ref" in text
-        assert "v${{ needs.identity.outputs.version }}" in str(cleanup["steps"])
+        assert "preview_ref" not in text
 
     def test_controller_rejects_a_requested_line_that_does_not_match_live_pr(self):
         workflow = (WORKFLOWS / "release-controller.yml").read_text()
@@ -339,6 +338,7 @@ class WorkflowSafetyContractTests(unittest.TestCase):
         assert "gel-candidate.json" in preview
         cleanup = workflow["jobs"]["cleanup-temporary-refs"]
         assert "always()" in cleanup["if"]
+        assert "needs.publish.result == 'success'" in cleanup["if"]
         assert "workflow_run.head_branch" in str(cleanup)
         assert "preview_ref" in _run_text(cleanup)
 

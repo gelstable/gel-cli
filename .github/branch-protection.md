@@ -42,7 +42,9 @@ The controller dispatches a candidate ref whose workflow YAML and release
 tooling can run with write privileges during staging. Treat that candidate ref
 as a trust boundary: protect generated workflow/tooling changes and review the
 generated release PR before allowing it to merge. The `candidate ref` is
-temporary and is removed after each candidate run, including failed runs.
+temporary and is removed after a successful candidate run. Failed candidate
+runs retain the ref for recovery. A derived preview ref is removed only after
+successful publication.
 
 ## Re-evaluation events
 

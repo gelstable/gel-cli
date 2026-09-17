@@ -173,6 +173,12 @@ With the secret unset, the controller and the candidate commit job fail on
 their first step with an explicit message instead of proceeding into a
 configuration that cannot merge.
 
+The pipelines can also run against another repository, such as a rehearsal
+scratch repo. Set that repository's `RELEASE_REPOSITORY` variable to its
+owner/name so the workflow guards pass, and provide the same
+`RELEASE_BOT_TOKEN` secret there. Every API call reads the operating
+repository from the runner environment, so nothing else needs overriding.
+
 Stable merge and publication
 ----------------------------
 

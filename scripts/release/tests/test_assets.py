@@ -1,6 +1,12 @@
+import os
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
 from gel_release import assets
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class TargetInventoryTests(unittest.TestCase):
@@ -53,6 +59,34 @@ class AssetNameTests(unittest.TestCase):
             assets.release_download_url("7.11.0", "SHA256SUMS"),
             "https://github.com/gelstable/gel-cli/releases/download/v7.11.0/SHA256SUMS",
         )
+
+
+class RepositoryIdentityTests(unittest.TestCase):
+    def test_repository_follows_the_operating_environment(self):
+        # gel_release reads GITHUB_REPOSITORY at import time so the whole
+        # pipeline retargets to whichever repository runs it (a rehearsal
+        # scratch repo included). Prove the read as a fresh process sees it
+        # instead of reloading the shared module in-process.
+        for repository in ("scratch/gel-cli-rehearsal", None):
+            with self.subTest(repository=repository):
+                env = dict(os.environ)
+                if repository is None:
+                    env.pop("GITHUB_REPOSITORY", None)
+                else:
+                    env["GITHUB_REPOSITORY"] = repository
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from gel_release import assets; print(assets.REPOSITORY)",
+                    ],
+                    env=env,
+                    cwd=REPO_ROOT,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout.strip(), repository or "gelstable/gel-cli")
 
 
 class ExpectedInventoryTests(unittest.TestCase):

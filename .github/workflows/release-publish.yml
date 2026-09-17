@@ -52,7 +52,7 @@ jobs:
       group: release-mutation
       cancel-in-progress: false
     if: >-
-      github.repository == 'gelstable/gel-cli' &&
+      github.repository == (vars.RELEASE_REPOSITORY || 'gelstable/gel-cli') &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
     runs-on: ubuntu-24.04

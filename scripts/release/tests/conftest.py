@@ -7,10 +7,18 @@ modules beside it, so they import the helpers with ``from conftest import ...``.
 """
 
 import contextlib
+import os
 import subprocess
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+
+# gel_release reads the operating repository from the environment at import
+# time, and this suite's fixtures assert against the production repository.
+# Pin it before any test module imports gel_release so the suite stays
+# deterministic even where GITHUB_REPOSITORY is already set, such as the CI
+# job that runs this suite on every pull request.
+os.environ["GITHUB_REPOSITORY"] = "gelstable/gel-cli"
 
 
 def _git(repo: Path, *argv: str) -> str:

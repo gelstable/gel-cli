@@ -6,9 +6,15 @@ repository hard-codes a release asset name.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
-REPOSITORY = "gelstable/gel-cli"
+# The repository every release API call targets. GitHub Actions sets
+# GITHUB_REPOSITORY to the operating repository, which keeps the same-repo
+# enforcement exact while letting any repository run this pipeline against
+# itself (a rehearsal scratch repo included). Outside CI this resolves to the
+# production repository.
+REPOSITORY = os.environ.get("GITHUB_REPOSITORY") or "gelstable/gel-cli"
 REGISTRY_BASENAME = "gel-cli"
 DIST_BASENAME = "gel"
 REGISTRY_MANIFEST_NAME = "gel-registry.json"

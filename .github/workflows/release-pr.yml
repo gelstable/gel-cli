@@ -23,7 +23,7 @@ jobs:
   prepare:
     name: prepare
     runs-on: ubuntu-24.04
-    if: github.repository == 'gelstable/gel-cli'
+    if: github.repository == (vars.RELEASE_REPOSITORY || 'gelstable/gel-cli')
     env:
       BASE_REF: ${{ github.event.client_payload.base_ref || github.event.client_payload.line || github.ref_name }}
     steps:

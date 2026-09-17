@@ -326,6 +326,23 @@ class WorkflowSafetyContractTests(unittest.TestCase):
             "attestations": "read",
         }
 
+    def test_release_workflow_guards_parameterize_the_operating_repository(self):
+        # The production fallback keeps the guard exact by default; the
+        # repository variable lets a rehearsal scratch repo run the same
+        # workflows against itself.
+        for name in (
+            "release-candidate-check.yml",
+            "release-pr.yml",
+            "release-controller.yml",
+            "release-publish.yml",
+        ):
+            text = (WORKFLOWS / name).read_text()
+            with self.subTest(workflow=name):
+                assert "github.repository == (vars.RELEASE_REPOSITORY || 'gelstable/gel-cli')" in (
+                    text
+                )
+                assert "github.repository == 'gelstable/gel-cli'" not in text
+
     def test_publication_is_serialized_across_lines_and_uses_read_defaults(self):
         workflow = _workflow("release-publish.yml")
         assert workflow["on"]["push"]["branches"] == ["release/v*.x"]

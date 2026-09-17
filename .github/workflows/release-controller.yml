@@ -40,7 +40,7 @@ env:
 jobs:
   resolve:
     name: resolve and dispatch
-    if: github.repository == 'gelstable/gel-cli'
+    if: github.repository == (vars.RELEASE_REPOSITORY || 'gelstable/gel-cli')
     runs-on: ubuntu-24.04
     permissions:
       contents: write

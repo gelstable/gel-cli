@@ -165,8 +165,7 @@ jobs:
           }
           jq --argjson timeline "$(cat "$RUNNER_TEMP/timeline.json")" \
             --argjson permissions "$(cat "$permissions_file")" \
-            --argjson phase_authorized true \
-            '. + {timeline: $timeline, permissions: $permissions, phase_authorized: $phase_authorized}' \
+            '. + {timeline: $timeline, permissions: $permissions}' \
             "$RUNNER_TEMP/live-pr.json" > "$RUNNER_TEMP/live-pr-enriched.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
           # publish-preview invokes fetch_live_preview_pr after draft readback

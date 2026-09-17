@@ -1012,7 +1012,16 @@ class PublicationTests(unittest.TestCase):
             version="7.1.0",
             snapshot=SNAPSHOT,
         )
-        values["phase_authorized"] = True
+        # Real fresh authorization state, exactly what the publish workflow
+        # injects from its timeline and permission lookups.
+        values["timeline"] = [
+            {
+                "event": "labeled",
+                "label": {"name": "prerelease:alpha"},
+                "actor": {"login": "maintainer"},
+            }
+        ]
+        values["permissions"] = {"maintainer": "maintain"}
         values.update(overrides)
         return values
 
@@ -1034,30 +1043,6 @@ class PublicationTests(unittest.TestCase):
             "tag_target": tag_target,
             "asset_bytes": {"gel-candidate.json": candidate.dump(record)},
         }
-        return value
-
-    def _stable_release(self, record: CandidateRecord, *, draft: bool = True) -> dict:
-        identity = self._stable_identity()
-        value = self._release(identity, record, draft=draft, tag_target="e" * 40)
-        value["merged_pr"] = {
-            "number": 101,
-            "state": "closed",
-            "merged": True,
-            "merge_commit_sha": "e" * 40,
-            "base": {
-                "ref": BASE_REF,
-                "sha": BASE_SHA,
-                "repo": {"full_name": REPOSITORY},
-            },
-            "head": {
-                "ref": HEAD_REF,
-                "sha": SOURCE_SHA,
-                "repo": {"full_name": REPOSITORY},
-            },
-        }
-        value["record_introduced"] = True
-        value["source_equivalent"] = True
-        value["published_stable_versions"] = ["7.1.0"]
         return value
 
     def test_preview_rejects_removed_phase_before_mutation(self):
@@ -1181,27 +1166,85 @@ class PublicationTests(unittest.TestCase):
                     refresh_live_pr=lambda _identity, _initial: changed,
                 )
 
+    def test_preview_rejects_phase_labeled_without_write_access(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record)
+        live = self._preview_pr(
+            timeline=[
+                {
+                    "event": "labeled",
+                    "label": {"name": "prerelease:alpha"},
+                    "actor": {"login": "contributor"},
+                }
+            ],
+            permissions={"contributor": "read"},
+        )
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with self.assertRaisesRegex(ValueError, "not authorized"):
+                github_release.publish_preview(identity, record, live, release)
+            mutate.assert_not_called()
+
+    def test_preview_requires_fresh_authorization_proof(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record)
+        live = self._preview_pr()
+        del live["timeline"]
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with self.assertRaisesRegex(ValueError, "fresh authorization proof"):
+                github_release.publish_preview(identity, record, live, release)
+            mutate.assert_not_called()
+
+    def test_preview_rejects_phase_labeled_by_a_bot(self):
+        identity = self._preview_identity()
+        record = self._record(identity)
+        release = self._release(identity, record)
+        live = self._preview_pr(
+            timeline=[
+                {
+                    "event": "labeled",
+                    "label": {"name": "prerelease:alpha"},
+                    "actor": {"login": "gelstable-release", "type": "Bot"},
+                }
+            ],
+            permissions={"gelstable-release": "admin"},
+        )
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with self.assertRaisesRegex(ValueError, "not authorized"):
+                github_release.publish_preview(identity, record, live, release)
+            mutate.assert_not_called()
+
     def test_stable_backport_without_merge_matching_record_is_a_noop(self):
         identity = self._stable_identity()
         record = self._record(identity)
-        release = self._stable_release(record)
+        release = self._merged_release(identity, record, push_sha="e" * 40, record_sha=SOURCE_SHA)
         release["merged_pr"]["number"] = 999
         with mock.patch.object(github_release, "_gh_mutate") as mutate:
             github_release.publish_stable(record, "e" * 40, release)
             mutate.assert_not_called()
 
-    def test_stable_valid_merge_creates_tag_at_actual_merge_sha(self):
+    def test_squash_push_without_a_matching_merged_pr_is_a_noop(self):
         identity = self._stable_identity()
         record = self._record(identity)
-        release = self._stable_release(record)
-        release["tag_target"] = None
+        release = self._release(identity, record, tag_target="e" * 40)
+        release["published_stable_versions"] = ["7.1.0"]
+        with mock.patch.object(github_release, "_gh_json", return_value=None):
+            with mock.patch.object(github_release, "_gh_mutate") as mutate:
+                github_release.publish_stable(record, "e" * 40, release)
+                mutate.assert_not_called()
+
+    def test_stable_valid_merge_creates_tag_at_actual_merge_sha(self):
+        _repo, push_sha, _record_sha, _identity, record, release = self._stable_scenario(
+            real_topology=True
+        )
         with mock.patch.object(github_release, "_gh_mutate") as mutate:
             with mock.patch.object(github_release.verify_draft, "verify"):
-                github_release.publish_stable(record, "e" * 40, release)
+                github_release.publish_stable(record, push_sha, release)
         calls = [call.args for call in mutate.call_args_list]
         self.assertEqual(len(calls), 2)
         self.assertIn("refs/tags/v7.1.0", str(calls[0]))
-        self.assertIn("e" * 40, str(calls[0]))
+        self.assertIn(push_sha, str(calls[0]))
         _method, _path, fields = calls[1]
         self.assertEqual(
             fields,
@@ -1216,24 +1259,24 @@ class PublicationTests(unittest.TestCase):
         )
 
     def test_stable_older_line_publishes_without_the_latest_flag(self):
-        identity = self._stable_identity()
-        record = self._record(identity)
-        release = self._stable_release(record)
+        _repo, push_sha, _record_sha, _identity, record, release = self._stable_scenario(
+            real_topology=True
+        )
         release["published_stable_versions"] = ["7.1.0", "8.0.0"]
         with mock.patch.object(github_release, "_gh_mutate") as mutate:
             with mock.patch.object(github_release.verify_draft, "verify"):
-                github_release.publish_stable(record, "e" * 40, release)
+                github_release.publish_stable(record, push_sha, release)
         _method, _path, fields = mutate.call_args.args
         self.assertEqual(fields["make_latest"], "false")
 
     def test_stable_rejects_mismatched_tag_target(self):
-        identity = self._stable_identity()
-        record = self._record(identity)
-        release = self._stable_release(record)
+        _repo, push_sha, _record_sha, _identity, record, release = self._stable_scenario(
+            real_topology=True
+        )
         release["tag_target"] = "f" * 40
         with mock.patch.object(verify_draft, "resolve_tag_commit", return_value="f" * 40):
             with self.assertRaisesRegex(ValueError, "tag|target|commit"):
-                github_release.publish_stable(record, "e" * 40, release)
+                github_release.publish_stable(record, push_sha, release)
 
     def _release_repo(self) -> tuple[Path, str, str, str, dict[str, object], CandidateRecord]:
         """Build a real line history with a prepared and staged generated branch.
@@ -1289,6 +1332,13 @@ class PublicationTests(unittest.TestCase):
         record_sha = git("rev-parse", "HEAD")
         return repo, base_sha, source_sha, record_sha, identity, record
 
+    def _enter_repo(self, repo: Path) -> None:
+        """Run the test inside ``repo``; publication inspects ``Path(".")``."""
+
+        working_dir = Path.cwd()
+        self.addCleanup(os.chdir, working_dir)
+        os.chdir(repo)
+
     def _merged_release(
         self,
         identity: dict[str, object],
@@ -1296,8 +1346,9 @@ class PublicationTests(unittest.TestCase):
         *,
         push_sha: str,
         record_sha: str,
+        draft: bool = True,
     ) -> dict:
-        value = self._release(identity, record, tag_target=None)
+        value = self._release(identity, record, draft=draft, tag_target=push_sha)
         value["merged_pr"] = {
             "number": 101,
             "state": "closed",
@@ -1316,6 +1367,36 @@ class PublicationTests(unittest.TestCase):
         }
         value["published_stable_versions"] = ["7.1.0"]
         return value
+
+    def _stable_scenario(self, *, real_topology: bool = False, draft: bool = True):
+        """Real repo, chdir, real merge push, and the matching release fixture.
+
+        Stable publication now always re-derives the record introduction and
+        source equivalence from Git at ``Path(".")``, so every stable test
+        runs inside a real merged-line checkout instead of asserting with
+        caller-supplied verdicts.
+        """
+
+        if real_topology:
+            self._topology.stop()
+        repo, _base, _source, record_sha, identity, record = self._release_repo()
+        self._enter_repo(repo)
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        git("switch", "-C", BASE_REF, identity["base_sha"])
+        git("merge", "--no-ff", "-m", "merge (#101)", HEAD_REF)
+        push_sha = git("rev-parse", BASE_REF)
+        release = self._merged_release(
+            identity, record, push_sha=push_sha, record_sha=record_sha, draft=draft
+        )
+        return repo, push_sha, record_sha, identity, record, release
 
     def test_stable_publishes_through_merge_commit_squash_and_rebase_shapes(self):
         shapes = (
@@ -1341,11 +1422,7 @@ class PublicationTests(unittest.TestCase):
             with self.subTest(shape=shape):
                 self._topology.stop()
                 repo, base, source, record_sha, identity, record = self._release_repo()
-                # _matching_merge_pr inspects the workflow checkout at Path("."),
-                # so these topology tests run inside the fixture repository.
-                working_dir = Path.cwd()
-                self.addCleanup(os.chdir, working_dir)
-                os.chdir(repo)
+                self._enter_repo(repo)
 
                 def git(*args: str) -> str:
                     return subprocess.run(
@@ -1372,37 +1449,82 @@ class PublicationTests(unittest.TestCase):
                     "true",
                 )
 
+    def test_stable_rejects_a_record_that_the_push_does_not_introduce(self):
+        _repo, push_sha, _record_sha, identity, _record, release = self._stable_scenario(
+            real_topology=True
+        )
+        stale_record = _candidate_record(
+            base_sha=identity["base_sha"],
+            source_sha=identity["source_sha"],
+            snapshot=identity["source_snapshot"],
+            build_date="2026-09-17T00:00:00+00:00",
+        )
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with self.assertRaisesRegex(ValueError, "record|introduced"):
+                github_release.publish_stable(stale_record, push_sha, release)
+            mutate.assert_not_called()
+
+    def test_stable_rejects_a_push_that_changed_source_bytes(self):
+        repo, push_sha, _record_sha, _identity, record, release = self._stable_scenario(
+            real_topology=True
+        )
+        (repo / "src" / "main.rs").write_text('fn main() { println!("changed"); }\n')
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "-A"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-qm", "unrelated source change"],
+            check=True,
+            capture_output=True,
+        )
+        pushed = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        release["merged_pr"]["merge_commit_sha"] = pushed
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with self.assertRaisesRegex(ValueError, "record|introduced|changed source"):
+                github_release.publish_stable(record, pushed, release)
+            mutate.assert_not_called()
+
     def test_stable_draft_verification_accepts_actual_merge_tag_target(self):
-        identity = self._stable_identity()
-        record = self._record(identity)
-        release = self._stable_release(record)
+        _repo, push_sha, _record_sha, _identity, record, release = self._stable_scenario(
+            real_topology=True
+        )
         with mock.patch.object(github_release, "_gh_mutate"):
-            with mock.patch.object(verify_draft, "verify") as verify:
-                github_release.publish_stable(record, "e" * 40, release)
-        self.assertEqual(verify.call_args.kwargs.get("expected_tag_target"), "e" * 40)
+            with mock.patch.object(github_release.verify_draft, "verify") as verify:
+                github_release.publish_stable(record, push_sha, release)
+        self.assertEqual(verify.call_args.kwargs.get("expected_tag_target"), push_sha)
 
     def test_stable_patch_failure_can_retry_existing_unpublished_tag(self):
-        identity = self._stable_identity()
-        record = self._record(identity)
-        release = self._stable_release(record)
-        with mock.patch.object(verify_draft, "resolve_tag_commit", return_value="e" * 40):
-            with mock.patch.object(verify_draft, "verify"):
+        _repo, push_sha, _record_sha, _identity, record, release = self._stable_scenario(
+            real_topology=True
+        )
+        with mock.patch.object(verify_draft, "resolve_tag_commit", return_value=push_sha):
+            with mock.patch.object(github_release.verify_draft, "verify"):
                 with mock.patch.object(
                     github_release,
                     "_publish_release",
                     side_effect=[ValueError("PATCH failed"), None],
                 ) as publish:
                     with self.assertRaisesRegex(ValueError, "PATCH"):
-                        github_release.publish_stable(record, "e" * 40, release)
-                    github_release.publish_stable(record, "e" * 40, release)
+                        github_release.publish_stable(record, push_sha, release)
+                    github_release.publish_stable(record, push_sha, release)
         self.assertEqual(publish.call_count, 2)
 
     def test_tag_target_resolves_the_actual_ref_when_release_has_sha_metadata(self):
         identity = self._stable_identity()
         record = self._record(identity)
-        release = self._stable_release(record)
-        release["target_commitish"] = "f" * 40
-        release["tag"] = {"object": {"type": "commit", "sha": "f" * 40}}
+        release = {
+            "tag_name": record.tag,
+            "name": record.tag,
+            "target_commitish": "f" * 40,
+            "tag": {"object": {"type": "commit", "sha": "f" * 40}},
+        }
         with mock.patch.object(verify_draft, "resolve_tag_commit", return_value=None) as resolve:
             self.assertIsNone(github_release._tag_target(record.tag, release))
         resolve.assert_called_once_with(record.tag, REPOSITORY)
@@ -1410,9 +1532,7 @@ class PublicationTests(unittest.TestCase):
     def test_stable_rejects_moved_merge_base(self):
         self._topology.stop()
         repo, base, _source, record_sha, identity, record = self._release_repo()
-        working_dir = Path.cwd()
-        self.addCleanup(os.chdir, working_dir)
-        os.chdir(repo)
+        self._enter_repo(repo)
 
         def git(*args: str) -> str:
             return subprocess.run(
@@ -1422,9 +1542,8 @@ class PublicationTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
 
-        # A squash onto a line that moved past the recorded base: the chain
-        # still contains the base several commits back only when the push was
-        # rebased onto a descendant; craft a push rooted on unrelated history.
+        # Craft a push whose first-parent chain is rooted on unrelated history
+        # instead of the recorded candidate base.
         git("switch", "-C", BASE_REF, base)
         unrelated = git("commit-tree", f"{record_sha}^{{tree}}", "-m", "unrelated root")
         push_sha = git("commit-tree", f"{record_sha}^{{tree}}", "-p", unrelated, "-m", "merge")
@@ -1433,24 +1552,24 @@ class PublicationTests(unittest.TestCase):
             github_release.publish_stable(record, push_sha, release)
 
     def test_stable_rejects_changed_draft_bytes(self):
-        identity = self._stable_identity()
-        record = self._record(identity)
-        release = self._stable_release(record)
+        _repo, push_sha, _record_sha, _identity, record, release = self._stable_scenario(
+            real_topology=True
+        )
         with mock.patch.object(
             verify_draft,
             "verify",
             side_effect=verify_draft.DraftVerificationError("asset bytes changed"),
         ):
             with self.assertRaisesRegex(ValueError, "draft|asset|bytes"):
-                github_release.publish_stable(record, "e" * 40, release)
+                github_release.publish_stable(record, push_sha, release)
 
     def test_stable_already_published_matching_retry_is_a_noop(self):
-        identity = self._stable_identity()
-        record = self._record(identity)
-        release = self._stable_release(record, draft=False)
-        with mock.patch.object(verify_draft, "resolve_tag_commit", return_value="e" * 40):
+        _repo, push_sha, _record_sha, _identity, record, release = self._stable_scenario(
+            real_topology=True, draft=False
+        )
+        with mock.patch.object(verify_draft, "resolve_tag_commit", return_value=push_sha):
             with mock.patch.object(github_release, "_gh_mutate") as mutate:
-                github_release.publish_stable(record, "e" * 40, release)
+                github_release.publish_stable(record, push_sha, release)
             mutate.assert_not_called()
 
     def test_latest_uses_numeric_semver_across_release_lines(self):

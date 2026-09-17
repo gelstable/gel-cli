@@ -842,11 +842,6 @@ def phase_authorized(timeline: list[dict], phase: str, permissions: Mapping[str,
     return _permission(permissions.get(login)) in _AUTHORIZED_PERMISSIONS
 
 
-# Keep the verb used by workflow callers discoverable without making a second
-# implementation that could drift from ``phase_authorized``.
-authorize_phase = phase_authorized
-
-
 def _gh_json(*args: str) -> object:
     """Run ``gh`` and decode its JSON output.
 
@@ -1295,20 +1290,18 @@ def _publish_release(
 
 
 def _preview_authorized(live_pr: Mapping[str, object], phase: str) -> None:
-    """Require fresh phase authority supplied by the workflow/API adapter."""
+    """Require fresh phase authorization computed from live timeline state.
 
-    for key in ("phase_authorized", "authorized"):
-        if key in live_pr:
-            if live_pr[key] is not True:
-                raise ValueError(f"preview phase {phase} is not authorized by a maintainer")
-            return
-    timeline = live_pr.get("timeline", live_pr.get("phase_timeline"))
-    permissions = live_pr.get("permissions", live_pr.get("phase_permissions"))
-    if isinstance(timeline, list) and isinstance(permissions, Mapping):
-        if not phase_authorized(timeline, phase, permissions):
-            raise ValueError(f"preview phase {phase} is not authorized by a maintainer")
-        return
-    raise ValueError(f"preview phase {phase} has no fresh authorization proof")
+    The timeline and permission lookup must come from the caller's fresh
+    repository read; there is no caller-supplied approval override.
+    """
+
+    timeline = live_pr.get("timeline")
+    permissions = live_pr.get("permissions")
+    if not isinstance(timeline, list) or not isinstance(permissions, Mapping):
+        raise ValueError(f"preview phase {phase} has no fresh authorization proof")
+    if not phase_authorized(timeline, phase, permissions):
+        raise ValueError(f"preview phase {phase} is not authorized by a maintainer")
 
 
 def _flatten_api_pages(value: object) -> list[object]:
@@ -1579,17 +1572,9 @@ def _assert_line_push_base(record: CandidateRecord, line_push_sha: str) -> None:
         )
 
 
-def _assert_record_introduced(
-    record: CandidateRecord,
-    line_push_sha: str,
-    release: Mapping[str, object],
-) -> None:
+def _assert_record_introduced(record: CandidateRecord, line_push_sha: str) -> None:
     """Require the exact record to be newly introduced by the line push."""
 
-    if "record_introduced" in release:
-        if release["record_introduced"] is not True:
-            raise ValueError(f"candidate record was not introduced by push {line_push_sha}")
-        return
     expected_record = candidate.dump(record)
     try:
         source_equivalence.assert_record_present(line_push_sha, expected_record, Path("."))
@@ -1615,15 +1600,7 @@ def _assert_record_introduced(
         )
 
 
-def _assert_merge_source(
-    record: CandidateRecord,
-    line_push_sha: str,
-    release: Mapping[str, object],
-) -> None:
-    if "source_equivalent" in release:
-        if release["source_equivalent"] is not True:
-            raise ValueError(f"line push {line_push_sha} changed source bytes")
-        return
+def _assert_merge_source(record: CandidateRecord, line_push_sha: str) -> None:
     try:
         source_equivalence.assert_merge_equivalent(record.source_sha, line_push_sha, Path("."))
     except source_equivalence.SourceDrift as error:
@@ -1728,8 +1705,8 @@ def publish_stable(
         )
         return
     _assert_line_push_base(validated, line_push_sha)
-    _assert_record_introduced(validated, line_push_sha, release)
-    _assert_merge_source(validated, line_push_sha, release)
+    _assert_record_introduced(validated, line_push_sha)
+    _assert_merge_source(validated, line_push_sha)
     draft = _assert_release_shape(release, expected, validated, allow_published=True)
     _assert_inline_distribution_bytes(release, validated)
     target = _tag_target(validated.tag, release)

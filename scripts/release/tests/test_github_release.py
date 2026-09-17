@@ -94,6 +94,51 @@ def _published_preview(
     }
 
 
+def _candidate_record(
+    *,
+    line: str = BASE_REF,
+    pr_number: int = 101,
+    phase: str | None = None,
+    version: str = "7.1.0",
+    base_sha: str = BASE_SHA,
+    source_sha: str = SOURCE_SHA,
+    build_sha: str | None = None,
+    snapshot: str = SNAPSHOT,
+    build_date: str = "2026-09-16T00:00:00+00:00",
+    draft_release_id: int = 123456,
+) -> CandidateRecord:
+    return CandidateRecord.model_validate(
+        {
+            "schema_version": 2,
+            "line": line,
+            "pr_number": pr_number,
+            "phase": phase,
+            "version": version,
+            "tag": f"v{version}",
+            "draft_release_id": draft_release_id,
+            "source_sha": source_sha,
+            "source_snapshot": snapshot,
+            "build_sha": build_sha if build_sha is not None else source_sha,
+            "base_sha": base_sha,
+            "build_date": build_date,
+            "workflow_runs": [],
+            "attestation": {
+                "predicate_type": "https://slsa.dev/provenance/v1",
+                "subject_count": 1,
+            },
+            "assets": [
+                {
+                    "id": 1,
+                    "name": "candidate.tar.gz",
+                    "size": 1,
+                    "sha256": "0" * 64,
+                    "blake2b512": "0" * 128,
+                }
+            ],
+        }
+    )
+
+
 class ResolveCandidateTests(unittest.TestCase):
     def test_unlabelled_pr_selects_stable_candidate_from_live_prepared_version(self):
         identity = github_release.resolve_candidate(_release_pr(), _live_pr(), [], [])
@@ -299,6 +344,98 @@ class ResolveCandidateTests(unittest.TestCase):
                 timeline, "alpha", {"old-maintainer": "admin", "maintainer": "write"}
             )
         )
+
+    def _staged_repo(self) -> tuple[Path, str, str, str, str]:
+        """Real repo with a prepared source and the staged record successor."""
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        git("init", "-q", "-b", "main", ".")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Fixed Point Test")
+        git("config", "commit.gpgsign", "false")
+        (repo / "Cargo.toml").write_text('[package]\nname = "gel-cli"\nversion = "7.1.0"\n')
+        (repo / "Cargo.lock").write_text(
+            'version = 4\n\n[[package]]\nname = "gel-cli"\nversion = "7.1.0"\n'
+        )
+        (repo / "src").mkdir()
+        (repo / "src" / "main.rs").write_text("fn main() {}\n")
+        git("add", "-A")
+        git("commit", "-qm", "release line base")
+        base_sha = git("rev-parse", "HEAD")
+
+        (repo / "README.md").write_text("prepared release\n")
+        git("add", "-A")
+        git("commit", "-qm", "chore: prepare release 7.1.0")
+        source_sha = git("rev-parse", "HEAD")
+        snapshot = source_equivalence.meaningful_tree(source_sha, repo)
+
+        record = _candidate_record(base_sha=base_sha, source_sha=source_sha, snapshot=snapshot)
+        (repo / "packaging").mkdir()
+        (repo / "packaging" / "release-candidate.json").write_bytes(candidate.dump(record))
+        git("add", "-A")
+        git("commit", "-qm", "chore: stage release candidate v7.1.0")
+        record_sha = git("rev-parse", "HEAD")
+        return repo, base_sha, source_sha, record_sha, snapshot
+
+    def test_staged_stable_record_is_the_resolution_fixed_point(self):
+        repo, base, source, record_sha, snapshot = self._staged_repo()
+        identity = github_release.resolve_candidate(
+            _release_pr(base_sha=base, head_sha=record_sha),
+            _live_pr(base_sha=base, head_sha=record_sha, snapshot=snapshot),
+            [],
+            [],
+            checkout=repo,
+        )
+        self.assertIsNone(identity)
+
+    def test_staged_record_for_a_different_identity_still_selects_a_candidate(self):
+        repo, base, source, record_sha, snapshot = self._staged_repo()
+        identity = github_release.resolve_candidate(
+            _release_pr(base_sha=base, head_sha=record_sha),
+            _live_pr(base_sha=base, head_sha=record_sha, version="7.2.0", snapshot=snapshot),
+            [],
+            [],
+            checkout=repo,
+        )
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        self.assertEqual(identity.version, "7.2.0")
+
+    def test_head_without_the_record_is_not_the_fixed_point(self):
+        repo, base, source, record_sha, snapshot = self._staged_repo()
+        identity = github_release.resolve_candidate(
+            _release_pr(base_sha=base, head_sha=source),
+            _live_pr(base_sha=base, head_sha=source, snapshot=snapshot),
+            [],
+            [],
+            checkout=repo,
+        )
+        self.assertIsNotNone(identity)
+
+    def test_unknown_head_sha_still_selects_a_candidate(self):
+        repo, base, source, record_sha, snapshot = self._staged_repo()
+        moved = "e" * 40
+        identity = github_release.resolve_candidate(
+            _release_pr(base_sha=base, head_sha=moved),
+            _live_pr(base_sha=base, head_sha=moved, snapshot=snapshot),
+            [],
+            [],
+            checkout=repo,
+        )
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        self.assertEqual(identity.source_sha, moved)
 
 
 class CandidateIdentityBoundaryTests(unittest.TestCase):

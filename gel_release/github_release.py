@@ -630,11 +630,56 @@ def _published_tag_inventory(tags: list[str], releases: list[dict]) -> list[str]
     return [tag for tag in tags if tag not in draft_tags or tag in published]
 
 
+def _stable_record_staged(
+    identity: CandidateIdentity,
+    live_pr: Mapping[str, object],
+    checkout: Path,
+) -> bool:
+    """Whether the live PR head already carries this exact stable record.
+
+    The controller recomputes the prepared version and the meaningful source
+    snapshot from the current PR head. Staging commits the record as a
+    record-only successor and the record path is excluded from the snapshot,
+    so a staged head yields the same identity as the tested source. A matching
+    record successor at the head is therefore the staging fixed point: the
+    candidate exists, the stable merge gate owns the rest, and dispatching
+    another build would never terminate.
+    """
+
+    head = live_pr.get("head")
+    head_sha = head.get("sha") if isinstance(head, Mapping) else None
+    if not isinstance(head_sha, str) or _GIT_SHA.fullmatch(head_sha) is None:
+        return False
+    try:
+        record_bytes = _git_blob(checkout, head_sha, str(candidate.CANDIDATE_PATH))
+        record = candidate.validate_record(candidate.load_bytes(record_bytes))
+    except (OSError, ValueError):
+        return False
+    if record.phase is not None or record.build_sha != record.source_sha:
+        return False
+    try:
+        # The staged head is a record-only successor of the record's own
+        # tested source, never of the head-derived identity source.
+        source_equivalence.assert_record_successor(
+            record.source_sha, head_sha, record_bytes, checkout
+        )
+    except (OSError, ValueError):
+        return False
+    return (
+        record.line == identity.line
+        and record.pr_number == identity.pr_number
+        and record.base_sha == identity.base_sha
+        and record.source_snapshot == identity.source_snapshot
+        and record.version == identity.version
+    )
+
+
 def resolve_candidate(
     pr: release_state.ReleasePr,
     live_pr: dict,
     tags: list[str],
     releases: list[dict],
+    checkout: Path = Path("."),
 ) -> CandidateIdentity | None:
     """Resolve the current live PR into one immutable candidate identity.
 
@@ -643,6 +688,10 @@ def resolve_candidate(
     a moved release-line base is rejected because a prepared candidate tied to
     the old base cannot be reused.  A newer head is allowed and becomes the
     candidate's source SHA.
+
+    A stable candidate whose exact record is already committed to the PR head
+    returns ``None``: that head is the staging fixed point and re-staging it
+    would loop. ``checkout`` is the working copy used to inspect that head.
     """
 
     if not isinstance(pr, release_state.ReleasePr):
@@ -668,7 +717,7 @@ def resolve_candidate(
     stable = preview.stable_version(version, live.major)
     published = published_snapshots(releases)
     if phase is None:
-        return CandidateIdentity(
+        identity = CandidateIdentity(
             line=live.base_ref,
             pr_number=live.number,
             base_sha=live.base_sha,
@@ -679,6 +728,9 @@ def resolve_candidate(
             channel="stable",
             build_sha=live.head_sha,
         )
+        if _stable_record_staged(identity, live_pr, Path(checkout)):
+            return None
+        return identity
 
     selected = preview.next_preview_version(
         stable,

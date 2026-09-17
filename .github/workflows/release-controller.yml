@@ -39,6 +39,7 @@ jobs:
       contents: write
       issues: read
       pull-requests: read
+      actions: write
     outputs:
       identity: ${{ steps.identity.outputs.identity }}
       version: ${{ steps.identity.outputs.version }}
@@ -204,6 +205,8 @@ jobs:
 
       - name: Resolve the immutable candidate identity from live state
         id: identity
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
         run: |
           set -euo pipefail
           uv run --frozen gel-release resolve-candidate \
@@ -211,9 +214,26 @@ jobs:
             --live-pr-json "$RUNNER_TEMP/live-pr-enriched.json" \
             --tags-json "$RUNNER_TEMP/published-tags.json" \
             --releases-json "$RUNNER_TEMP/releases.json" \
-            --repo "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/identity.json"
+            --repo "$GITHUB_REPOSITORY" \
+            --checkout . > "$RUNNER_TEMP/identity.json"
           if [[ ! -s "$RUNNER_TEMP/identity.json" ]]; then
-            echo "the current phase and source snapshot are already published"
+            # Empty resolution means the preview snapshot is already published
+            # or the stable record is already staged at the PR head. A staged
+            # record is the staging fixed point; make sure the required gate
+            # runs on that head even when the record push could not fire
+            # pull_request events.
+            head_sha="$(jq -r '.head.sha' "$RUNNER_TEMP/live-pr-enriched.json")"
+            if gh api \
+              "repos/$GITHUB_REPOSITORY/contents/packaging/release-candidate.json?ref=$head_sha" \
+              > /dev/null 2>&1; then
+              gh workflow run release-candidate-check.yml \
+                --repo "$GITHUB_REPOSITORY" \
+                --ref "$CONTROLLER_REF" \
+                -f pr_number="$(jq -r '.number' "$RUNNER_TEMP/live-pr.json")"
+              echo "stable candidate record is staged; dispatched the stable merge gate"
+            else
+              echo "the current phase and source snapshot are already published"
+            fi
             exit 0
           fi
           identity="$(jq -c . "$RUNNER_TEMP/identity.json")"

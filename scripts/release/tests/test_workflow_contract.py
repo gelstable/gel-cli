@@ -391,6 +391,22 @@ class StableMergeWorkflowContractTests(unittest.TestCase):
         assert "generated" in text
         assert "candidate record" in text
 
+    def test_stable_gate_is_dispatchable_and_dispatched_around_the_record_push(self):
+        check = _workflow("release-candidate-check.yml")
+        triggers = check["on"]
+        assert "workflow_dispatch" in triggers
+        assert "pr_number" in triggers["workflow_dispatch"]["inputs"]
+
+        candidate_workflow = _workflow("release-candidate.yml")
+        commit_text = _run_text(candidate_workflow["jobs"]["commit-stable"])
+        assert "gh workflow run release-candidate-check.yml" in commit_text
+        assert '-f pr_number="$PR_NUMBER"' in commit_text
+        assert candidate_workflow["jobs"]["commit-stable"]["permissions"]["actions"] == "write"
+
+        controller = (WORKFLOWS / "release-controller.yml").read_text()
+        assert "release-candidate-check.yml" in controller
+        assert "packaging/release-candidate.json" in controller
+
 
 class ReleaseMigrationDocumentationContractTests(unittest.TestCase):
     def test_readme_covers_line_migration_and_recovery(self):

@@ -851,6 +851,9 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+      actions: write
+    env:
+      CONTROLLER_REF: master
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -944,6 +947,21 @@ jobs:
           git commit -m "chore: stage release candidate v${{ needs.plan.outputs.version }}"
           git push --force-with-lease="refs/heads/$head_ref:$remote_head" \
             origin "HEAD:refs/heads/$head_ref"
+
+      - name: Require the stable merge gate on the record head
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          # The record push may not fire pull_request events, and branch
+          # protection requires the stable merge gate on the new head.
+          # Dispatch the gate explicitly; the workflow rechecks the live PR
+          # and verifies this exact head.
+          gh workflow run release-candidate-check.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$CONTROLLER_REF" \
+            -f pr_number="$PR_NUMBER"
 
   cleanup-temporary-refs:
     name: clean up temporary release refs

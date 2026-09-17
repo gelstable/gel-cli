@@ -411,6 +411,12 @@ def _parser() -> argparse.ArgumentParser:
     resolve.add_argument("--repo", default=assets.REPOSITORY)
     resolve.add_argument("--tags-json", required=True, type=Path)
     resolve.add_argument("--releases-json", required=True, type=Path)
+    resolve.add_argument(
+        "--checkout",
+        type=Path,
+        default=Path("."),
+        help="Working copy used to detect an already staged stable record",
+    )
     resolve.add_argument("--prepared-version")
     resolve.add_argument("--source-snapshot")
     derive = commands.add_parser("derive-preview-commit")
@@ -641,6 +647,7 @@ def main(argv: list[str] | None = None) -> int:
                 live_pr,
                 _read_tags(args.tags_json),
                 _read_releases(args.releases_json),
+                checkout=args.checkout,
             )
             if identity is not None:
                 print(json.dumps(identity.as_dict(), separators=(",", ":"), sort_keys=True))

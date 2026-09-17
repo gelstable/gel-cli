@@ -965,8 +965,19 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("refs/tags/v7.1.0-alpha.1", str(calls[0]))
         self.assertIn(identity["build_sha"], str(calls[0]))
-        self.assertIn("make_latest", str(calls[1]))
-        self.assertIn("'draft': False", str(calls[1]))
+        method, path, fields = calls[1]
+        self.assertEqual(method, "PATCH")
+        self.assertEqual(
+            fields,
+            {
+                "tag_name": "v7.1.0-alpha.1",
+                "draft": False,
+                "prerelease": True,
+                # GitHub documents make_latest as the string enum
+                # "true"|"false"|"legacy"; previews never become latest.
+                "make_latest": "false",
+            },
+        )
 
     def test_preview_patch_failure_can_retry_existing_unpublished_tag(self):
         identity = self._preview_identity()
@@ -1025,6 +1036,29 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("refs/tags/v7.1.0", str(calls[0]))
         self.assertIn("e" * 40, str(calls[0]))
+        _method, _path, fields = calls[1]
+        self.assertEqual(
+            fields,
+            {
+                "tag_name": "v7.1.0",
+                "draft": False,
+                "prerelease": False,
+                # The newest stable across every line becomes latest, encoded
+                # as the documented string enum.
+                "make_latest": "true",
+            },
+        )
+
+    def test_stable_older_line_publishes_without_the_latest_flag(self):
+        identity = self._stable_identity()
+        record = self._record(identity)
+        release = self._stable_release(record)
+        release["published_stable_versions"] = ["7.1.0", "8.0.0"]
+        with mock.patch.object(github_release, "_gh_mutate") as mutate:
+            with mock.patch.object(github_release.verify_draft, "verify"):
+                github_release.publish_stable(record, "e" * 40, release)
+        _method, _path, fields = mutate.call_args.args
+        self.assertEqual(fields["make_latest"], "false")
 
     def test_stable_rejects_mismatched_tag_target(self):
         identity = self._stable_identity()

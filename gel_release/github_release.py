@@ -1214,6 +1214,9 @@ def _publish_release(
     prerelease: bool,
     make_latest: bool,
 ) -> None:
+    # ``make_latest`` is a string enum ("true"|"false"|"legacy") in the GitHub
+    # release API, not a JSON boolean; ``draft`` and ``prerelease`` are the
+    # genuine booleans. ``_gh_mutate`` encodes str values literally.
     _gh_mutate(
         "PATCH",
         f"/repos/{assets.REPOSITORY}/releases/{record.draft_release_id}",
@@ -1221,7 +1224,7 @@ def _publish_release(
             "tag_name": record.tag,
             "draft": False,
             "prerelease": prerelease,
-            "make_latest": make_latest,
+            "make_latest": "true" if make_latest else "false",
         },
     )
 

@@ -480,6 +480,10 @@ def _parser() -> argparse.ArgumentParser:
     channel.add_argument("--version", required=True)
     release_head = commands.add_parser("release-head")
     release_head.add_argument("--line", required=True)
+    classify = commands.add_parser("classify-pr")
+    classify.add_argument("--pr-json", required=True, type=Path)
+    classify.add_argument("--line", required=True)
+    classify.add_argument("--event", required=True)
     completions = commands.add_parser("completions")
     completions.add_argument("--binary", required=True, type=Path)
     completions.add_argument("--out-dir", required=True, type=Path)
@@ -723,6 +727,17 @@ def main(argv: list[str] | None = None) -> int:
             print(registry_manifest.release_channel(args.version))
         elif args.command == "release-head":
             print(release_state.expected_head_for_line(args.line))
+        elif args.command == "classify-pr":
+            pr = json.loads(args.pr_json.read_bytes())
+            if not isinstance(pr, dict):
+                raise ValueError("live PR JSON must be an object")
+            head = pr.get("head")
+            head_ref = head.get("ref") if isinstance(head, dict) else None
+            print(
+                "true"
+                if release_state.controller_should_run(head_ref, args.line, args.event)
+                else "false"
+            )
         elif args.command == "completions":
             package_target.generate_completions(args.binary, args.out_dir)
         elif args.command == "package-target":

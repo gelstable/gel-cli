@@ -200,5 +200,87 @@ class CliIdentityTests(unittest.TestCase):
         self.assertNotIn("Traceback", completed.stderr)
 
 
+class ControllerClassificationTests(unittest.TestCase):
+    """The controller runs for generated release PRs and nobody else."""
+
+    def test_generated_head_runs(self):
+        for event in ("pull_request", "workflow_dispatch", "repository_dispatch"):
+            with self.subTest(event=event):
+                self.assertTrue(
+                    release_state.controller_should_run("knope/release-v7.x", "release/v7.x", event)
+                )
+
+    def test_ordinary_backport_head_is_skipped_neutrally_on_pull_request_events(self):
+        # Branch protection does not require the controller, so a backport PR
+        # targeting a release line must not get a red check from it.
+        self.assertFalse(
+            release_state.controller_should_run("backport/fix", "release/v7.x", "pull_request")
+        )
+
+    def test_dispatching_an_ordinary_backport_fails_loudly(self):
+        # An operator explicitly named that pull request, so silence is wrong.
+        for event in ("workflow_dispatch", "repository_dispatch"):
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(ValueError, "generated head"):
+                    release_state.controller_should_run("backport/fix", "release/v7.x", event)
+
+    def test_master_head_against_a_release_line_is_not_generated(self):
+        self.assertFalse(
+            release_state.controller_should_run("master", "release/v7.x", "pull_request")
+        )
+
+    def test_invalid_inputs_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "release line"):
+            release_state.controller_should_run("knope/release-v7.x", "master", "pull_request")
+        with self.assertRaisesRegex(ValueError, "head ref"):
+            release_state.controller_should_run(None, "release/v7.x", "pull_request")
+
+    def test_classify_pr_prints_the_controller_decision(self):
+        for head_ref, event, expected in (
+            ("knope/release-v7.x", "pull_request", "true"),
+            ("backport/fix", "pull_request", "false"),
+        ):
+            with self.subTest(head_ref=head_ref, event=event):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "pr.json"
+                    path.write_text(json.dumps({"head": {"ref": head_ref}}))
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        status = cli.main(
+                            [
+                                "classify-pr",
+                                "--pr-json",
+                                str(path),
+                                "--line",
+                                "release/v7.x",
+                                "--event",
+                                event,
+                            ]
+                        )
+                self.assertEqual(status, 0)
+                self.assertEqual(output.getvalue().strip(), expected)
+
+    def test_classify_pr_rejects_a_dispatched_backport_with_status_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pr.json"
+            path.write_text(json.dumps({"head": {"ref": "backport/fix"}}))
+            output = io.StringIO()
+            errors = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                status = cli.main(
+                    [
+                        "classify-pr",
+                        "--pr-json",
+                        str(path),
+                        "--line",
+                        "release/v7.x",
+                        "--event",
+                        "workflow_dispatch",
+                    ]
+                )
+        self.assertEqual(status, 2)
+        self.assertIn("generated head", errors.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

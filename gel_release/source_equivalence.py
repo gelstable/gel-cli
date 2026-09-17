@@ -20,21 +20,24 @@ class SourceDrift(ValueError):
 
 
 def tree_entries(rev: str, repo: Path = Path(".")) -> dict[str, str]:
-    completed = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo),
-            "ls-tree",
-            "-r",
-            "-z",
-            "--format=%(objectmode) %(objectname) %(path)",
-            rev,
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "ls-tree",
+                "-r",
+                "-z",
+                "--format=%(objectmode) %(objectname) %(path)",
+                rev,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise SourceDrift(f"could not read the tree at {rev}: {error.stderr.strip()}") from error
     entries: dict[str, str] = {}
     for record in completed.stdout.split("\0"):
         if not record:

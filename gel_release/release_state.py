@@ -70,6 +70,30 @@ def expected_head_for_line(line: str) -> str:
     return expected_head(parse_line(line))
 
 
+def controller_should_run(head_ref: object, line: str, event_name: str) -> bool:
+    """Whether the controller should process a live PR head.
+
+    Only the generated release PR head stages candidates. An ordinary backport
+    PR that targets a release line gets a neutral skip on ``pull_request``
+    events: branch protection does not require the controller, so failing here
+    would put a permanent red check on every backport. A workflow or repository
+    dispatch that names a non-generated head is an explicit operator request,
+    so it fails loudly instead of silently doing nothing.
+    """
+
+    expected = expected_head(parse_line(line))
+    if not isinstance(head_ref, str) or not head_ref:
+        raise ValueError(f"live PR has an invalid head ref {head_ref!r}")
+    if head_ref == expected:
+        return True
+    if event_name == "pull_request":
+        return False
+    raise ValueError(
+        f"head ref {head_ref!r} is not the generated head {expected!r} for {line!r}; "
+        "the controller only stages candidates for the generated release PR"
+    )
+
+
 def phase_from_labels(labels: list[str]) -> str | None:
     """Resolve the one active prerelease phase from exact label names."""
 

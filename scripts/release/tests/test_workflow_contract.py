@@ -61,13 +61,11 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
         # The check exists but nothing invokes it is the invisible failure:
         # assert the directory-wide form so re-narrowing to one file fails.
         quality_text = _run_text(_workflow("ci.yml")["jobs"]["quality"])
-        lines = quality_text.splitlines()
-        assert "scripts/ci/check-action-pins.sh" in lines
-        assert '"$(go env GOPATH)/bin/actionlint"' in lines
-        assert not any(
-            line.startswith(("scripts/ci/check-action-pins.sh ", '"$(go env GOPATH)/bin/actionlint" '))
-            for line in lines
-        )
+        for line in quality_text.splitlines():
+            if line.startswith("scripts/ci/check-action-pins.sh"):
+                self.assertEqual(line, "scripts/ci/check-action-pins.sh")
+            if line.startswith('"$(go env GOPATH)/bin/actionlint"'):
+                self.assertEqual(line, '"$(go env GOPATH)/bin/actionlint"')
 
     def test_ci_actions_are_sha_pinned_with_a_version_comment(self):
         text = (WORKFLOWS / "ci.yml").read_text()
@@ -75,6 +73,28 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
             if "uses:" not in line or "./" in line:
                 continue
             assert re.search(r"uses:\s+[^@\s]+@[0-9a-f]{40}\s+#\s+.+$", line)
+
+
+class ControllerTriggerContractTests(unittest.TestCase):
+    def test_controller_only_triggers_for_release_line_targets(self):
+        # GitHub matches `branches:` against the PR base, so feature PRs
+        # targeting master never start the controller at all.
+        workflow = _workflow("release-controller.yml")
+        assert workflow["on"]["pull_request"]["branches"] == ["release/v*.x"]
+
+    def test_every_step_after_the_classify_decision_is_guarded_by_it(self):
+        resolve = _workflow("release-controller.yml")["jobs"]["resolve"]
+        steps = _steps(resolve)
+        classify_index = next(
+            index for index, step in enumerate(steps) if step.get("id") == "classify"
+        )
+        classify_text = str(steps[classify_index].get("run", ""))
+        assert "classify-pr" in classify_text
+        for step in steps[classify_index + 1 :]:
+            with self.subTest(step=step.get("name")):
+                assert "steps.classify.outputs.should_run == 'true'" in str(step.get("if", "")), (
+                    "is not guarded by the classify decision"
+                )
 
 
 class CandidateInputContractTests(unittest.TestCase):

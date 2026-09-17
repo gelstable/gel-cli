@@ -97,6 +97,13 @@ class EquivalenceTests(unittest.TestCase):
             source_equivalence.meaningful_tree(source_change, self.repo),
         )
 
+    def test_unknown_revision_raises_source_drift(self):
+        # The fixed-point and successor checks treat every comparison failure
+        # as "not the fixed point", so a git-level failure must surface as
+        # SourceDrift (a ValueError), not escape as a subprocess error.
+        with self.assertRaises(source_equivalence.SourceDrift):
+            source_equivalence.tree_entries("0" * 40, self.repo)
+
     def test_snapshot_mismatch_is_rejected(self):
         with self.assertRaisesRegex(source_equivalence.SourceDrift, "snapshot"):
             source_equivalence.assert_snapshot("f" * 64, self.base, self.repo)

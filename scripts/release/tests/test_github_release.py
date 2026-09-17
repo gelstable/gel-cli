@@ -441,6 +441,32 @@ class ResolveCandidateTests(unittest.TestCase):
         )
         self.assertIsNotNone(identity)
 
+    def test_damaged_source_tree_is_not_the_fixed_point(self):
+        # Object damage must read as "not the fixed point", not crash the
+        # controller: the successor check reports git failures as SourceDrift
+        # and the fixed-point check treats that as False.
+        repo, base, source, record_sha, snapshot = self._staged_repo()
+        source_tree = _git(repo, "rev-parse", f"{source}^{{tree}}")
+        (repo / ".git" / "objects" / source_tree[:2] / source_tree[2:]).unlink()
+
+        identity = github_release.CandidateIdentity(
+            line=BASE_REF,
+            pr_number=101,
+            base_sha=base,
+            source_sha=source,
+            source_snapshot=snapshot,
+            phase=None,
+            version="7.1.0",
+            channel="stable",
+        )
+        self.assertFalse(
+            github_release._stable_record_staged(
+                identity,
+                _live_pr(base_sha=base, head_sha=record_sha, snapshot=snapshot),
+                repo,
+            )
+        )
+
     def test_prepared_version_colliding_with_a_published_tag_fails_before_staging(self):
         releases = [
             {

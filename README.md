@@ -51,7 +51,10 @@ prepared at the same time without sharing generated state.
 Starting a line
 ---------------
 
-To start a major line, cut `release/vN.x` from `master`, set its intended plain
+How to start a `release/vN.x` branch depends on whether version `N.0.0` has
+been published before.
+
+For a brand-new major, cut the branch from `master` and set its intended plain
 starting version in both `Cargo.toml` and `Cargo.lock`, and push the branch:
 
 ```
@@ -59,6 +62,19 @@ git switch -c release/v8.x master
 # edit Cargo.toml and Cargo.lock to set the package to 8.0.0
 git commit -am "chore: start release/v8.x at 8.0.0"
 git push origin release/v8.x
+```
+
+For a major that already has published releases (adopting v7, for example), cut
+the branch from `master` and change nothing. `master` already carries the
+current plain version, and the first release PR bumps it to the next version
+through Knope: `7.10.2` on `master` becomes `7.11.0` on `release/v7.x`. Never
+hand-set a version that is already tagged on a new line; the controller
+rejects a prepared version whose tag already belongs to a published release
+before any candidate is built.
+
+```
+git switch -c release/v7.x master
+git push origin release/v7.x
 ```
 
 Protect `master` and every active `release/vN.x` branch before accepting

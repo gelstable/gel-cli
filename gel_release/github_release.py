@@ -730,6 +730,19 @@ def resolve_candidate(
         )
         if _stable_record_staged(identity, live_pr, Path(checkout)):
             return None
+        # Fail before any build, staging, gate, or merge when the prepared
+        # version already belongs to a published release. Unpublished tags
+        # stay permitted so a retry after a failed publication can re-stage.
+        published_tags = {
+            release.get("tag_name")
+            for release in releases
+            if isinstance(release, Mapping) and release.get("draft") is not True
+        }
+        if identity.tag in published_tags:
+            raise ValueError(
+                f"prepared version {identity.version} is already published as "
+                f"{identity.tag}; a release line must prepare an untagged version"
+            )
         return identity
 
     selected = preview.next_preview_version(

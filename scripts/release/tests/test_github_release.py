@@ -423,6 +423,34 @@ class ResolveCandidateTests(unittest.TestCase):
         )
         self.assertIsNotNone(identity)
 
+    def test_prepared_version_colliding_with_a_published_tag_fails_before_staging(self):
+        releases = [
+            {
+                "id": 5,
+                "tag_name": "v7.1.0",
+                "name": "v7.1.0",
+                "draft": False,
+                "prerelease": False,
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "already published|7.1.0"):
+            github_release.resolve_candidate(_release_pr(), _live_pr(), ["v7.1.0"], releases)
+
+    def test_unpublished_draft_tag_does_not_block_the_prepared_version(self):
+        releases = [
+            {
+                "id": 5,
+                "tag_name": "v7.1.0",
+                "name": "v7.1.0",
+                "draft": True,
+                "prerelease": False,
+            }
+        ]
+        identity = github_release.resolve_candidate(_release_pr(), _live_pr(), ["v7.1.0"], releases)
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        self.assertEqual(identity.version, "7.1.0")
+
     def test_unknown_head_sha_still_selects_a_candidate(self):
         repo, base, source, record_sha, snapshot = self._staged_repo()
         moved = "e" * 40

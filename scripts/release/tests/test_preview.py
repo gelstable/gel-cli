@@ -1,22 +1,13 @@
+import contextlib
+import io
 import json
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from gel_release import preview, source_equivalence
+from conftest import _git, git_repo
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-
-
-def _git(repo: Path, *argv: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *argv],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+from gel_release import cli, preview, source_equivalence
 
 
 class StableVersionTests(unittest.TestCase):
@@ -24,7 +15,7 @@ class StableVersionTests(unittest.TestCase):
         self.assertEqual(preview.stable_version("7.1.1", 7), "7.1.1")
 
     def test_cargo_version_from_another_major_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "major"):
+        with self.assertRaisesRegex(ValueError, "8.0.0"):
             preview.stable_version("8.0.0", 7)
 
     def test_prerelease_cargo_version_is_rejected(self):
@@ -112,79 +103,54 @@ class PreviewVersionTests(unittest.TestCase):
 
 
 class PreviewCliTests(unittest.TestCase):
-    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, "-m", "gel_release.cli", *args],
-            cwd=REPO_ROOT,
-            text=True,
-            capture_output=True,
-        )
+    """The CLI surface the release workflows shell out to."""
+
+    def _run(self, *args: str) -> tuple[int, str]:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = cli.main(list(args))
+        return status, output.getvalue()
+
+    def _preview_version(self, published: list, snapshot: str) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            tags = Path(tmp) / "tags.json"
+            published_path = Path(tmp) / "published.json"
+            tags.write_text(json.dumps(["v7.1.1-alpha.1"]))
+            published_path.write_text(json.dumps(published))
+            return self._run(
+                "preview-version",
+                "--base",
+                "7.1.1",
+                "--phase",
+                "alpha",
+                "--snapshot",
+                snapshot,
+                "--tags-json",
+                str(tags),
+                "--published-json",
+                str(published_path),
+            )
 
     def test_snapshot_prints_meaningful_tree_for_revision(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            _git(repo, "init", "-q", ".")
-            _git(repo, "config", "user.email", "test@example.com")
-            _git(repo, "config", "user.name", "Test")
-            (repo / "src").mkdir()
-            (repo / "src" / "main.rs").write_text("fn main() {}\n")
-            _git(repo, "add", "-A")
-            _git(repo, "commit", "-qm", "base")
+        with git_repo() as repo:
             rev = _git(repo, "rev-parse", "HEAD")
             expected = source_equivalence.meaningful_tree(rev, repo)
+            status, output = self._run("snapshot", "--rev", rev, "--repo", str(repo))
 
-            completed = self._run("snapshot", "--rev", rev, "--repo", str(repo))
-
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), expected)
+        self.assertEqual(status, 0)
+        self.assertEqual(output.strip(), expected)
 
     def test_preview_version_reads_tag_and_published_state_json(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tags = Path(tmp) / "tags.json"
-            published = Path(tmp) / "published.json"
-            tags.write_text(json.dumps(["v7.1.1-alpha.1"]))
-            published.write_text(json.dumps([]))
+        status, output = self._preview_version([], "new-tree")
 
-            completed = self._run(
-                "preview-version",
-                "--base",
-                "7.1.1",
-                "--phase",
-                "alpha",
-                "--snapshot",
-                "new-tree",
-                "--tags-json",
-                str(tags),
-                "--published-json",
-                str(published),
-            )
-
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "7.1.1-alpha.2")
+        self.assertEqual(status, 0)
+        self.assertEqual(output.strip(), "7.1.1-alpha.2")
 
     def test_preview_version_cli_returns_no_work_for_current_snapshot(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tags = Path(tmp) / "tags.json"
-            published = Path(tmp) / "published.json"
-            tags.write_text(json.dumps(["v7.1.1-alpha.1"]))
-            published.write_text(json.dumps([["alpha", "current-tree"]]))
+        status, output = self._preview_version([["alpha", "current-tree"]], "current-tree")
 
-            completed = self._run(
-                "preview-version",
-                "--base",
-                "7.1.1",
-                "--phase",
-                "alpha",
-                "--snapshot",
-                "current-tree",
-                "--tags-json",
-                str(tags),
-                "--published-json",
-                str(published),
-            )
-
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout, "")
+        self.assertEqual(status, 0)
+        self.assertEqual(output, "")
 
 
 if __name__ == "__main__":

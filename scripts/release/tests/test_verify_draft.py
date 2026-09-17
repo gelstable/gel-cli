@@ -62,71 +62,65 @@ class ManifestUrlTests(unittest.TestCase):
         self.assertIn("isolation", str(raised.exception).lower())
 
 
+def _listed(version: str, *, extra: str | None = None, drop_last: bool = False) -> list[dict]:
+    names = assets.expected_assets(version)
+    if drop_last:
+        names = names[:-1]
+    listed = [{"id": index, "name": name, "size": 1} for index, name in enumerate(names)]
+    if extra is not None:
+        listed.append({"id": 999, "name": extra, "size": 1})
+    return listed
+
+
+RECORD_ASSET = candidate.PREVIEW_RECORD_NAME
+
+
 class InventoryTests(unittest.TestCase):
-    def test_unexpected_release_asset_is_rejected(self):
-        listed = [
-            {"id": i, "name": name, "size": 1}
-            for i, name in enumerate(assets.expected_assets("7.11.0"))
-        ]
-        listed.append({"id": 999, "name": "leftover.bin", "size": 1})
-        with self.assertRaises(verify_draft.DraftVerificationError):
-            verify_draft.check_inventory(listed, "7.11.0")
+    """A draft's asset list must be exactly the inventory its phase implies."""
 
-    def test_missing_release_asset_is_rejected(self):
-        listed = [
-            {"id": i, "name": name, "size": 1}
-            for i, name in enumerate(assets.expected_assets("7.11.0"))
-        ][:-1]
-        with self.assertRaises(verify_draft.DraftVerificationError):
-            verify_draft.check_inventory(listed, "7.11.0")
+    # (label, version, extra asset, check_inventory kwargs, expected failure)
+    CASES = (
+        ("stable inventory", "7.11.0", None, {}, None),
+        ("stable with an unexpected asset", "7.11.0", "leftover.bin", {}, "leftover.bin"),
+        (
+            "stable missing an asset",
+            "7.11.0",
+            None,
+            {},
+            assets.expected_assets("7.11.0")[-1],
+        ),
+        ("phase requires the candidate record", "7.11.0", None, {"phase": "alpha"}, RECORD_ASSET),
+        (
+            "prerelease version requires the candidate record",
+            "7.11.0-alpha.1",
+            None,
+            {},
+            RECORD_ASSET,
+        ),
+        ("phase accepts the candidate record", "7.11.0", RECORD_ASSET, {"phase": "alpha"}, None),
+        (
+            "record argument accepts the candidate record",
+            "7.11.0",
+            RECORD_ASSET,
+            {"record": {"phase": "alpha"}},
+            None,
+        ),
+        ("stable rejects the candidate record", "7.11.0", RECORD_ASSET, {}, RECORD_ASSET),
+    )
 
-    def test_exact_inventory_passes(self):
-        listed = [
-            {"id": i, "name": name, "size": 1}
-            for i, name in enumerate(assets.expected_assets("7.11.0"))
-        ]
-        verify_draft.check_inventory(listed, "7.11.0")
-
-    def test_preview_inventory_requires_candidate_record_asset(self):
-        listed = [
-            {"id": i, "name": name, "size": 1}
-            for i, name in enumerate(assets.expected_assets("7.11.0"))
-        ]
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "gel-candidate.json"):
-            verify_draft.check_inventory(listed, "7.11.0", phase="alpha")
-
-    def test_prerelease_version_requires_candidate_record_asset(self):
-        listed = [
-            {"id": i, "name": name, "size": 1}
-            for i, name in enumerate(assets.expected_assets("7.11.0-alpha.1"))
-        ]
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "gel-candidate.json"):
-            verify_draft.check_inventory(listed, "7.11.0-alpha.1")
-
-    def test_preview_inventory_accepts_candidate_record_asset(self):
-        listed = [
-            {"id": i, "name": name, "size": 1}
-            for i, name in enumerate(assets.expected_assets("7.11.0"))
-        ]
-        listed.append({"id": 999, "name": "gel-candidate.json", "size": 1})
-        verify_draft.check_inventory(listed, "7.11.0", phase="alpha")
-
-    def test_preview_inventory_accepts_record_argument(self):
-        listed = [
-            {"id": i, "name": name, "size": 1}
-            for i, name in enumerate(assets.expected_assets("7.11.0"))
-        ]
-        listed.append({"id": 999, "name": "gel-candidate.json", "size": 1})
-        verify_draft.check_inventory(listed, "7.11.0", record={"phase": "alpha"})
-
-    def test_stable_inventory_rejects_candidate_record_asset(self):
-        listed = [
-            {"id": i, "name": name, "size": 1}
-            for i, name in enumerate(assets.expected_assets("7.11.0"))
-        ]
-        listed.append({"id": 999, "name": "gel-candidate.json", "size": 1})
-        with self.assertRaises(verify_draft.DraftVerificationError):
-            verify_draft.check_inventory(listed, "7.11.0")
+    def test_inventory_permutations(self):
+        for label, version, extra, kwargs, expected in self.CASES:
+            with self.subTest(case=label):
+                listed = _listed(
+                    version,
+                    extra=extra,
+                    drop_last=label == "stable missing an asset",
+                )
+                if expected is None:
+                    verify_draft.check_inventory(listed, version, **kwargs)
+                else:
+                    with self.assertRaisesRegex(verify_draft.DraftVerificationError, expected):
+                        verify_draft.check_inventory(listed, version, **kwargs)
 
 
 class ReleaseIdentityTests(unittest.TestCase):
@@ -166,19 +160,31 @@ class ReleaseIdentityTests(unittest.TestCase):
         "body": "Candidate staged from " + RECORD["source_sha"] + ".",
     }
 
-    def test_release_tag_must_match_candidate(self):
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "tag"):
-            verify_draft.check_release_identity(
-                {**self.RELEASE, "tag_name": "v7.12.0"},
-                self.RECORD,
-            )
+    # Each field is checked before the tag is ever looked up, so no GitHub
+    # call is mocked here.
+    IDENTITY_MISMATCHES = (
+        ("tag_name", "v7.12.0", "v7.12.0.*v7.11.0"),
+        ("id", 999, "999"),
+        ("draft", False, "draft"),
+        ("name", "wrong", "'wrong'"),
+        ("prerelease", True, "prerelease"),
+    )
+
+    def test_release_identity_field_mismatches_are_rejected(self):
+        for field, bad_value, expected_message in self.IDENTITY_MISMATCHES:
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(verify_draft.DraftVerificationError, expected_message):
+                    verify_draft.check_release_identity(
+                        {**self.RELEASE, field: bad_value},
+                        self.RECORD,
+                    )
 
     @mock.patch(
         "gel_release.verify_draft._gh_json",
         return_value={"object": {"type": "commit", "sha": "b" * 40}},
     )
     def test_release_source_must_match_candidate(self, gh_json):
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "source"):
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "b" * 40):
             verify_draft.check_release_identity(self.RELEASE, self.RECORD)
 
     @mock.patch(
@@ -216,64 +222,40 @@ class ReleaseIdentityTests(unittest.TestCase):
         ],
     )
     def test_annotated_tag_source_mismatch_is_rejected(self, gh_json):
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "source"):
+        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "b" * 40):
             verify_draft.check_release_identity(self.RELEASE, self.RECORD)
 
-    @mock.patch(
-        "gel_release.verify_draft._gh_json",
-        side_effect=subprocess.CalledProcessError(
-            1, ["gh", "api"], stderr="gh: Not Found (HTTP 404)"
-        ),
+    # (stderr, stdout, expected failure).  Only a clean 404 on stderr means the
+    # draft tag has not been created yet; every other outcome, including a 404
+    # that appears anywhere but the status line, must fail closed.
+    TAG_LOOKUP_FAILURES = (
+        ("gh: Not Found (HTTP 404)", None, None),
+        ("gh: Forbidden (HTTP 403)", None, "lookup"),
+        ("gh: Internal Server Error (HTTP 500)", None, "lookup"),
+        ("gh: Forbidden (HTTP 403)\nRequest ID: 404", None, "lookup"),
+        ("gh: Internal Server Error (HTTP 500)\nRequest ID: 404", None, "lookup"),
+        ("gh: lookup failed\nRequest ID: 404", None, "lookup"),
+        ("gh: Forbidden (HTTP 403)", "gh: Not Found (HTTP 404)", "lookup"),
+        ("gh: Forbidden HTTP 403", "gh: Not Found (HTTP 404)", "lookup"),
     )
-    def test_uncreated_draft_tag_is_not_proven_by_release_body(self, gh_json):
-        resolved = verify_draft.check_release_identity(self.RELEASE, self.RECORD)
-        self.assertIsNone(resolved)
-        gh_json.assert_called_once_with("api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0")
 
-    @mock.patch(
-        "gel_release.verify_draft._gh_json",
-        side_effect=subprocess.CalledProcessError(
-            1, ["gh", "api"], stderr="gh: Forbidden (HTTP 403)"
-        ),
-    )
-    def test_tag_lookup_forbidden_fails_closed(self, gh_json):
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "lookup"):
-            verify_draft.check_release_identity(self.RELEASE, self.RECORD)
-
-    @mock.patch(
-        "gel_release.verify_draft._gh_json",
-        side_effect=subprocess.CalledProcessError(
-            1, ["gh", "api"], stderr="gh: Internal Server Error (HTTP 500)"
-        ),
-    )
-    def test_tag_lookup_server_error_fails_closed(self, gh_json):
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "lookup"):
-            verify_draft.check_release_identity(self.RELEASE, self.RECORD)
-
-    def test_tag_lookup_ignores_unrelated_404(self):
-        for stderr in (
-            "gh: Forbidden (HTTP 403)\nRequest ID: 404",
-            "gh: Internal Server Error (HTTP 500)\nRequest ID: 404",
-            "gh: lookup failed\nRequest ID: 404",
-        ):
-            with self.subTest(stderr=stderr):
-                error = subprocess.CalledProcessError(1, ["gh", "api"], stderr=stderr)
-                with mock.patch("gel_release.verify_draft._gh_json", side_effect=error):
-                    with self.assertRaisesRegex(verify_draft.DraftVerificationError, "lookup"):
-                        verify_draft.check_release_identity(self.RELEASE, self.RECORD)
-
-    def test_tag_lookup_rejects_conflicting_http_statuses(self):
-        for stderr in ("gh: Forbidden (HTTP 403)", "gh: Forbidden HTTP 403"):
-            with self.subTest(stderr=stderr):
+    def test_tag_lookup_failures_are_classified_by_http_status(self):
+        for stderr, stdout, expected in self.TAG_LOOKUP_FAILURES:
+            with self.subTest(stderr=stderr, stdout=stdout):
                 error = subprocess.CalledProcessError(
-                    1,
-                    ["gh", "api"],
-                    output="gh: Not Found (HTTP 404)",
-                    stderr=stderr,
+                    1, ["gh", "api"], output=stdout, stderr=stderr
                 )
-                with mock.patch("gel_release.verify_draft._gh_json", side_effect=error):
-                    with self.assertRaisesRegex(verify_draft.DraftVerificationError, "lookup"):
-                        verify_draft.check_release_identity(self.RELEASE, self.RECORD)
+                with mock.patch("gel_release.verify_draft._gh_json", side_effect=error) as gh_json:
+                    if expected is None:
+                        self.assertIsNone(
+                            verify_draft.check_release_identity(self.RELEASE, self.RECORD)
+                        )
+                        gh_json.assert_called_once_with(
+                            "api", "/repos/gelstable/gel-cli/git/ref/tags/v7.11.0"
+                        )
+                    else:
+                        with self.assertRaisesRegex(verify_draft.DraftVerificationError, expected):
+                            verify_draft.check_release_identity(self.RELEASE, self.RECORD)
 
     @mock.patch("gel_release.verify_draft.resolve_tag_commit", return_value=None)
     @mock.patch("gel_release.verify_draft.get_release", return_value=RELEASE)
@@ -282,22 +264,6 @@ class ReleaseIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(verify_draft.DraftVerificationError, "not created"):
                 verify_draft.verify(record, Path(tmp), verify_attestations_flag=False)
-
-    def test_release_id_must_match_candidate(self):
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "release id"):
-            verify_draft.check_release_identity({**self.RELEASE, "id": 999}, self.RECORD)
-
-    def test_release_must_be_draft(self):
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "draft"):
-            verify_draft.check_release_identity({**self.RELEASE, "draft": False}, self.RECORD)
-
-    def test_release_name_must_match_tag(self):
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "name"):
-            verify_draft.check_release_identity({**self.RELEASE, "name": "wrong"}, self.RECORD)
-
-    def test_release_prerelease_flag_matches_phase(self):
-        with self.assertRaisesRegex(verify_draft.DraftVerificationError, "prerelease"):
-            verify_draft.check_release_identity({**self.RELEASE, "prerelease": True}, self.RECORD)
 
     @mock.patch(
         "gel_release.verify_draft._gh_json",

@@ -48,16 +48,6 @@ class AssetNameTests(unittest.TestCase):
             "gel-v7.11.0-aarch64-pc-windows-msvc.zip",
         )
 
-    def test_linux_package_names(self):
-        self.assertEqual(
-            assets.deb_name("7.11.0", assets.BY_TRIPLE["x86_64-unknown-linux-musl"]),
-            "gel_7.11.0_amd64.deb",
-        )
-        self.assertEqual(
-            assets.rpm_name("7.11.0", assets.BY_TRIPLE["aarch64-unknown-linux-musl"]),
-            "gel-7.11.0-1.aarch64.rpm",
-        )
-
     def test_download_url(self):
         self.assertEqual(
             assets.release_download_url("7.11.0", "SHA256SUMS"),

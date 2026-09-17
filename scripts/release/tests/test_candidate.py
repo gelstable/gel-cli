@@ -61,32 +61,29 @@ class RecordShapeTests(unittest.TestCase):
             self.assertNotIn("release-candidate.json", names)
             self.assertNotIn("packaging/release-candidate.json", names)
 
-    def test_identity_fields(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, _ = _record(Path(tmp))
-            self.assertEqual(record["schema_version"], 2)
-            self.assertEqual(record["line"], "release/v7.x")
-            self.assertEqual(record["pr_number"], 321)
-            self.assertIsNone(record["phase"])
-            self.assertEqual(record["tag"], "v7.11.0")
-            self.assertEqual(record["draft_release_id"], 123456789)
-            self.assertEqual(record["source_sha"], "a" * 40)
-            self.assertEqual(record["build_sha"], "a" * 40)
-            self.assertEqual(record["base_sha"], "b" * 40)
-            self.assertEqual(record["source_snapshot"], "d" * 64)
-            self.assertEqual(record["workflow_runs"][0]["run_attempt"], 1)
-            self.assertEqual(record["attestation"]["subject_count"], 23)
-
-    def test_valid_preview_shape_uses_derived_build_sha(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, _ = _record(Path(tmp), "7.11.0-alpha.1")
-            self.assertEqual(record["schema_version"], 2)
-            self.assertEqual(record["line"], "release/v7.x")
-            self.assertEqual(record["pr_number"], 321)
-            self.assertEqual(record["phase"], "alpha")
-            self.assertEqual(record["source_sha"], "a" * 40)
-            self.assertEqual(record["build_sha"], "c" * 40)
-            self.assertNotIn("gel-candidate.json", {item["name"] for item in record["assets"]})
+    def test_identity_fields_for_stable_and_preview(self):
+        # A preview record carries the same identity as a stable one except for
+        # its phase and the build SHA derived from the frozen source commit.
+        for version, phase, build_sha in (
+            ("7.11.0", None, "a" * 40),
+            ("7.11.0-alpha.1", "alpha", "c" * 40),
+        ):
+            with self.subTest(version=version):
+                with tempfile.TemporaryDirectory() as tmp:
+                    record, _ = _record(Path(tmp), version)
+                    self.assertEqual(record["schema_version"], 2)
+                    self.assertEqual(record["line"], "release/v7.x")
+                    self.assertEqual(record["pr_number"], 321)
+                    self.assertEqual(record["phase"], phase)
+                    self.assertEqual(record["version"], version)
+                    self.assertEqual(record["tag"], f"v{version}")
+                    self.assertEqual(record["draft_release_id"], 123456789)
+                    self.assertEqual(record["source_sha"], "a" * 40)
+                    self.assertEqual(record["build_sha"], build_sha)
+                    self.assertEqual(record["base_sha"], "b" * 40)
+                    self.assertEqual(record["source_snapshot"], "d" * 64)
+                    self.assertEqual(record["workflow_runs"][0]["run_attempt"], 1)
+                    self.assertEqual(record["attestation"]["subject_count"], 23)
 
     def test_dump_is_byte_stable_and_newline_terminated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -189,67 +186,39 @@ class VerifyTests(unittest.TestCase):
             record, dist = _record(Path(tmp))
             candidate.verify_record(record, "7.11.0", dist)
 
-    def test_tampered_asset_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, dist = _record(Path(tmp))
-            (dist / "SHA256SUMS").write_bytes(b"tampered")
-            with self.assertRaises(candidate.CandidateMismatch):
-                candidate.verify_record(record, "7.11.0", dist)
+    # Each mutation makes exactly one change to the staged distribution
+    # directory or to the recorded inventory; every one must fail verification.
+    MUTATIONS = (
+        ("tampered asset bytes", lambda record, dist: (dist / "SHA256SUMS").write_bytes(b"x")),
+        ("missing asset file", lambda record, dist: (dist / "gel-registry.json").unlink()),
+        ("extra asset file", lambda record, dist: (dist / "surprise.bin").write_bytes(b"x")),
+        ("unsupported schema version", lambda record, dist: record.update(schema_version=99)),
+        ("tag mismatch", lambda record, dist: record.update(tag="v7.11.1")),
+        ("truncated inventory", lambda record, dist: record.update(assets=record["assets"][:-1])),
+        (
+            "size mismatch",
+            lambda record, dist: record["assets"][0].update(size=record["assets"][0]["size"] + 1),
+        ),
+        (
+            "blake2b mismatch",
+            lambda record, dist: record["assets"][0].update(blake2b512="0" * 128),
+        ),
+    )
 
-    def test_missing_asset_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, dist = _record(Path(tmp))
-            (dist / "gel-registry.json").unlink()
-            with self.assertRaises(candidate.CandidateMismatch):
-                candidate.verify_record(record, "7.11.0", dist)
-
-    def test_extra_asset_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, dist = _record(Path(tmp))
-            (dist / "surprise.bin").write_bytes(b"unexpected")
-            with self.assertRaises(candidate.CandidateMismatch):
-                candidate.verify_record(record, "7.11.0", dist)
+    def test_mutated_candidate_is_rejected(self):
+        for label, mutate in self.MUTATIONS:
+            with self.subTest(mutation=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    record, dist = _record(Path(tmp))
+                    mutate(record, dist)
+                    with self.assertRaises(candidate.CandidateMismatch):
+                        candidate.verify_record(record, "7.11.0", dist)
 
     def test_version_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             record, dist = _record(Path(tmp))
             with self.assertRaises(candidate.CandidateMismatch):
                 candidate.verify_record(record, "7.11.1", dist)
-
-    def test_unsupported_schema_version(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, dist = _record(Path(tmp))
-            record["schema_version"] = 99
-            with self.assertRaises(candidate.CandidateMismatch):
-                candidate.verify_record(record, "7.11.0", dist)
-
-    def test_tag_mismatch(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, dist = _record(Path(tmp))
-            record["tag"] = "v7.11.1"
-            with self.assertRaises(candidate.CandidateMismatch):
-                candidate.verify_record(record, "7.11.0", dist)
-
-    def test_recorded_inventory_mismatch(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, dist = _record(Path(tmp))
-            record["assets"] = record["assets"][:-1]
-            with self.assertRaises(candidate.CandidateMismatch):
-                candidate.verify_record(record, "7.11.0", dist)
-
-    def test_size_mismatch_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, dist = _record(Path(tmp))
-            record["assets"][0]["size"] += 1
-            with self.assertRaises(candidate.CandidateMismatch):
-                candidate.verify_record(record, "7.11.0", dist)
-
-    def test_blake2b_mismatch_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            record, dist = _record(Path(tmp))
-            record["assets"][0]["blake2b512"] = "0" * 128
-            with self.assertRaises(candidate.CandidateMismatch):
-                candidate.verify_record(record, "7.11.0", dist)
 
     def test_preview_readback_asset_is_ignored_when_verifying_staged_distributions(self):
         with tempfile.TemporaryDirectory() as tmp:

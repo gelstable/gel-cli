@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -5,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gel_release import release_state
+from gel_release import cli, release_state
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY = "gelstable/gel-cli"
@@ -102,7 +104,7 @@ class PullRequestIdentityTests(unittest.TestCase):
             release_state.validate_pr(_pr(state="closed"), REPOSITORY)
 
     def test_conflicting_phase_labels_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "phase labels"):
+        with self.assertRaisesRegex(ValueError, "prerelease:alpha"):
             release_state.validate_pr(
                 _pr(
                     labels=[
@@ -132,34 +134,26 @@ class PhaseLabelTests(unittest.TestCase):
                 self.assertEqual(release_state.phase_from_labels([label]), phase)
 
     def test_two_active_phase_labels_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "phase labels"):
+        with self.assertRaisesRegex(ValueError, "prerelease:alpha"):
             release_state.phase_from_labels(["prerelease:alpha", "prerelease:rc"])
 
 
 class CliIdentityTests(unittest.TestCase):
-    def test_pr_identity_prints_validated_machine_readable_identity(self):
+    def _pr_identity(self, pr: dict) -> tuple[int, str]:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "pr.json"
-            path.write_text(json.dumps(_pr()))
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "gel_release.cli",
-                    "pr-identity",
-                    "--pr-json",
-                    str(path),
-                    "--repo",
-                    REPOSITORY,
-                ],
-                cwd=REPO_ROOT,
-                text=True,
-                capture_output=True,
-            )
+            path.write_text(json.dumps(pr))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = cli.main(["pr-identity", "--pr-json", str(path), "--repo", REPOSITORY])
+        return status, output.getvalue()
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
+    def test_pr_identity_prints_validated_machine_readable_identity(self):
+        status, output = self._pr_identity(_pr())
+
+        self.assertEqual(status, 0)
         self.assertEqual(
-            json.loads(completed.stdout),
+            json.loads(output),
             {
                 "number": 42,
                 "base_ref": "release/v7.x",
@@ -171,18 +165,18 @@ class CliIdentityTests(unittest.TestCase):
             },
         )
 
-    def test_pr_identity_rejects_conflicting_fetched_phase_labels(self):
+    def test_pr_identity_module_entry_point_exits_two_without_a_traceback(self):
+        """The only test that runs the CLI as a real process.
+
+        It proves the ``python -m gel_release.cli`` entry point maps a
+        validation failure onto exit status 2 with a plain stderr message,
+        which an in-process ``cli.main`` call cannot observe.
+        """
+
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "pr.json"
             path.write_text(
-                json.dumps(
-                    _pr(
-                        labels=[
-                            {"name": "prerelease:alpha"},
-                            {"name": "prerelease:rc"},
-                        ]
-                    )
-                )
+                json.dumps(_pr(labels=[{"name": "prerelease:alpha"}, {"name": "prerelease:rc"}]))
             )
             completed = subprocess.run(
                 [
@@ -201,7 +195,8 @@ class CliIdentityTests(unittest.TestCase):
             )
 
         self.assertEqual(completed.returncode, 2)
-        self.assertIn("phase labels", completed.stderr)
+        self.assertIn("prerelease:alpha", completed.stderr)
+        self.assertIn("prerelease:rc", completed.stderr)
         self.assertNotIn("Traceback", completed.stderr)
 
 

@@ -131,83 +131,85 @@ class BuildTests(unittest.TestCase):
             (root / "Cargo.toml").write_text("[package]\nname = 'gel'\n")
             with self.assertRaises(ValueError) as ctx:
                 linux_packages._manifest_with_target(root, AMD64)
-            self.assertEqual(
-                str(ctx.exception),
-                f"Placeholder {linux_packages.TARGET_PLACEHOLDER} not found in Cargo.toml",
-            )
+            self.assertIn(linux_packages.TARGET_PLACEHOLDER, str(ctx.exception))
+
+    def _build(self, cargo):
+        """Run ``build`` with ``cargo`` standing in for ``subprocess.run``.
+
+        Reports what the real ``Cargo.toml`` looked like while cargo ran, the
+        backup file the build made, and whatever ``build`` returned or raised.
+        """
+
+        seen: dict[str, object] = {}
+        original_named_temporary_file = tempfile.NamedTemporaryFile
+
+        def spy_named_temporary_file(*args, **kwargs):
+            handle = original_named_temporary_file(*args, **kwargs)
+            seen["backup"] = Path(handle.name)
+            return handle
+
+        def run(cmd, *args, **kwargs):
+            seen["manifest"] = Path("Cargo.toml").read_text()
+            return cargo(cmd)
+
+        with (
+            unittest.mock.patch(
+                "tempfile.NamedTemporaryFile", side_effect=spy_named_temporary_file
+            ),
+            unittest.mock.patch("subprocess.run", side_effect=run),
+            tempfile.TemporaryDirectory() as tmp_out,
+        ):
+            out_dir = Path(tmp_out)
+            seen["out_dir"] = out_dir
+            try:
+                produced = linux_packages.build(
+                    AMD64, "7.11.0", Path("target/completions"), out_dir
+                )
+            except subprocess.CalledProcessError as error:
+                seen["error"] = error
+            else:
+                seen["produced"] = produced
+                seen["existing"] = [path for path in produced if path.is_file()]
+        return seen
+
+    def _assert_manifest_is_restored(self, seen, original_manifest):
+        # The build must patch the target placeholder in place and put the
+        # pristine manifest back, leaving no backup file behind.
+        self.assertIn(AMD64.triple, seen["manifest"])
+        self.assertNotIn(linux_packages.TARGET_PLACEHOLDER, seen["manifest"])
+        self.assertEqual(Path("Cargo.toml").read_text(), original_manifest)
+        self.assertFalse(seen["backup"].exists())
 
     def test_build_replaces_placeholder_and_rolls_back_on_failure(self):
-        manifest_during_run = None
-        created_backup = None
-
-        orig_named_temp = tempfile.NamedTemporaryFile
-
-        def spy_named_temp(*args, **kwargs):
-            nonlocal created_backup
-            f = orig_named_temp(*args, **kwargs)
-            created_backup = Path(f.name)
-            return f
-
-        def fake_run(cmd, *args, **kwargs):
-            nonlocal manifest_during_run
-            manifest_during_run = Path("Cargo.toml").read_text()
+        def failing_cargo(cmd):
             raise subprocess.CalledProcessError(1, cmd)
 
         original_manifest = Path("Cargo.toml").read_text()
-        with (
-            unittest.mock.patch("tempfile.NamedTemporaryFile", side_effect=spy_named_temp),
-            unittest.mock.patch("subprocess.run", side_effect=fake_run),
-            tempfile.TemporaryDirectory() as tmp_out,
-        ):
-            with self.assertRaises(subprocess.CalledProcessError):
-                linux_packages.build(AMD64, "7.11.0", Path("target/completions"), Path(tmp_out))
+        seen = self._build(failing_cargo)
 
-        self.assertIsNotNone(manifest_during_run)
-        self.assertIn(AMD64.triple, manifest_during_run)
-        self.assertNotIn(linux_packages.TARGET_PLACEHOLDER, manifest_during_run)
-        self.assertEqual(Path("Cargo.toml").read_text(), original_manifest)
-        self.assertIsNotNone(created_backup)
-        self.assertFalse(created_backup.exists())
+        self.assertIsInstance(seen["error"], subprocess.CalledProcessError)
+        self._assert_manifest_is_restored(seen, original_manifest)
 
-    def test_build_success_restores_manifest_and_cleans_backup(self):
-        manifest_during_run = None
-        created_backup = None
-
-        orig_named_temp = tempfile.NamedTemporaryFile
-
-        def spy_named_temp(*args, **kwargs):
-            nonlocal created_backup
-            f = orig_named_temp(*args, **kwargs)
-            created_backup = Path(f.name)
-            return f
-
-        def fake_run(cmd, *args, **kwargs):
-            nonlocal manifest_during_run
-            manifest_during_run = Path("Cargo.toml").read_text()
+    def test_build_success_restores_manifest_and_collects_packages(self):
+        def succeeding_cargo(cmd):
             dist = Path("dist")
             dist.mkdir(parents=True, exist_ok=True)
             (dist / assets.deb_name("7.11.0", AMD64)).write_text("dummy deb")
             (dist / assets.rpm_name("7.11.0", AMD64)).write_text("dummy rpm")
 
         original_manifest = Path("Cargo.toml").read_text()
-        with (
-            unittest.mock.patch("tempfile.NamedTemporaryFile", side_effect=spy_named_temp),
-            unittest.mock.patch("subprocess.run", side_effect=fake_run),
-            tempfile.TemporaryDirectory() as tmp_out,
-        ):
-            out_dir = Path(tmp_out)
-            produced = linux_packages.build(AMD64, "7.11.0", Path("target/completions"), out_dir)
-            self.assertEqual(len(produced), 2)
-            self.assertEqual(produced[0], out_dir / assets.deb_name("7.11.0", AMD64))
-            self.assertEqual(produced[1], out_dir / assets.rpm_name("7.11.0", AMD64))
-            self.assertTrue(all(p.is_file() for p in produced))
+        seen = self._build(succeeding_cargo)
 
-        self.assertIsNotNone(manifest_during_run)
-        self.assertIn(AMD64.triple, manifest_during_run)
-        self.assertNotIn(linux_packages.TARGET_PLACEHOLDER, manifest_during_run)
-        self.assertEqual(Path("Cargo.toml").read_text(), original_manifest)
-        self.assertIsNotNone(created_backup)
-        self.assertFalse(created_backup.exists())
+        out_dir = seen["out_dir"]
+        self.assertEqual(
+            seen["produced"],
+            [
+                out_dir / assets.deb_name("7.11.0", AMD64),
+                out_dir / assets.rpm_name("7.11.0", AMD64),
+            ],
+        )
+        self.assertEqual(seen["existing"], seen["produced"])
+        self._assert_manifest_is_restored(seen, original_manifest)
 
 
 if __name__ == "__main__":

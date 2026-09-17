@@ -1,18 +1,10 @@
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from conftest import _git
+
 from gel_release import source_equivalence
-
-
-def _git(repo: Path, *argv: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *argv],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 class EquivalenceTests(unittest.TestCase):

@@ -389,6 +389,33 @@ def prepare_line(
     )
 
 
+def collect_phase_permissions(*, repo: str, timeline_json: Path, out: Path) -> dict[str, str]:
+    """Look up each human timeline actor's repository permission via ``gh``.
+
+    The workflow timelines are read fresh in the caller; this owns the single
+    actor-extraction and permission-lookup rule the publication and controller
+    flows share, so it cannot drift between their YAML files.
+    """
+
+    timeline = json.loads(timeline_json.read_bytes())
+    if not isinstance(timeline, list):
+        raise ValueError("PR timeline must be a list")
+    permissions: dict[str, str] = {}
+    for login in github_release.timeline_actors(timeline):
+        permission = _gh(
+            "api",
+            f"repos/{repo}/collaborators/{login}/permission",
+            "--jq",
+            ".permission",
+        )
+        if not permission:
+            raise ValueError(f"could not read the repository permission for {login!r}")
+        permissions[login] = permission
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(permissions, sort_keys=True) + "\n")
+    return permissions
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gel-release")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -427,6 +454,10 @@ def _parser() -> argparse.ArgumentParser:
     authorize.add_argument("--timeline-json", required=True, type=Path)
     authorize.add_argument("--phase", required=True)
     authorize.add_argument("--permissions-json", required=True, type=Path)
+    phase_permissions = commands.add_parser("phase-permissions")
+    phase_permissions.add_argument("--repo", required=True)
+    phase_permissions.add_argument("--timeline-json", required=True, type=Path)
+    phase_permissions.add_argument("--out", required=True, type=Path)
     preparation = commands.add_parser("prepare-line")
     preparation.add_argument("--base-ref", required=True)
     preparation.add_argument(
@@ -666,6 +697,12 @@ def main(argv: list[str] | None = None) -> int:
                 "true"
                 if github_release.phase_authorized(timeline, args.phase, permissions)
                 else "false"
+            )
+        elif args.command == "phase-permissions":
+            collect_phase_permissions(
+                repo=args.repo,
+                timeline_json=args.timeline_json,
+                out=args.out,
             )
         elif args.command == "prepare-line":
             result = prepare_line(

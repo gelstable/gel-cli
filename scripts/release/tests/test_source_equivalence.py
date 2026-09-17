@@ -41,12 +41,6 @@ class EquivalenceTests(unittest.TestCase):
 
     def test_allowlisted_additions_are_equivalent(self):
         (self.repo / "packaging" / "release-candidate.json").write_text("{}\n")
-        (self.repo / "Formula").mkdir()
-        (self.repo / "Formula" / "gel.rb").write_text("class Gel < Formula\nend\n")
-        (self.repo / "bucket").mkdir()
-        (self.repo / "bucket" / "gel.json").write_text("{}\n")
-        (self.repo / "packaging" / "aur").mkdir()
-        (self.repo / "packaging" / "aur" / "PKGBUILD").write_text("pkgname=gel-cli-bin\n")
         head = self._commit("metadata only")
 
         source_equivalence.assert_equivalent(self.base, head, self.repo)
@@ -82,27 +76,16 @@ class EquivalenceTests(unittest.TestCase):
         with self.assertRaises(source_equivalence.SourceDrift):
             source_equivalence.assert_equivalent(self.base, head, self.repo)
 
-    def test_allowlist_is_exactly_the_four_generated_paths(self):
+    def test_allowlist_is_exactly_the_generated_record_path(self):
         self.assertEqual(
             sorted(source_equivalence.ALLOWLIST),
-            [
-                "Formula/gel.rb",
-                "bucket/gel.json",
-                "packaging/aur/PKGBUILD",
-                "packaging/release-candidate.json",
-            ],
+            ["packaging/release-candidate.json"],
         )
 
     def test_meaningful_tree_ignores_generated_candidate_and_distribution_files(self):
         baseline = source_equivalence.meaningful_tree(self.base, self.repo)
 
-        (self.repo / "Formula").mkdir()
-        (self.repo / "Formula" / "gel.rb").write_text("class Gel < Formula\nend\n")
-        (self.repo / "bucket").mkdir()
-        (self.repo / "bucket" / "gel.json").write_text("{}\n")
         (self.repo / "packaging" / "release-candidate.json").write_text("{}\n")
-        (self.repo / "packaging" / "aur").mkdir()
-        (self.repo / "packaging" / "aur" / "PKGBUILD").write_text("pkgname=gel-cli-bin\n")
         generated = self._commit("generated candidate and distribution files")
 
         self.assertEqual(source_equivalence.meaningful_tree(generated, self.repo), baseline)

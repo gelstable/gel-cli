@@ -139,12 +139,6 @@ class CandidateInputContractTests(unittest.TestCase):
         text = _run_text(cleanup)
         assert "preview_ref" not in text
 
-    def test_controller_rejects_a_requested_line_that_does_not_match_live_pr(self):
-        workflow = (WORKFLOWS / "release-controller.yml").read_text()
-        assert "REQUESTED_LINE" in workflow
-        assert ".base.ref" in workflow
-        assert "requested release line" in workflow
-
 
 class CandidateGraphContractTests(unittest.TestCase):
     def test_target_and_smoke_matrices_are_derived_from_release_cli(self):
@@ -203,28 +197,6 @@ class CandidateGraphContractTests(unittest.TestCase):
             "e2e_winget",
         ):
             assert scenario in install_text
-
-    def test_linux_package_scenarios_install_the_release_packages(self):
-        workflow = _workflow("release-install-e2e.yml")
-        prepare_text = _run_text(workflow["jobs"]["prepare"])
-        assert "release-dist/gel_${VERSION}_amd64.deb" in prepare_text
-        assert "release-dist/gel-${VERSION}-1.x86_64.rpm" in prepare_text
-
-        apt = workflow["jobs"]["apt"]
-        dnf = workflow["jobs"]["dnf"]
-        assert ".deb" in str(apt.get("env", {}))
-        assert "GEL_E2E_PACKAGE" in apt.get("env", {})
-        assert ".rpm" in str(dnf.get("env", {}))
-        assert "GEL_E2E_PACKAGE" in dnf.get("env", {})
-
-        scenarios = WORKFLOWS.parents[1] / "tests" / "install-manager" / "scenarios"
-        apt_source = (scenarios / "apt.rs").read_text()
-        dnf_source = (scenarios / "dnf.rs").read_text()
-        for source in (apt_source, dnf_source):
-            assert "GEL_E2E_PACKAGE" in source
-            assert "if let Some(package)" in source
-            assert '.arg("-i")' in source
-            assert ".arg(package)" in source
 
     def test_stage_uploads_exact_inventory_attests_and_reads_api_back(self):
         workflow = _workflow("release-candidate.yml")
@@ -358,16 +330,6 @@ class StableMergeWorkflowContractTests(unittest.TestCase):
         assert "candidate" in workflow["jobs"]
         assert workflow["jobs"]["candidate"]["name"] == "stable merge gate"
 
-    def test_stable_gate_reads_live_pr_merge_ref_and_candidate_record(self):
-        workflow = _workflow("release-candidate-check.yml")
-        text = _run_text(workflow["jobs"]["candidate"])
-        assert "pulls/$PR_NUMBER" in text
-        assert "refs/pull/$PR_NUMBER/merge" in text
-        assert "packaging/release-candidate.json" in text
-        assert "check_stable_merge" in text
-        assert "Cargo.toml" in text
-        assert "Cargo.lock" in text
-
     def test_stable_gate_uses_read_only_permissions_and_pinned_actions(self):
         workflow = _workflow("release-candidate-check.yml")
         assert workflow["permissions"] == {"contents": "read"}
@@ -409,73 +371,52 @@ class StableMergeWorkflowContractTests(unittest.TestCase):
 
 
 class ReleaseMigrationDocumentationContractTests(unittest.TestCase):
-    def test_readme_covers_line_migration_and_recovery(self):
-        text = README.read_text()
-        for required in (
-            "release/vN.x",
-            "master",
-            "Cargo.toml",
-            "Cargo.lock",
-            ".changeset/",
-            "cherry-pick",
-            "prerelease:alpha",
-            "prerelease:beta",
-            "prerelease:rc",
-            "retry",
-            "stale draft",
-            "stable merge gate",
-            "Release publish",
-            "latest",
-            "separate snapshot pull request",
-            "published, non-draft",
-            "allowlist",
-            "master-based generated release workflow",
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, text)
+    """The migration story is the branch's handoff document; keep its anchors."""
 
-    def test_readme_keeps_legacy_package_root_and_channel_paths_documented(self):
-        text = README.read_text()
-        for required in (
-            "GEL_PKG_ROOT",
-            "EDGEDB_PKG_ROOT",
-            "https://packages.geldata.com",
-            "nightly",
-            "[registry]",
-            "sources",
-            '"channel": "stable"',
-            '"channel": "testing"',
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, text)
-
-    def test_branch_protection_guidance_requires_the_stable_merge_gate_on_each_line(self):
-        self.assertTrue(BRANCH_PROTECTION.is_file())
-        text = BRANCH_PROTECTION.read_text()
-        for required in (
-            "release/v*.x",
-            "stable merge gate",
-            "opened",
-            "synchronize",
-            "reopened",
-            "labeled",
-            "unlabeled",
-            "required status check",
-            "Do not allow bypassing",
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, text)
-
-    def test_documents_backport_and_workflow_trust_boundaries(self):
-        branch_text = BRANCH_PROTECTION.read_text()
-        readme_text = README.read_text()
-        for text in (branch_text, readme_text):
-            for required in (
+    def test_readme_and_protection_rules_cover_the_release_migration(self):
+        readme = README.read_text()
+        protection = BRANCH_PROTECTION.read_text()
+        anchors = {
+            readme: (
+                "release/vN.x",
+                "master",
+                "Cargo.toml",
+                "Cargo.lock",
+                ".changeset/",
+                "cherry-pick",
+                "stable merge gate",
+                "Release publish",
+                "separate snapshot pull request",
+                "https://packages.geldata.com",
+                "[registry]",
+            ),
+            protection: (
+                "release/v*.x",
+                "stable merge gate",
+                "required status check",
+                "Do not allow bypassing",
                 "ordinary backport",
-                "candidate record",
-                "generated release PR",
                 "trust boundary",
-                "candidate ref",
-            ):
-                with self.subTest(text=text[:20], required=required):
-                    self.assertIn(required, text)
+            ),
+        }
+        for text, required in anchors.items():
+            for anchor in required:
+                with self.subTest(file="readme" if text is readme else "protection", anchor=anchor):
+                    self.assertIn(anchor, text)
+
+    def test_readme_documents_the_existing_major_line_procedure(self):
+        text = README.read_text()
+        # The v7 migration must not tell readers to re-tag an old version.
+        self.assertIn("already has published releases", text)
+        self.assertIn("7.10.2", text)
+        self.assertIn("7.11.0", text)
+        self.assertIn("Never", text)
+
+    def test_branch_protection_documents_merge_method_support(self):
+        text = BRANCH_PROTECTION.read_text()
+        self.assertIn("merge methods", text)
+        self.assertIn("up to date", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

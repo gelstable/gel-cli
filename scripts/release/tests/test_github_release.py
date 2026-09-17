@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +28,15 @@ HEAD_REF = "knope/release-v7.x"
 BASE_SHA = "b" * 40
 SOURCE_SHA = "a" * 40
 SNAPSHOT = "c" * 64
+
+
+def _git(repo: Path, *argv: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *argv],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def _release_pr(
@@ -345,6 +355,20 @@ class ResolveCandidateTests(unittest.TestCase):
             )
         )
 
+    def test_timeline_actors_lists_humans_once_and_excludes_bots(self):
+        timeline = [
+            {"event": "labeled", "actor": {"login": "maintainer"}},
+            {"event": "labeled", "actor": {"login": "gelstable-release[bot]"}},
+            {"event": "synchronize", "actor": {"login": "renovate", "type": "Bot"}},
+            {"event": "unlabeled", "actor": {"login": "maintainer"}},
+        ]
+
+        self.assertEqual(github_release.timeline_actors(timeline), ["maintainer"])
+
+    def test_timeline_actors_requires_a_timeline_list(self):
+        with self.assertRaisesRegex(ValueError, "timeline"):
+            github_release.timeline_actors({"event": "labeled"})  # type: ignore[arg-type]
+
     def _staged_repo(self) -> tuple[Path, str, str, str, str]:
         """Real repo with a prepared source and the staged record successor."""
 
@@ -352,13 +376,7 @@ class ResolveCandidateTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         repo = Path(tmp.name)
 
-        def git(*args: str) -> str:
-            return subprocess.run(
-                ["git", "-C", str(repo), *args],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
+        git = partial(_git, repo)
 
         git("init", "-q", "-b", "main", ".")
         git("config", "user.email", "test@example.com")
@@ -645,12 +663,7 @@ class StableMergeGateTests(unittest.TestCase):
         )
 
     def _git(self, *argv: str) -> str:
-        return subprocess.run(
-            ["git", "-C", str(self.repo), *argv],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
+        return _git(self.repo, *argv)
 
     def _record(self, **overrides: object) -> CandidateRecord:
         value: dict[str, object] = {
@@ -767,9 +780,6 @@ class StableMergeGateTests(unittest.TestCase):
 
     def test_generated_metadata_only_merge_tree_is_accepted(self):
         merge_sha = self._merge_sha(
-            ("Formula/gel.rb", "class Gel < Formula\nend\n"),
-            ("bucket/gel.json", "{}\n"),
-            ("packaging/aur/PKGBUILD", "pkgname=gel-cli-bin\n"),
             ("packaging/release-candidate.json", "{}\n"),
         )
         self._check(merge_sha=merge_sha)
@@ -1289,13 +1299,7 @@ class PublicationTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         repo = Path(tmp.name)
 
-        def git(*args: str) -> str:
-            return subprocess.run(
-                ["git", "-C", str(repo), *args],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
+        git = partial(_git, repo)
 
         git("init", "-q", "-b", "main", ".")
         git("config", "user.email", "test@example.com")
@@ -1382,13 +1386,7 @@ class PublicationTests(unittest.TestCase):
         repo, _base, _source, record_sha, identity, record = self._release_repo()
         self._enter_repo(repo)
 
-        def git(*args: str) -> str:
-            return subprocess.run(
-                ["git", "-C", str(repo), *args],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
+        git = partial(_git, repo)
 
         git("switch", "-C", BASE_REF, identity["base_sha"])
         git("merge", "--no-ff", "-m", "merge (#101)", HEAD_REF)
@@ -1424,13 +1422,7 @@ class PublicationTests(unittest.TestCase):
                 repo, base, source, record_sha, identity, record = self._release_repo()
                 self._enter_repo(repo)
 
-                def git(*args: str) -> str:
-                    return subprocess.run(
-                        ["git", "-C", str(repo), *args],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    ).stdout.strip()
+                git = partial(_git, repo)
 
                 git("switch", "-C", BASE_REF, base)
                 prepare(git, base, HEAD_REF, source, record_sha)
@@ -1534,13 +1526,7 @@ class PublicationTests(unittest.TestCase):
         repo, base, _source, record_sha, identity, record = self._release_repo()
         self._enter_repo(repo)
 
-        def git(*args: str) -> str:
-            return subprocess.run(
-                ["git", "-C", str(repo), *args],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
+        git = partial(_git, repo)
 
         # Craft a push whose first-parent chain is rooted on unrelated history
         # instead of the recorded candidate base.
@@ -1578,6 +1564,40 @@ class PublicationTests(unittest.TestCase):
 
 
 class GithubReleaseCliTests(unittest.TestCase):
+    def test_phase_permissions_cli_writes_the_human_actor_permission_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            timeline = root / "timeline.json"
+            timeline.write_text(
+                json.dumps(
+                    [
+                        {"event": "labeled", "actor": {"login": "maintainer"}},
+                        {"event": "labeled", "actor": {"login": "gelstable-release[bot]"}},
+                    ]
+                )
+            )
+            out = root / "permissions.json"
+            with mock.patch.object(cli, "_gh", return_value="maintain") as gh:
+                status = cli.main(
+                    [
+                        "phase-permissions",
+                        "--repo",
+                        REPOSITORY,
+                        "--timeline-json",
+                        str(timeline),
+                        "--out",
+                        str(out),
+                    ]
+                )
+                self.assertEqual(status, 0)
+                self.assertEqual(json.loads(out.read_text()), {"maintainer": "maintain"})
+                gh.assert_called_once_with(
+                    "api",
+                    f"repos/{REPOSITORY}/collaborators/maintainer/permission",
+                    "--jq",
+                    ".permission",
+                )
+
     def test_resolve_candidate_cli_prints_all_immutable_identity_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

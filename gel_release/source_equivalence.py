@@ -11,14 +11,7 @@ import hashlib
 import subprocess
 from pathlib import Path
 
-ALLOWLIST = frozenset(
-    {
-        "Formula/gel.rb",
-        "bucket/gel.json",
-        "packaging/aur/PKGBUILD",
-        "packaging/release-candidate.json",
-    }
-)
+ALLOWLIST = frozenset({"packaging/release-candidate.json"})
 RECORD_PATH = "packaging/release-candidate.json"
 
 
@@ -74,11 +67,6 @@ def meaningful_tree(rev: str, repo: Path = Path(".")) -> str:
 def assert_snapshot(expected: str, rev: str, repo: Path = Path(".")) -> None:
     """Require a revision's meaningful source snapshot to match ``expected``."""
 
-    # Accept either natural positional ordering when called by integrations:
-    # ``assert_snapshot(expected, rev)`` is the canonical form, while
-    # ``assert_snapshot(rev, expected)`` remains unambiguous by digest length.
-    if len(expected) == 40 and len(rev) == 64:
-        expected, rev = rev, expected
     actual = meaningful_tree(rev, repo)
     if actual != expected:
         raise SourceDrift(

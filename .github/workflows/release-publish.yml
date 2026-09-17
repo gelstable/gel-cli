@@ -145,26 +145,19 @@ jobs:
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/timeline" \
             | jq 'add' > "$RUNNER_TEMP/timeline.json"
           test -n "$phase"
-          permissions_file="$RUNNER_TEMP/permissions.json"
-          echo '{}' > "$permissions_file"
-          jq -r '.[].actor | select((.type // "") != "Bot" and ((.login // "") | endswith("[bot]") | not)) | .login // empty' "$RUNNER_TEMP/timeline.json" \
-            | sort -u \
-            | while IFS= read -r actor; do
-                [[ -n "$actor" ]] || continue
-                permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$actor/permission" --jq '.permission')"
-                jq --arg actor "$actor" --arg permission "$permission" \
-                  '. + {($actor): $permission}' "$permissions_file" > "$permissions_file.tmp"
-                mv "$permissions_file.tmp" "$permissions_file"
-              done
+          PYTHONPATH=. uv run --frozen gel-release phase-permissions \
+            --repo "$GITHUB_REPOSITORY" \
+            --timeline-json "$RUNNER_TEMP/timeline.json" \
+            --out "$RUNNER_TEMP/permissions.json"
           authorized="$(PYTHONPATH=. uv run --frozen gel-release phase-authorized \
             --timeline-json "$RUNNER_TEMP/timeline.json" --phase "$phase" \
-            --permissions-json "$permissions_file")"
+            --permissions-json "$RUNNER_TEMP/permissions.json")"
           [[ "$authorized" == true ]] || {
             echo "phase $phase was not added by an authorized maintainer" >&2
             exit 1
           }
           jq --argjson timeline "$(cat "$RUNNER_TEMP/timeline.json")" \
-            --argjson permissions "$(cat "$permissions_file")" \
+            --argjson permissions "$(cat "$RUNNER_TEMP/permissions.json")" \
             '. + {timeline: $timeline, permissions: $permissions}' \
             "$RUNNER_TEMP/live-pr.json" > "$RUNNER_TEMP/live-pr-enriched.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"

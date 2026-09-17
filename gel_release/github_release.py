@@ -808,6 +808,26 @@ def _permission(value: object) -> str | None:
     return value.lower() if isinstance(value, str) else None
 
 
+def timeline_actors(timeline: list[dict]) -> list[str]:
+    """Return the human actors in a PR timeline, excluding bots.
+
+    Bot transitions never carry phase authority, so their permission lookups
+    are skipped entirely.
+    """
+
+    if not isinstance(timeline, list):
+        raise ValueError("PR timeline must be a list")
+    actors: set[str] = set()
+    for entry in timeline:
+        if not isinstance(entry, Mapping):
+            raise ValueError("PR timeline entries must be objects")
+        login, actor_type = _timeline_actor(entry)
+        if not login or actor_type and actor_type.lower() == "bot" or login.endswith("[bot]"):
+            continue
+        actors.add(login)
+    return sorted(actors)
+
+
 def phase_authorized(timeline: list[dict], phase: str, permissions: Mapping[str, object]) -> bool:
     """Check the latest active phase label was added by an authorized user.
 
@@ -1362,15 +1382,7 @@ def fetch_live_preview_pr(
         entry for entry in _flatten_api_pages(timeline_payload) if isinstance(entry, Mapping)
     ]
     permissions: dict[str, str] = {}
-    actors = {
-        login
-        for entry in timeline
-        for actor in [entry.get("actor", entry.get("user"))]
-        if isinstance(actor, Mapping)
-        for login in [actor.get("login")]
-        if isinstance(login, str) and login and not login.endswith("[bot]")
-    }
-    for login in sorted(actors):
+    for login in timeline_actors(timeline):
         permission = _gh_json(
             "api",
             f"/repos/{assets.REPOSITORY}/collaborators/{login}/permission",

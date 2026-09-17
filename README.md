@@ -129,6 +129,14 @@ without a matching newly merged candidate is a no-op. If publication fails,
 retry the same line push after fixing the cause; an existing matching tag and
 published release are successful idempotent states.
 
+All three GitHub merge methods are supported on release lines. Publication
+binds the recorded base through the first-parent chain of the pushed merge:
+merge commits and squashes reach the recorded base as the immediate first
+parent, and a rebase merge reaches it through the rewritten preparation
+commit. Require branches to be up to date before merging so a squash or
+rebase lands directly on the recorded base; publication rejects a push whose
+base is missing or more than the two generated commits away.
+
 GitHub's `latest` flag is selected from the greatest published stable SemVer
 across all major lines, so a v7 patch does not displace a newer v8 stable
 release. Preview releases remain testing releases and never become latest.

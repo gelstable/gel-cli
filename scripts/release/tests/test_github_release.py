@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -1069,19 +1070,142 @@ class PublicationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "tag|target|commit"):
                 github_release.publish_stable(record, "e" * 40, release)
 
-    def test_stable_uses_merge_first_parent_for_recorded_base(self):
-        identity = self._stable_identity()
+    def _release_repo(self) -> tuple[Path, str, str, str, dict[str, object], CandidateRecord]:
+        """Build a real line history with a prepared and staged generated branch.
+
+        Returns the repo path, base SHA, tested source SHA, generated head
+        (the record successor), the stable identity, and the staged record.
+        """
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        git("init", "-q", "-b", "main", ".")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Publication Topology Test")
+        git("config", "commit.gpgsign", "false")
+        (repo / "Cargo.toml").write_text('[package]\nname = "gel-cli"\nversion = "7.1.0"\n')
+        (repo / "Cargo.lock").write_text(
+            'version = 4\n\n[[package]]\nname = "gel-cli"\nversion = "7.1.0"\n'
+        )
+        (repo / "src").mkdir()
+        (repo / "src" / "main.rs").write_text("fn main() {}\n")
+        git("add", "-A")
+        git("commit", "-qm", "release line base")
+        base_sha = git("rev-parse", "HEAD")
+
+        git("switch", "-c", HEAD_REF, base_sha)
+        (repo / "CHANGELOG.md").write_text("# 7.1.0\n")
+        git("add", "-A")
+        git("commit", "-qm", "chore: prepare release 7.1.0")
+        source_sha = git("rev-parse", "HEAD")
+        snapshot = source_equivalence.meaningful_tree(source_sha, repo)
+        identity = {
+            **self._stable_identity(),
+            "base_sha": base_sha,
+            "source_sha": source_sha,
+            "build_sha": source_sha,
+            "source_snapshot": snapshot,
+        }
         record = self._record(identity)
-        release = self._stable_release(record)
-        # GitHub's merged PR payload can report the current release-line tip,
-        # which may be the merge itself or a later push. The immutable base is
-        # the first parent of the pushed merge commit.
-        release["merged_pr"]["base"]["sha"] = "e" * 40
-        self._topology.stop()
-        with mock.patch.object(github_release, "_run_git", return_value=f"{'e' * 40} {BASE_SHA}"):
-            with mock.patch.object(github_release, "_gh_mutate"):
-                with mock.patch.object(verify_draft, "verify"):
-                    github_release.publish_stable(record, "e" * 40, release)
+        (repo / "packaging").mkdir()
+        (repo / "packaging" / "release-candidate.json").write_bytes(candidate.dump(record))
+        git("add", "-A")
+        git("commit", "-qm", "chore: stage release candidate v7.1.0")
+        record_sha = git("rev-parse", "HEAD")
+        return repo, base_sha, source_sha, record_sha, identity, record
+
+    def _merged_release(
+        self,
+        identity: dict[str, object],
+        record: CandidateRecord,
+        *,
+        push_sha: str,
+        record_sha: str,
+    ) -> dict:
+        value = self._release(identity, record, tag_target=None)
+        value["merged_pr"] = {
+            "number": 101,
+            "state": "closed",
+            "merged": True,
+            "merge_commit_sha": push_sha,
+            "base": {
+                "ref": BASE_REF,
+                "sha": identity["base_sha"],
+                "repo": {"full_name": REPOSITORY},
+            },
+            "head": {
+                "ref": HEAD_REF,
+                "sha": record_sha,
+                "repo": {"full_name": REPOSITORY},
+            },
+        }
+        value["published_stable_versions"] = ["7.1.0"]
+        return value
+
+    def test_stable_publishes_through_merge_commit_squash_and_rebase_shapes(self):
+        shapes = (
+            (
+                "merge commit",
+                lambda git, base, head, _source, _record: git(
+                    "merge", "--no-ff", "-m", "merge (#101)", head
+                ),
+            ),
+            (
+                "squash",
+                lambda git, base, head, _source, _record: (
+                    git("merge", "--squash", head),
+                    git("commit", "-qm", "merge (#101)"),
+                ),
+            ),
+            (
+                "rebase",
+                lambda git, base, head, source, record: git("cherry-pick", source, record),
+            ),
+        )
+        for shape, prepare in shapes:
+            with self.subTest(shape=shape):
+                self._topology.stop()
+                repo, base, source, record_sha, identity, record = self._release_repo()
+                # _matching_merge_pr inspects the workflow checkout at Path("."),
+                # so these topology tests run inside the fixture repository.
+                working_dir = Path.cwd()
+                self.addCleanup(os.chdir, working_dir)
+                os.chdir(repo)
+
+                def git(*args: str) -> str:
+                    return subprocess.run(
+                        ["git", "-C", str(repo), *args],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+
+                git("switch", "-C", BASE_REF, base)
+                prepare(git, base, HEAD_REF, source, record_sha)
+                push_sha = git("rev-parse", BASE_REF)
+                release = self._merged_release(
+                    identity, record, push_sha=push_sha, record_sha=record_sha
+                )
+                with mock.patch.object(github_release, "_gh_mutate") as mutate:
+                    with mock.patch.object(github_release.verify_draft, "verify"):
+                        github_release.publish_stable(record, push_sha, release)
+                self.assertTrue(
+                    any("refs/tags/v7.1.0" in str(call.args) for call in mutate.call_args_list)
+                )
+                self.assertEqual(
+                    mutate.call_args.args[2]["make_latest"],
+                    "true",
+                )
 
     def test_stable_draft_verification_accepts_actual_merge_tag_target(self):
         identity = self._stable_identity()
@@ -1119,14 +1243,29 @@ class PublicationTests(unittest.TestCase):
         resolve.assert_called_once_with(record.tag, REPOSITORY)
 
     def test_stable_rejects_moved_merge_base(self):
-        identity = self._stable_identity()
-        record = self._record(identity)
-        release = self._stable_release(record)
-        release["merged_pr"]["base"]["sha"] = "f" * 40
         self._topology.stop()
-        with mock.patch.object(github_release, "_run_git", return_value=f"{'e' * 40} {'f' * 40}"):
-            with self.assertRaisesRegex(ValueError, "base|candidate"):
-                github_release.publish_stable(record, "e" * 40, release)
+        repo, base, _source, record_sha, identity, record = self._release_repo()
+        working_dir = Path.cwd()
+        self.addCleanup(os.chdir, working_dir)
+        os.chdir(repo)
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        # A squash onto a line that moved past the recorded base: the chain
+        # still contains the base several commits back only when the push was
+        # rebased onto a descendant; craft a push rooted on unrelated history.
+        git("switch", "-C", BASE_REF, base)
+        unrelated = git("commit-tree", f"{record_sha}^{{tree}}", "-m", "unrelated root")
+        push_sha = git("commit-tree", f"{record_sha}^{{tree}}", "-p", unrelated, "-m", "merge")
+        release = self._merged_release(identity, record, push_sha=push_sha, record_sha=record_sha)
+        with self.assertRaisesRegex(ValueError, "base|candidate"):
+            github_release.publish_stable(record, push_sha, release)
 
     def test_stable_rejects_changed_draft_bytes(self):
         identity = self._stable_identity()

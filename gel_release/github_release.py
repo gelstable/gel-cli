@@ -1483,20 +1483,34 @@ def _matching_merge_pr(
 
 
 def _assert_line_push_base(record: CandidateRecord, line_push_sha: str) -> None:
-    """Bind the candidate base to the release-line push's first parent."""
+    """Bind the candidate base to the release-line push's first-parent chain.
+
+    Branch protection may allow merge commits, squash merges, and rebase
+    merges. A merge commit and a squash both reach the recorded base as the
+    immediate first parent, while a rebase merge reaches it through the
+    rewritten preparation commit. The generated pull request carries at most
+    those two commits above the base, so a longer chain means the line moved
+    after the candidate was prepared.
+    """
 
     try:
-        parents = _run_git(Path("."), "rev-list", "--parents", "-n", "1", line_push_sha).split()
+        chain = _run_git(Path("."), "rev-list", "--first-parent", line_push_sha).split()
     except ValueError as error:
         raise ValueError(
-            f"line push {line_push_sha} has no inspectable merge topology: {error}"
+            f"line push {line_push_sha} has no inspectable history: {error}"
         ) from error
-    if len(parents) < 2:
-        raise ValueError(f"line push {line_push_sha} has no first parent")
-    if parents[1] != record.base_sha:
+    try:
+        steps = chain.index(record.base_sha)
+    except ValueError:
         raise ValueError(
-            f"line push {line_push_sha} first parent {parents[1]} does not match "
-            f"candidate base {record.base_sha}"
+            f"line push {line_push_sha} does not sit on the recorded base {record.base_sha}"
+        ) from None
+    if steps == 0:
+        raise ValueError(f"line push {line_push_sha} is the recorded base, not a candidate merge")
+    if steps > 2:
+        raise ValueError(
+            f"line push {line_push_sha} is {steps} commits above the recorded base "
+            f"{record.base_sha}; refresh the release pull request"
         )
 
 

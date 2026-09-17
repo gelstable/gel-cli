@@ -23,6 +23,13 @@ request with the repository's normal review and conversation rules.
 The protected branch rule still requires this status context for every PR;
 ordinary backports receive their passing result from the safe path below.
 
+Any combination of merge methods may be allowed on release lines. The
+publication gate verifies merge commits, squashes, and rebases by binding the
+recorded base through the pushed merge's first-parent chain, so no merge
+method needs to be disabled. Keep "require branches to be up to date"
+enabled: a squash or rebase that lands on a moved base is rejected at
+publication.
+
 An ordinary backport PR targeting a release line gets the safe passing path
 when it cannot add or modify `packaging/release-candidate.json` or
 `packaging/gel-candidate.json`. The workflow identifies the generated release

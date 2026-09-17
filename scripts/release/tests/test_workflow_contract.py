@@ -44,6 +44,39 @@ def _run_text(job: dict) -> str:
     return "\n".join(str(step.get("run", "")) for step in _steps(job))
 
 
+class ContinuousIntegrationContractTests(unittest.TestCase):
+    """The release suite only protects the pipeline when CI actually runs it."""
+
+    def test_ci_runs_the_release_test_suite_and_release_linters(self):
+        workflow = _workflow("ci.yml")
+        jobs = workflow["jobs"]
+        assert "release-tooling" in jobs
+        text = _run_text(jobs["release-tooling"])
+        assert "uv sync --frozen" in text
+        assert "ruff check" in text
+        assert "ruff format --check" in text
+        assert "pytest scripts/release/tests" in text
+
+    def test_quality_lints_the_whole_workflows_directory(self):
+        # The check exists but nothing invokes it is the invisible failure:
+        # assert the directory-wide form so re-narrowing to one file fails.
+        quality_text = _run_text(_workflow("ci.yml")["jobs"]["quality"])
+        lines = quality_text.splitlines()
+        assert "scripts/ci/check-action-pins.sh" in lines
+        assert '"$(go env GOPATH)/bin/actionlint"' in lines
+        assert not any(
+            line.startswith(("scripts/ci/check-action-pins.sh ", '"$(go env GOPATH)/bin/actionlint" '))
+            for line in lines
+        )
+
+    def test_ci_actions_are_sha_pinned_with_a_version_comment(self):
+        text = (WORKFLOWS / "ci.yml").read_text()
+        for line in text.splitlines():
+            if "uses:" not in line or "./" in line:
+                continue
+            assert re.search(r"uses:\s+[^@\s]+@[0-9a-f]{40}\s+#\s+.+$", line)
+
+
 class CandidateInputContractTests(unittest.TestCase):
     def test_candidate_only_accepts_a_dispatched_json_identity(self):
         workflow = _workflow("release-candidate.yml")

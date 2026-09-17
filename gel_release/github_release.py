@@ -216,6 +216,7 @@ def check_stable_merge(
     live_pr: dict,
     merge_sha: str,
     repo: Path,
+    live_snapshot: str | None = None,
 ) -> None:
     """Validate every identity boundary required before a stable merge.
 
@@ -223,7 +224,15 @@ def check_stable_merge(
     PR head. This check re-reads the live PR, the prospective merge tree, both
     Cargo version files, and the draft release before allowing the PR to merge.
     Generated distribution metadata is ignored only by ``source_equivalence``'s
-    explicit four-path allowlist.
+    explicit allowlist.
+
+    ``live_snapshot`` is the meaningful source snapshot of the live PR head,
+    computed by the caller with git against the same repository. The gate
+    workflow always supplies it, binding the head GitHub reports right now to
+    the tested snapshot. The prepared version needs no equivalent check here:
+    the record-only successor proof above already pins the live head to the
+    exact tested source and record bytes, and the Cargo checks below pin both
+    revisions to the record's plain stable version.
     """
 
     validated = candidate.validate_record(record)
@@ -274,23 +283,6 @@ def check_stable_merge(
     except source_equivalence.SourceDrift as error:
         raise ValueError(f"live PR source SHA check failed: {error}") from error
 
-    version_fields = ("prepared_version", "cargo_version", "version")
-    head = live_pr.get("head")
-    has_version = any(name in live_pr for name in version_fields) or (
-        isinstance(head, Mapping) and any(name in head for name in version_fields)
-    )
-    live_version = _prepared_version(live_pr) if has_version else None
-    if live_version is not None and live_version != validated.version:
-        raise ValueError(
-            f"live PR prepared version {live_version!r} does not match candidate "
-            f"{validated.version!r}"
-        )
-
-    snapshot_fields = ("source_snapshot", "meaningful_tree", "snapshot")
-    has_snapshot = any(name in live_pr for name in snapshot_fields) or (
-        isinstance(head, Mapping) and any(name in head for name in snapshot_fields)
-    )
-    live_snapshot = _source_snapshot(live_pr) if has_snapshot else None
     if live_snapshot is not None and live_snapshot != validated.source_snapshot:
         raise ValueError(
             f"live PR source snapshot {live_snapshot!r} does not match candidate "

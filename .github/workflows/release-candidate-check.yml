@@ -148,11 +148,15 @@ jobs:
           MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
           LIVE_PR_PATH: ${{ runner.temp }}/live-pr.json
           RECORD_PATH: ${{ runner.temp }}/record.json
+          HEAD_SHA: ${{ steps.live.outputs.head_sha }}
         run: |
           set -euo pipefail
           # check_stable_merge verifies Cargo.toml, Cargo.lock, the complete
-          # merge tree, and the draft assets through the GitHub API.
-          uv run --frozen python - "$RECORD_PATH" "$LIVE_PR_PATH" "$MERGE_SHA" <<'PY'
+          # merge tree, and the draft assets through the GitHub API. The
+          # snapshot is pure git — no toolchain — and binds the live head
+          # GitHub reports right now to the tested source snapshot.
+          snapshot="$(uv run --frozen gel-release snapshot --rev "$HEAD_SHA" --repo .)"
+          uv run --frozen python - "$RECORD_PATH" "$LIVE_PR_PATH" "$MERGE_SHA" "$snapshot" <<'PY'
           import json
           import sys
           from pathlib import Path
@@ -166,6 +170,7 @@ jobs:
               live_pr,
               sys.argv[3],
               Path.cwd(),
+              live_snapshot=sys.argv[4],
           )
           print("stable merge gate passed")
           PY

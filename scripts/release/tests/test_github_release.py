@@ -852,13 +852,19 @@ class StableMergeGateTests(unittest.TestCase):
         self._git("commit", "-qm", "merge generated metadata")
         return self._git("rev-parse", "HEAD")
 
-    def _check(self, live: dict | None = None, merge_sha: str | None = None) -> None:
+    def _check(
+        self,
+        live: dict | None = None,
+        merge_sha: str | None = None,
+        live_snapshot: str | None = None,
+    ) -> None:
         with mock.patch("gel_release.verify_draft.verify"):
             github_release.check_stable_merge(
                 self.record,
                 live or self.live,
                 merge_sha or self.staged_sha,
                 self.repo,
+                live_snapshot=live_snapshot,
             )
 
     def test_current_same_repository_generated_pr_with_verified_draft_is_accepted(self):
@@ -916,9 +922,14 @@ class StableMergeGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "phase"):
             self._check({**self.live, "labels": [{"name": "prerelease:beta"}]})
 
-    def test_prepared_version_major_mismatch_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "version|major"):
-            self._check({**self.live, "prepared_version": "8.1.0"})
+    def test_changed_live_head_snapshot_is_rejected(self):
+        # The gate computes this from the live head with git; a mismatch means
+        # the head GitHub reports no longer carries the tested source.
+        with self.assertRaisesRegex(ValueError, "snapshot"):
+            self._check(live_snapshot="f" * 64)
+
+    def test_matching_live_head_snapshot_is_accepted(self):
+        self._check(live_snapshot=self.snapshot)
 
     def test_missing_candidate_record_is_rejected(self):
         with mock.patch("gel_release.verify_draft.verify"):

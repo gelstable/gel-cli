@@ -427,6 +427,16 @@ class StableMergeWorkflowContractTests(unittest.TestCase):
                 continue
             assert re.search(r"uses:\s+[^@\s]+@[0-9a-f]{40}\s+#\s+.+$", line)
 
+    def test_stable_gate_binds_the_live_head_snapshot(self):
+        # The gate computes the live head's meaningful source snapshot (pure
+        # git, no toolchain) and threads it into check_stable_merge, so the
+        # head GitHub reports right now must match the tested snapshot. No
+        # caller-supplied version field is trusted: the record-only successor
+        # proof and the Cargo version checks already bind the version exactly.
+        text = _run_text(_workflow("release-candidate-check.yml")["jobs"]["candidate"])
+        assert "gel-release snapshot --rev" in text
+        assert "live_snapshot=" in text
+
     def test_ordinary_backport_has_safe_path_and_generated_pr_keeps_full_gate(self):
         workflow = _workflow("release-candidate-check.yml")
         text = _run_text(workflow["jobs"]["candidate"])

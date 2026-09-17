@@ -187,6 +187,42 @@ class IsolationTests(unittest.TestCase):
             self.assertNotIn(suffix, rendered)
 
 
+class LegacyReplacementsTests(unittest.TestCase):
+    """Published v7.10.x manifests use replacements instead of indexes."""
+
+    def manifest(self) -> dict:
+        return {
+            "schema_version": 1,
+            "indexes": [],
+            "replacements": [
+                {
+                    "sha256": f"{index:064x}",
+                    "url": (
+                        "https://github.com/gelstable/gel-cli/releases/download/v7.10.2/"
+                        f"gel-cli-target-{index}"
+                    ),
+                }
+                for index in range(2)
+            ],
+        }
+
+    def test_published_v7_replacements_manifest_validates(self):
+        manifest = self.manifest()
+        registry_manifest.validate_manifest(manifest)
+        from gel_release.models import ReleaseManifest
+
+        ReleaseManifest.model_validate(manifest)
+
+    def test_replacements_without_indexes_array_validates(self):
+        manifest = self.manifest()
+        del manifest["indexes"]
+        registry_manifest.validate_manifest(manifest)
+
+    def test_empty_manifest_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "indexes or replacements"):
+            registry_manifest.validate_manifest({"schema_version": 1})
+
+
 class GoldenFixtureTests(unittest.TestCase):
     def test_committed_fixture_matches_generator_output(self):
         rendered = registry_manifest.dump(

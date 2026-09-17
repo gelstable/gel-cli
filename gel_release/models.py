@@ -127,15 +127,15 @@ class GithubAsset(StrictModel):
 
 
 class ManifestVerification(StrictModel):
-    size: PositiveInt
+    size: Annotated[int, Field(strict=True, ge=0)]
     blake2b: Blake2b512
-    sha256: Sha256
+    sha256: Sha256 | None = None
 
 
 class ManifestInstallRef(StrictModel):
     ref: HttpUrl
     type: Annotated[str, Field(min_length=1)]
-    encoding: Literal["identity", "zstd"]
+    encoding: Annotated[str, Field(min_length=1)] | None = None
     verification: ManifestVerification
 
 
@@ -173,6 +173,22 @@ class ManifestIndex(StrictModel):
     packages: list[ManifestPackage]
 
 
+class Replacement(StrictModel):
+    """A legacy published artifact digest and its replacement release URL."""
+
+    sha256: Annotated[str, Field(min_length=1)]
+    url: Annotated[str, Field(min_length=1)]
+
+
 class ReleaseManifest(StrictModel):
+    # Published v7.10.x manifests carry ``replacements`` instead of ``indexes``;
+    # the vendored JSON schema blesses both shapes, so this model must too.
     schema_version: Literal[1]
-    indexes: list[ManifestIndex]
+    indexes: list[ManifestIndex] = []
+    replacements: list[Replacement] = []
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> ReleaseManifest:
+        if not self.indexes and not self.replacements:
+            raise ValueError("a release manifest must contain indexes or replacements")
+        return self

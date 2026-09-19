@@ -310,6 +310,13 @@ you want that covered before production.
   package** before `gel` and `gel-postgis` adopt the pipeline. Porting once is
   cheap; porting to two drifted copies is not.
 
+## Scope decision
+
+The preview path is in scope. The first production release is intended to be a
+beta on the v7 line before a stable `7.11.0`, so rehearsal steps 3 through 5 are
+required rather than optional, and the preview machinery must not go to
+production unrehearsed.
+
 ## Honest assessment of remaining effort
 
 Phases 1 through 4 are mechanical: roughly a day of agent work plus review, low

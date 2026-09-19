@@ -1,0 +1,364 @@
+name: Release candidate install e2e
+
+'on':
+  workflow_call:
+    inputs:
+      version:
+        description: Candidate version whose built artifacts are under test
+        required: true
+        type: string
+      build_sha:
+        description: Immutable candidate commit used for the harness checkout
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-install-e2e-${{ inputs.build_sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUST_VERSION: "1.88"
+
+jobs:
+  harness:
+    name: build install harness (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runner: ubuntu-24.04
+            exe: ""
+          - name: macos
+            runner: macos-15
+            exe: ""
+          - name: windows
+            runner: windows-2025
+            exe: .exe
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 0
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # pinned master
+        with:
+          toolchain: "1.88"
+      - name: Build the install-manager test harness
+        shell: bash
+        env:
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ inputs.build_sha }}"
+          cargo test --features install_manager_e2e --test install-manager --no-run \
+            --message-format=json > "$RUNNER_TEMP/cargo-test.json"
+          test_bin="$(jq -r '
+            select(.reason == "compiler-artifact"
+                   and .target.name == "install-manager"
+                   and (.target.kind | index("test")) != null
+                   and .executable != null)
+            | .executable' "$RUNNER_TEMP/cargo-test.json" | tail -n 1)"
+          if [[ -z "$test_bin" || "$test_bin" == null ]]; then
+            echo "no compiled install-manager test binary" >&2
+            exit 1
+          fi
+          if command -v cygpath >/dev/null 2>&1; then
+            test_bin="$(cygpath -u "$test_bin")"
+          fi
+          mkdir -p dist
+          cp "$test_bin" "dist/install-manager$EXE"
+          test -s "dist/install-manager$EXE"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: release-install-harness-${{ matrix.name }}
+          path: dist/install-manager${{ matrix.exe }}
+          if-no-files-found: error
+          retention-days: 1
+
+  prepare:
+    name: prepare candidate install bytes (${{ matrix.name }})
+    needs: harness
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            exe: ""
+          - name: macos
+            runner: macos-15
+            target: aarch64-apple-darwin
+            exe: ""
+          - name: windows
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: release-dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-harness-${{ matrix.name }}
+          path: dist
+      - name: Extract the exact candidate binary and require native packages
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ inputs.build_sha }}"
+          stem="gel-v$VERSION-$TARGET"
+          mkdir -p extracted
+          if [[ -f "release-dist/$stem.tar.gz" ]]; then
+            tar -xzf "release-dist/$stem.tar.gz" -C extracted
+            binary="extracted/$stem/gel"
+          elif [[ -f "release-dist/$stem.zip" ]]; then
+            unzip -q "release-dist/$stem.zip" -d extracted
+            binary="extracted/$stem/gel.exe"
+          else
+            echo "candidate archive for $TARGET is missing" >&2
+            exit 1
+          fi
+          test -s "$binary"
+          cp "$binary" "dist/gel$EXE"
+          test -s "dist/gel$EXE"
+          if [[ "$TARGET" == x86_64-unknown-linux-musl ]]; then
+            test -s "release-dist/gel_${VERSION}_amd64.deb"
+            test -s "release-dist/gel-${VERSION}-1.x86_64.rpm"
+            cp "release-dist/gel_${VERSION}_amd64.deb" dist/
+            cp "release-dist/gel-${VERSION}-1.x86_64.rpm" dist/
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: release-install-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  direct-linux:
+    name: direct (linux)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-linux
+          path: dist
+      - name: Run direct install scenario
+        run: scripts/ci/run-install-scenario.sh e2e_direct
+
+  direct-macos:
+    name: direct (macos)
+    needs: prepare
+    runs-on: macos-15
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-macos
+          path: dist
+      - name: Run direct install scenario
+        run: scripts/ci/run-install-scenario.sh e2e_direct
+
+  direct-windows:
+    name: direct (windows)
+    needs: prepare
+    runs-on: windows-2025
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-windows
+          path: dist
+      - name: Run direct install scenario
+        shell: bash
+        run: bash scripts/ci/run-install-scenario.sh e2e_direct
+
+  apt:
+    name: apt (ubuntu)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    env:
+      GEL_E2E_PACKAGE: dist/gel_${{ inputs.version }}_amd64.deb
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-linux
+          path: dist
+      - name: Run apt install scenario
+        run: scripts/ci/run-install-scenario.sh e2e_apt
+
+  dnf:
+    name: dnf (fedora)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    container: fedora:41
+    env:
+      GEL_E2E_PACKAGE: dist/gel-${{ inputs.version }}-1.x86_64.rpm
+    steps:
+      - name: Install container dependencies
+        run: dnf -y install git rpm tar
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-linux
+          path: dist
+      - name: Run dnf install scenario
+        run: scripts/ci/run-install-scenario.sh e2e_dnf
+
+  pacman:
+    name: pacman (arch)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - name: Install container dependencies
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-linux
+          path: dist
+      - name: Run pacman install scenario
+        run: scripts/ci/run-install-scenario.sh e2e_pacman
+
+  homebrew-linux:
+    name: homebrew (linux)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-linux
+          path: dist
+      - name: Run homebrew install scenario
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          scripts/ci/run-install-scenario.sh e2e_homebrew
+
+  homebrew-macos:
+    name: homebrew (macos)
+    needs: prepare
+    runs-on: macos-15
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-macos
+          path: dist
+      - name: Run homebrew install scenario
+        run: scripts/ci/run-install-scenario.sh e2e_homebrew
+
+  nix:
+    name: nix (linux)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-linux
+          path: dist
+      - name: Run nix install scenario
+        run: scripts/ci/run-install-scenario.sh e2e_nix
+
+  scoop:
+    name: scoop (windows)
+    needs: prepare
+    runs-on: windows-2025
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - name: Install Scoop
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          Invoke-RestMethod -Uri https://get.scoop.sh -OutFile "$env:RUNNER_TEMP\install-scoop.ps1"
+          & "$env:RUNNER_TEMP\install-scoop.ps1" -RunAsAdmin
+          "$env:USERPROFILE\scoop\shims" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-windows
+          path: dist
+      - name: Run scoop install scenario
+        shell: bash
+        run: bash scripts/ci/run-install-scenario.sh e2e_scoop
+
+  winget:
+    name: winget (windows)
+    needs: prepare
+    runs-on: windows-2025
+    env:
+      GEL_E2E_ALLOW_GLOBAL_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.build_sha }}
+          fetch-depth: 1
+      - name: Allow installs from a local manifest
+        shell: pwsh
+        run: winget settings --enable LocalManifestFiles
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-install-windows
+          path: dist
+      - name: Run winget install scenario
+        shell: bash
+        run: bash scripts/ci/run-install-scenario.sh e2e_winget

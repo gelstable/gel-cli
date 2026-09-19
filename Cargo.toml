@@ -32,6 +32,7 @@ gel-config = { version = "0.1" }
 name = "gel-cli"
 license = "MIT/Apache-2.0"
 version = "7.10.2"
+publish = false
 authors = ["Gel Data Inc. <yo@geldata.com>"]
 edition.workspace = true
 rust-version.workspace = true
@@ -175,6 +176,41 @@ wiremock = "0.6.0"
 
 [build-dependencies]
 serde_json = "1.0"
+
+[package.metadata.deb]
+name = "gel"
+maintainer = "Gelstable contributors <https://github.com/gelstable/gel-cli>"
+copyright = "Gel Data Inc. and the gelstable contributors"
+license-file = ["LICENSE-APACHE", "0"]
+extended-description = "Command-line interface for Gel (formerly EdgeDB)."
+section = "database"
+priority = "optional"
+depends = ""
+assets = [
+    ["target/RELEASE_TARGET/release/gel", "usr/bin/", "755"],
+    ["target/completions/gel.bash", "usr/share/bash-completion/completions/gel", "644"],
+    ["target/completions/_gel", "usr/share/zsh/site-functions/_gel", "644"],
+    ["target/completions/gel.fish", "usr/share/fish/vendor_completions.d/gel.fish", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/gel/LICENSE-APACHE", "644"],
+    ["LICENSE-MIT", "usr/share/doc/gel/LICENSE-MIT", "644"],
+    ["README.md", "usr/share/doc/gel/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "gel"
+summary = "Command-line interface for Gel (formerly EdgeDB)"
+license = "Apache-2.0 OR MIT"
+release = "1"
+auto-req = "no"
+assets = [
+    { source = "target/RELEASE_TARGET/release/gel", dest = "/usr/bin/gel", mode = "755" },
+    { source = "target/completions/gel.bash", dest = "/usr/share/bash-completion/completions/gel", mode = "644" },
+    { source = "target/completions/_gel", dest = "/usr/share/zsh/site-functions/_gel", mode = "644" },
+    { source = "target/completions/gel.fish", dest = "/usr/share/fish/vendor_completions.d/gel.fish", mode = "644" },
+    { source = "LICENSE-APACHE", dest = "/usr/share/doc/gel/LICENSE-APACHE", mode = "644" },
+    { source = "LICENSE-MIT", dest = "/usr/share/doc/gel/LICENSE-MIT", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/gel/README.md", mode = "644" },
+]
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = {version="0.3.10", features=["iterator"]}

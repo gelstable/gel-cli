@@ -1,0 +1,299 @@
+name: Release publish
+
+'on':
+  push:
+    branches: [release/v*.x]
+  workflow_run:
+    workflows: [Release candidate]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Publication path
+        required: true
+        type: choice
+        options: [preview, stable]
+      identity:
+        description: JSON CandidateIdentity for preview publication
+        required: false
+        type: string
+      record_path:
+        description: Candidate record path in the checked out tree
+        required: false
+        default: packaging/release-candidate.json
+        type: string
+      pr_number:
+        description: Generated release pull request number for preview publication
+        required: false
+        type: string
+      release_id:
+        description: Existing draft release id for preview publication
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Every release line participates in one publication critical section. The
+# latest decision is made only after this lock is held and immediately before
+# the release PATCH.
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.11.23"
+  RUST_VERSION: "1.88"
+
+jobs:
+  publish:
+    name: publish reviewed release
+    concurrency:
+      group: release-mutation
+      cancel-in-progress: false
+    if: >-
+      github.repository == (vars.RELEASE_REPOSITORY || 'gelstable/gel-cli') &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+      attestations: read
+      actions: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install release tooling
+        run: uv sync --frozen
+
+      - name: Publish an authorized preview
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.mode == 'preview') ||
+          (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IDENTITY_JSON: ${{ inputs.identity }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          RECORD_PATH: ${{ inputs.record_path }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- publication rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
+          # The CLI command below delegates to publish_preview; its latest
+          # comparison counterpart is should_make_latest.
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            if [[ ! "$RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              fail "expected a positive candidate run id, got '$RUN_ID'"
+            fi
+            artifact_dir="$RUNNER_TEMP/candidate-record"
+            mkdir -p "$artifact_dir"
+            gh run download "$RUN_ID" --name candidate-record --dir "$artifact_dir"
+            RECORD_PATH="$(find "$artifact_dir" -type f \( \
+              -name gel-candidate.json -o -name release-candidate.json \
+            \) -print -quit)"
+            if [[ ! -s "$RECORD_PATH" ]]; then
+              fail "no candidate record named gel-candidate.json or release-candidate.json in the candidate-record artifact of run $RUN_ID"
+            fi
+            phase="$(jq -r '.phase // empty' "$RECORD_PATH")"
+            if [[ -z "$phase" ]]; then
+              echo "successful candidate has no preview phase; stable publication waits for a line push"
+              exit 0
+            fi
+            IDENTITY_JSON="$(jq -c '{line, pr_number, base_sha, source_sha, build_sha,
+              source_snapshot, phase, version, channel: "testing"}' "$RECORD_PATH")"
+            PR_NUMBER="$(jq -r '.pr_number' "$RECORD_PATH")"
+            RELEASE_ID="$(jq -r '.draft_release_id' "$RECORD_PATH")"
+          else
+            if [[ -z "$IDENTITY_JSON" ]]; then
+              fail "preview publication needs a JSON CandidateIdentity in the identity input, got an empty value"
+            fi
+            if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+              fail "expected a positive pull request number, got '$PR_NUMBER'"
+            fi
+            if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+              fail "expected a positive draft release id, got '$RELEASE_ID'"
+            fi
+            if [[ ! -s "$RECORD_PATH" ]]; then
+              fail "expected a non-empty candidate record at $RECORD_PATH"
+            fi
+          fi
+          printf '%s' "$IDENTITY_JSON" > "$RUNNER_TEMP/identity.json"
+          phase="${phase:-$(jq -r '.phase // empty' "$RUNNER_TEMP/identity.json")}"
+          if [[ -z "$phase" ]]; then
+            echo "successful candidate has no preview phase; stable publication waits for a line push"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/live-pr.json"
+          source_sha="$(jq -r '.head.sha' "$RUNNER_TEMP/live-pr.json")"
+          head_ref="$(jq -r '.head.ref' "$RUNNER_TEMP/live-pr.json")"
+          source_tree="$RUNNER_TEMP/source-tree"
+          mkdir -p "$source_tree"
+          git fetch --no-tags origin "refs/heads/$head_ref:refs/remotes/origin/$head_ref"
+          git archive "$source_sha" | tar -x -C "$source_tree"
+          prepared_version="$(cargo metadata --locked --format-version 1 --no-deps \
+            --manifest-path "$source_tree/Cargo.toml" \
+            | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
+          source_snapshot="$(PYTHONPATH=. uv run --frozen gel-release snapshot \
+            --rev "$source_sha" --repo .)"
+          jq --arg version "$prepared_version" --arg snapshot "$source_snapshot" \
+            '.prepared_version = $version | .source_snapshot = $snapshot' \
+            "$RUNNER_TEMP/live-pr.json" > "$RUNNER_TEMP/live-pr-enriched-base.json"
+          mv "$RUNNER_TEMP/live-pr-enriched-base.json" "$RUNNER_TEMP/live-pr.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/timeline" \
+            | jq 'add' > "$RUNNER_TEMP/timeline.json"
+          test -n "$phase"
+          PYTHONPATH=. uv run --frozen gel-release phase-permissions \
+            --repo "$GITHUB_REPOSITORY" \
+            --timeline-json "$RUNNER_TEMP/timeline.json" \
+            --out "$RUNNER_TEMP/permissions.json"
+          authorized="$(PYTHONPATH=. uv run --frozen gel-release phase-authorized \
+            --timeline-json "$RUNNER_TEMP/timeline.json" --phase "$phase" \
+            --permissions-json "$RUNNER_TEMP/permissions.json")"
+          [[ "$authorized" == true ]] || {
+            echo "phase $phase was not added by an authorized maintainer" >&2
+            exit 1
+          }
+          jq --argjson timeline "$(cat "$RUNNER_TEMP/timeline.json")" \
+            --argjson permissions "$(cat "$RUNNER_TEMP/permissions.json")" \
+            '. + {timeline: $timeline, permissions: $permissions}' \
+            "$RUNNER_TEMP/live-pr.json" > "$RUNNER_TEMP/live-pr-enriched.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
+          # publish-preview invokes fetch_live_preview_pr after draft readback
+          # so the final PR, phase authorization, and source snapshot are fresh.
+          PYTHONPATH=. uv run --frozen gel-release publish-preview \
+            --identity-json "$RUNNER_TEMP/identity.json" \
+            --record "$RECORD_PATH" \
+            --live-pr-json "$RUNNER_TEMP/live-pr-enriched.json" \
+            --release-json "$RUNNER_TEMP/release.json"
+
+      - name: Find the stable candidate on a release-line push
+        id: stable
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'stable')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECORD_PATH: ${{ inputs.record_path }}
+        run: |
+          set -euo pipefail
+          fail() {
+            printf '%s\n' "$*" >&2
+            printf -- '- publication rejected: %s\n' "$*" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
+          # The CLI command below delegates to publish_stable.
+          # publish_stable performs the authenticated verify-draft check before
+          # allowing a tag or release state mutation.
+          record="$RECORD_PATH"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            record="packaging/release-candidate.json"
+          fi
+          if [[ ! -s "$record" ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "no stable candidate record on the pushed line"
+            exit 0
+          fi
+          release_id="$(jq -r '.draft_release_id' "$record")"
+          if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            fail "candidate record $record has draft_release_id '$release_id', expected a positive id"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$RUNNER_TEMP/release.json"
+          pr_number="$(jq -r '.pr_number' "$record")"
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" > "$RUNNER_TEMP/merged-pr.json"
+          jq --slurpfile merged_pr "$RUNNER_TEMP/merged-pr.json" \
+            '. + {merged_pr: $merged_pr[0]}' "$RUNNER_TEMP/release.json" \
+            > "$RUNNER_TEMP/release-with-pr.json"
+          version="$(jq -r '.version' "$record")"
+          source_sha="$(jq -r '.source_sha' "$record")"
+          merged_pr_number="$(jq -r '.merged_pr.number // empty' "$RUNNER_TEMP/release-with-pr.json")"
+          merged_pr_sha="$(jq -r '.merged_pr.merge_commit_sha // empty' "$RUNNER_TEMP/release-with-pr.json")"
+          if [[ "$merged_pr_number" == "$(jq -r '.pr_number' "$record")" && "$merged_pr_sha" == "$GITHUB_SHA" ]]; then
+            # publish_stable repeats this source-equivalence check after its
+            # record and head validation. This preflight keeps the named gate
+            # visible while allowing ordinary backport pushes to be no-ops.
+            PYTHONPATH=. uv run --frozen gel-release source-equivalence \
+              --base "$source_sha" --head "$GITHUB_SHA"
+          fi
+          PYTHONPATH=. uv run --frozen gel-release publish-stable \
+            --record "$record" --line-push-sha "$GITHUB_SHA" \
+            --release-json "$RUNNER_TEMP/release-with-pr.json"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "published candidate $version"
+          {
+            echo "## Release publish"
+            echo
+            echo "- line push: $GITHUB_SHA"
+            echo "- pull request: #$pr_number"
+            echo "- version: $version"
+            echo "- source SHA: $source_sha"
+            echo "- draft release id: $release_id"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+  cleanup-temporary-refs:
+    name: clean up temporary candidate refs
+    if: >-
+      always() && github.event_name == 'workflow_run' &&
+      needs.publish.result == 'success'
+    needs: [publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Remove the run-scoped candidate ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_REF: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          if [[ "$CANDIDATE_REF" == gel-release-candidate/* ]]; then
+            gh api -X DELETE \
+              "/repos/$GITHUB_REPOSITORY/git/refs/heads/$CANDIDATE_REF" \
+              >/dev/null || echo "candidate ref already removed: $CANDIDATE_REF"
+          fi
+
+      - name: Remove the derived preview ref after publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/candidate-record"
+          mkdir -p "$artifact_dir"
+          if ! gh run download "$RUN_ID" --name candidate-record --dir "$artifact_dir"; then
+            echo "candidate record artifact unavailable; no preview ref to remove"
+            exit 0
+          fi
+          record="$(find "$artifact_dir" -type f -name gel-candidate.json -print -quit)"
+          if [[ -z "$record" || ! -s "$record" ]]; then
+            echo "stable candidate has no derived preview ref"
+            exit 0
+          fi
+          line="$(jq -r '.line' "$record")"
+          tag="v$(jq -r '.version' "$record")"
+          build_sha="$(jq -r '.build_sha' "$record")"
+          preview_line="${line//\//-}"
+          preview_ref="gel-preview-build/$preview_line/$tag/$build_sha"
+          gh api -X DELETE \
+            "/repos/$GITHUB_REPOSITORY/git/refs/heads/$preview_ref" \
+            >/dev/null || echo "preview ref already removed: $preview_ref"

@@ -28,21 +28,29 @@ Description: gel CLI install-manager e2e fixture
 ";
 
 pub fn run() {
-    let privilege =
-        match unix_package::precheck(&["dpkg-deb", "dpkg", "dpkg-query"], PackageQuery::Dpkg) {
-            Ok(privilege) => privilege,
-            Err(reason) => {
-                eprintln!("skipping: {reason}");
-                return;
-            }
-        };
-    let scenario = AptScenario::new(privilege).expect("prepare the apt scenario");
+    let package = std::env::var_os("GEL_E2E_PACKAGE").map(PathBuf::from);
+    let tools: &[&str] = if package.is_some() {
+        &["dpkg", "dpkg-query"]
+    } else {
+        &["dpkg-deb", "dpkg", "dpkg-query"]
+    };
+    let privilege = match unix_package::precheck(tools, PackageQuery::Dpkg) {
+        Ok(privilege) => privilege,
+        Err(reason) => {
+            eprintln!("skipping: {reason}");
+            return;
+        }
+    };
+    let scenario = AptScenario::new(privilege, package).expect("prepare the apt scenario");
     scenario::assert_managed(&scenario);
 }
 
 pub struct AptScenario {
     root: tempfile::TempDir,
     privilege: Privilege,
+    /// When set by CI, install this exact release `.deb` instead of building a
+    /// fixture package around the extracted candidate binary.
+    package: Option<PathBuf>,
     /// Set immediately before `dpkg -i` runs, so cleanup can tell "the install
     /// never got that far" from "the install ran". Without it, every failure
     /// while *building* the package would also print a confusing `dpkg -r gel`
@@ -57,10 +65,11 @@ pub struct AptScenario {
 }
 
 impl AptScenario {
-    fn new(privilege: Privilege) -> anyhow::Result<AptScenario> {
+    fn new(privilege: Privilege, package: Option<PathBuf>) -> anyhow::Result<AptScenario> {
         Ok(AptScenario {
             root: tempfile::Builder::new().prefix("gel-e2e-apt-").tempdir()?,
             privilege,
+            package,
             attempted: AtomicBool::new(false),
         })
     }
@@ -72,6 +81,25 @@ impl Scenario for AptScenario {
     }
 
     fn install(&self, source: &Path) -> anyhow::Result<PathBuf> {
+        if let Some(package) = &self.package {
+            anyhow::ensure!(
+                package.is_file(),
+                "configured release package does not exist: {}",
+                package.display(),
+            );
+            self.attempted.store(true, Ordering::SeqCst);
+            scenario::checked(
+                self.privilege.command("dpkg").arg("-i").arg(package),
+                "`dpkg -i` release package",
+            )?;
+            let installed = unix_package::installed_system_bin()?;
+            anyhow::ensure!(
+                scenario::blake2b_hex(&installed) == scenario::blake2b_hex(source),
+                "the release .deb installed bytes different from the candidate archive",
+            );
+            return Ok(installed);
+        }
+
         let pkg = self.root.path().join("pkg");
         // `stage_binary` names the copy `gel` and marks it 0755, which is
         // exactly the file `dpkg-deb` has to find under `usr/bin`.

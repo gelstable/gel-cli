@@ -71,8 +71,8 @@ jobs:
           # GITHUB_SHA is the older commit and the live PR head is the newer one;
           # passing here would record a result on a commit that was never
           # verified. Fail instead: the push that moved the branch fires
-          # pull_request/synchronize (the release bot token is a PAT or App
-          # token), and the controller re-dispatches the gate on the new head,
+          # pull_request/synchronize under the release App installation token,
+          # and the controller re-dispatches the gate on the new head,
           # so the fresh commit gets its own run.
           if [[ "$GITHUB_SHA" != "$HEAD_SHA" ]]; then
             fail "dispatched ref resolved to $GITHUB_SHA but the live head of $HEAD_REF is $HEAD_SHA; dispatch the gate again on the current head"

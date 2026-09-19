@@ -759,28 +759,26 @@ jobs:
       pull-requests: read
       actions: write
     steps:
-      - name: Require the release bot token
-        env:
-          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
-        run: |
-          set -euo pipefail
-          # The record push below must fire pull_request/synchronize so the
-          # required stable merge gate re-runs on the new head. GITHUB_TOKEN
-          # pushes never fire workflow events, so falling back to it would
-          # produce a release PR that can never become mergeable. Fail here
-          # instead of silently selecting that configuration.
-          if [[ -z "$RELEASE_BOT_TOKEN" ]]; then
-            echo "RELEASE_BOT_TOKEN is not configured; it must be a PAT or GitHub App token whose pushes trigger workflow events" >&2
-            printf -- '- candidate rejected: RELEASE_BOT_TOKEN is not configured\n' \
-              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-            exit 1
-          fi
+      # The record push must fire pull_request/synchronize so the required
+      # stable merge gate re-runs on the new head. GITHUB_TOKEN pushes never
+      # fire workflow events; minting must succeed rather than falling back to
+      # a token that leaves the release PR permanently unmergeable.
+      - name: Mint release App token
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.GEL_RELEASER_APP_ID }}
+          private-key: ${{ secrets.GEL_RELEASER_KEY }}
+          permission-actions: write
+          permission-contents: write
+          permission-metadata: read
+          permission-pull-requests: read
 
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           ref: ${{ needs.identity.outputs.build_sha }}
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+          token: ${{ steps.release-token.outputs.token }}
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -788,7 +786,7 @@ jobs:
           path: packaging
       - name: Recheck the live PR before committing metadata
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
           EXPECTED_SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
           EXPECTED_BASE_SHA: ${{ needs.plan.outputs.base_sha }}
@@ -825,7 +823,7 @@ jobs:
 
       - name: Push the stable record to the exact live PR head
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
           SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
           IDENTITY_JSON: ${{ needs.plan.outputs.identity }}
@@ -887,7 +885,7 @@ jobs:
 
       - name: Require the stable merge gate on the record head
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
         run: |
           set -euo pipefail
@@ -901,7 +899,7 @@ jobs:
           # If that branch moves between this dispatch and the run starting,
           # the gate refuses to pass: it compares GITHUB_SHA against the live
           # PR head and fails when they differ. The newer push fires
-          # pull_request/synchronize under the release bot token, and the
+          # pull_request/synchronize under the release App token, and the
           # controller re-dispatches on the new head, so the current commit
           # always gets its own run without needing a lock here.
           head_ref="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.head.ref')"
@@ -927,9 +925,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Mint release App token
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.GEL_RELEASER_APP_ID }}
+          private-key: ${{ secrets.GEL_RELEASER_KEY }}
+          permission-contents: write
+          permission-metadata: read
+
       - name: Remove candidate and preview refs
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           CANDIDATE_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail

@@ -27,11 +27,22 @@ jobs:
     env:
       BASE_REF: ${{ github.event.client_payload.base_ref || github.event.client_payload.line || github.ref_name }}
     steps:
+      - name: Mint release App token
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.GEL_RELEASER_APP_ID }}
+          private-key: ${{ secrets.GEL_RELEASER_KEY }}
+          permission-actions: write
+          permission-contents: write
+          permission-metadata: read
+          permission-pull-requests: write
+
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           fetch-depth: 0
           ref: ${{ github.event.client_payload.base_ref || github.event.client_payload.line || github.ref_name }}
-          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+          token: ${{ steps.release-token.outputs.token }}
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -81,7 +92,7 @@ jobs:
         if: steps.changes.outputs.pending == 'true'
         id: prepared
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: |
           set -euo pipefail
           major="${{ steps.changes.outputs.major }}"
@@ -160,7 +171,7 @@ jobs:
         if: steps.changes.outputs.pending == 'true'
         id: pr
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           VERSION: ${{ steps.prepared.outputs.version }}
           HEAD_REF: ${{ steps.prepared.outputs.head_ref }}
         run: |
@@ -192,12 +203,12 @@ jobs:
       - name: Dispatch the release controller
         if: steps.changes.outputs.pending == 'true'
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
-          # The bot token push does not trigger another workflow. Dispatch the
-          # controller explicitly after the PR has been created or refreshed.
+          # Dispatch explicitly after creation or refresh: the first generated
+          # branch push precedes its PR, so there is no synchronize event yet.
           gh workflow run release-controller.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref "$CONTROLLER_REF" \

@@ -143,14 +143,16 @@ an unpublished draft with the same tag, line, and generated PR is replaced
 when its source identity is stale; published tags and releases remain
 immutable.
 
-Release automation token
-------------------------
+Release GitHub App
+------------------
 
-The release workflows authenticate as `secrets.RELEASE_BOT_TOKEN`. It must be a
-personal access token or a GitHub App installation token with write access to
-contents, pull requests, and actions on this repository. The default
-`GITHUB_TOKEN` is not a valid substitute and the workflows no longer fall back
-to it.
+The release workflows mint a fresh `gelstable-releaser` installation token in
+every job that needs the release identity. They read the App ID from
+`vars.GEL_RELEASER_APP_ID` and its private key from
+`secrets.GEL_RELEASER_KEY`, then down-scope each token to that job's API
+operations. See `.github/release-app.md` for the App configuration,
+installation, and key-management procedure. The default `GITHUB_TOKEN` is not
+a valid substitute and the workflows never fall back to it.
 
 The reason is event delivery, not permissions. Candidate staging pushes
 `packaging/release-candidate.json` onto the generated `knope/release-vN.x`
@@ -158,8 +160,8 @@ head, and branch protection requires the `Release candidate check / stable
 merge gate` context to pass on that new head commit. Pushes made with
 `GITHUB_TOKEN` never trigger workflow events, so no `pull_request`
 `synchronize` run would start for the commit the branch rule evaluates, and
-the release PR could never become mergeable. A PAT or App token fires the
-event normally.
+the release PR could never become mergeable. An App installation token fires
+the event normally.
 
 The workflows also dispatch the gate explicitly on the generated head branch
 after pushing the record. A `workflow_dispatch` check run attaches to the head
@@ -169,15 +171,16 @@ moves between the dispatch and the run, the gate compares `GITHUB_SHA` with
 the live PR head and fails rather than reporting a result for a commit it did
 not verify; the push that moved the branch starts a fresh run of its own.
 
-With the secret unset, the controller and the candidate commit job fail on
-their first step with an explicit message instead of proceeding into a
+If the App ID, private key, installation, or requested permission is missing,
+the job fails while minting its token instead of proceeding into a
 configuration that cannot merge.
 
 The pipelines can also run against another repository, such as a rehearsal
 scratch repo. Set that repository's `RELEASE_REPOSITORY` variable to its
-owner/name so the workflow guards pass, and provide the same
-`RELEASE_BOT_TOKEN` secret there. Every API call reads the operating
-repository from the runner environment, so nothing else needs overriding.
+owner/name so the workflow guards pass, install `gelstable-releaser`, and add
+the repository to the selected scopes of `GEL_RELEASER_APP_ID` and
+`GEL_RELEASER_KEY`. Every API call reads the operating repository from the
+runner environment, so nothing else needs overriding.
 
 Stable merge and publication
 ----------------------------

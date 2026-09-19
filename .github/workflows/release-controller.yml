@@ -52,27 +52,27 @@ jobs:
       version: ${{ steps.identity.outputs.version }}
       build_sha: ${{ steps.identity.outputs.build_sha }}
     steps:
-      - name: Require the release bot token
-        env:
-          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
-        run: |
-          set -euo pipefail
-          # The pipeline depends on pushes made by this token firing workflow
-          # events: the generated PR head must re-run the required stable merge
-          # gate. GITHUB_TOKEN pushes never fire events, so falling back to it
-          # silently produces a release PR that can never become mergeable.
-          if [[ -z "$RELEASE_BOT_TOKEN" ]]; then
-            echo "RELEASE_BOT_TOKEN is not configured; it must be a PAT or GitHub App token whose pushes trigger workflow events" >&2
-            printf -- '- release rejected: RELEASE_BOT_TOKEN is not configured\n' \
-              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-            exit 1
-          fi
+      # The pipeline depends on these pushes firing workflow events so the
+      # generated PR head re-runs its required stable merge gate. GITHUB_TOKEN
+      # pushes never fire workflow events; minting must succeed rather than
+      # falling back to a token that leaves the PR permanently unmergeable.
+      - name: Mint release App token
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.GEL_RELEASER_APP_ID }}
+          private-key: ${{ secrets.GEL_RELEASER_KEY }}
+          permission-actions: write
+          permission-contents: write
+          permission-issues: read
+          permission-metadata: read
+          permission-pull-requests: read
 
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           fetch-depth: 0
           ref: ${{ env.CONTROLLER_REF }}
-          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+          token: ${{ steps.release-token.outputs.token }}
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -93,7 +93,7 @@ jobs:
           INPUT_LINE: ${{ inputs.line }}
           DISPATCH_PR: ${{ github.event.client_payload.pr }}
           DISPATCH_LINE: ${{ github.event.client_payload.base_ref || github.event.client_payload.line }}
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: |
           set -euo pipefail
           fail() {
@@ -127,7 +127,7 @@ jobs:
       - name: Fetch the live pull request
         id: live
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           PR_NUMBER: ${{ steps.request.outputs.number }}
         run: |
           set -euo pipefail
@@ -220,7 +220,7 @@ jobs:
       - name: Read published tags and release records
         if: steps.classify.outputs.should_run == 'true'
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: |
           set -euo pipefail
           gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
@@ -232,7 +232,7 @@ jobs:
       - name: Read published preview candidate records
         if: steps.classify.outputs.should_run == 'true'
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: |
           set -euo pipefail
           while IFS=$'\t' read -r release_id asset_id; do
@@ -253,7 +253,7 @@ jobs:
       - name: Verify the active phase was authorized by a maintainer
         if: steps.classify.outputs.should_run == 'true' && steps.source.outputs.version != ''
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           PR_NUMBER: ${{ steps.request.outputs.number }}
         run: |
           set -euo pipefail
@@ -285,7 +285,7 @@ jobs:
         if: steps.classify.outputs.should_run == 'true'
         id: identity
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: |
           set -euo pipefail
           uv run --frozen gel-release resolve-candidate \
@@ -325,7 +325,7 @@ jobs:
               # starting, the gate compares GITHUB_SHA against the live PR head
               # and fails rather than reporting a result for a commit it did not
               # verify. The push that moved the branch fires
-              # pull_request/synchronize under the release bot token, so the new
+              # pull_request/synchronize under the release App token, so the new
               # head still gets its own run; no lock is needed here.
               gh workflow run release-candidate-check.yml \
                 --repo "$GITHUB_REPOSITORY" \
@@ -363,7 +363,7 @@ jobs:
       - name: Recheck the live pull request before deriving or dispatching
         if: steps.classify.outputs.should_run == 'true' && steps.identity.outputs.identity != ''
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           PR_NUMBER: ${{ steps.request.outputs.number }}
           EXPECTED_BASE_SHA: ${{ fromJSON(steps.identity.outputs.identity).base_sha }}
           EXPECTED_SOURCE_SHA: ${{ fromJSON(steps.identity.outputs.identity).source_sha }}
@@ -409,7 +409,7 @@ jobs:
         if: steps.classify.outputs.should_run == 'true' && steps.identity.outputs.identity != '' && fromJSON(steps.identity.outputs.identity).phase != null
         id: preview
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           LINE: ${{ fromJSON(steps.identity.outputs.identity).line }}
           TAG: v${{ fromJSON(steps.identity.outputs.identity).version }}
           SOURCE_SHA: ${{ fromJSON(steps.identity.outputs.identity).source_sha }}
@@ -430,7 +430,7 @@ jobs:
         if: steps.classify.outputs.should_run == 'true' && steps.identity.outputs.identity != ''
         id: dispatch
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: |
           set -euo pipefail
           # A workflow_dispatch run's GITHUB_SHA comes from its ref, not from
@@ -445,7 +445,7 @@ jobs:
       - name: Dispatch immutable candidate staging
         if: steps.classify.outputs.should_run == 'true' && steps.identity.outputs.identity != ''
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           DISPATCH_REF: ${{ steps.dispatch.outputs.candidate_ref }}
         run: |
           set -euo pipefail

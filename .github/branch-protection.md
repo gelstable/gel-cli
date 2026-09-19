@@ -39,8 +39,8 @@ that PR. A candidate record change on an ordinary backport fails the check.
 
 Do not allow bypassing the required status check, including for repository
 administrators or release automation. Disable force pushes and branch
-deletion for `master` and active release lines. The release bot may update its
-generated `knope/release-vN.x` branch through the workflow's narrowly scoped
+deletion for `master` and active release lines. The release App may update its
+generated `knope/release-vN.x` branch through a narrowly scoped installation
 token; that generated branch is not a protected release line and is never a
 substitute for the required check on `release/vN.x`.
 
@@ -51,13 +51,13 @@ Candidate staging pushes the reviewed record onto the generated
 on that commit. Two things make the check appear there.
 
 First, the push itself must fire a `pull_request` `synchronize` event.
-`secrets.RELEASE_BOT_TOKEN` must therefore be a personal access token or a
-GitHub App installation token with write access to contents, pull requests,
-and actions. The default `GITHUB_TOKEN` cannot be used: pushes authenticated
-with it never trigger workflow events, so the required check would never start
-on the new head and the release PR could never satisfy branch protection. The
-workflows fail on their first step when the secret is missing rather than
-falling back to `GITHUB_TOKEN`.
+Each mutating job therefore mints a `gelstable-releaser` installation token
+from `vars.GEL_RELEASER_APP_ID` and `secrets.GEL_RELEASER_KEY`, down-scoped to
+the permissions that job needs. The default `GITHUB_TOKEN` cannot be used:
+pushes authenticated with it never trigger workflow events, so the required
+check would never start on the new head and the release PR could never satisfy
+branch protection. The mint step fails if the App configuration or requested
+permissions are unavailable rather than falling back to `GITHUB_TOKEN`.
 
 Second, the controller and the candidate commit job dispatch
 `release-candidate-check.yml` on the generated head branch, never on a fixed

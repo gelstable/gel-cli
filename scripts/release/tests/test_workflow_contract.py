@@ -19,6 +19,8 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 README = REPO_ROOT / "README.md"
 BRANCH_PROTECTION = REPO_ROOT / ".github" / "branch-protection.md"
 SHA = re.compile(r"^[0-9a-f]{40}$")
+CREATE_APP_TOKEN = "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1"
+RELEASE_TOKEN = "${{ steps.release-token.outputs.token }}"
 
 
 def _workflow(name: str) -> dict:
@@ -73,6 +75,90 @@ class ContinuousIntegrationContractTests(unittest.TestCase):
             if "uses:" not in line or "./" in line:
                 continue
             assert re.search(r"uses:\s+[^@\s]+@[0-9a-f]{40}\s+#\s+.+$", line)
+
+
+class ReleaseAppAuthenticationContractTests(unittest.TestCase):
+    """Every privileged job gets its own least-privilege installation token."""
+
+    expected_permissions = {
+        ("release-pr.yml", "prepare"): {
+            "permission-actions": "write",
+            "permission-contents": "write",
+            "permission-metadata": "read",
+            "permission-pull-requests": "write",
+        },
+        ("release-controller.yml", "resolve"): {
+            "permission-actions": "write",
+            "permission-contents": "write",
+            "permission-issues": "read",
+            "permission-metadata": "read",
+            "permission-pull-requests": "read",
+        },
+        ("release-candidate.yml", "commit-stable"): {
+            "permission-actions": "write",
+            "permission-contents": "write",
+            "permission-metadata": "read",
+            "permission-pull-requests": "read",
+        },
+        ("release-candidate.yml", "cleanup-temporary-refs"): {
+            "permission-contents": "write",
+            "permission-metadata": "read",
+        },
+    }
+
+    def test_privileged_jobs_mint_fresh_minimally_scoped_app_tokens(self):
+        for (workflow_name, job_name), expected_permissions in self.expected_permissions.items():
+            with self.subTest(workflow=workflow_name, job=job_name):
+                job = _workflow(workflow_name)["jobs"][job_name]
+                mint_steps = [step for step in _steps(job) if step.get("uses") == CREATE_APP_TOKEN]
+                self.assertEqual(len(mint_steps), 1)
+                mint = mint_steps[0]
+                self.assertEqual(mint.get("id"), "release-token")
+                inputs = mint.get("with", {})
+                self.assertEqual(inputs.get("app-id"), "${{ vars.GEL_RELEASER_APP_ID }}")
+                self.assertEqual(inputs.get("private-key"), "${{ secrets.GEL_RELEASER_KEY }}")
+                permissions = {
+                    key: value for key, value in inputs.items() if key.startswith("permission-")
+                }
+                self.assertEqual(permissions, expected_permissions)
+
+    def test_app_token_is_consumed_only_as_checkout_or_gh_authentication(self):
+        def token_paths(value: object, path: tuple[object, ...] = ()) -> list[tuple[object, ...]]:
+            if value == RELEASE_TOKEN:
+                return [path]
+            if isinstance(value, dict):
+                return [
+                    found
+                    for key, child in value.items()
+                    for found in token_paths(child, (*path, key))
+                ]
+            if isinstance(value, list):
+                return [
+                    found
+                    for index, child in enumerate(value)
+                    for found in token_paths(child, (*path, index))
+                ]
+            return []
+
+        for workflow_name, job_name in self.expected_permissions:
+            with self.subTest(workflow=workflow_name, job=job_name):
+                job = _workflow(workflow_name)["jobs"][job_name]
+                paths = token_paths(job)
+                self.assertTrue(paths)
+                for path in paths:
+                    self.assertEqual(path[0], "steps")
+                    self.assertIn(path[-2:], (("with", "token"), ("env", "GH_TOKEN")))
+
+    def test_personal_access_token_configuration_is_gone(self):
+        for name in (
+            "release-candidate.yml",
+            "release-controller.yml",
+            "release-pr.yml",
+        ):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text()
+                self.assertNotIn("RELEASE_BOT", text)
+                self.assertNotIn("secrets.RELEASE_BOT_TOKEN", text)
 
 
 class ControllerTriggerContractTests(unittest.TestCase):
@@ -501,21 +587,12 @@ class StableMergeWorkflowContractTests(unittest.TestCase):
 
     def test_event_firing_token_has_no_default_token_fallback(self):
         """`GITHUB_TOKEN` pushes fire no events, so the gate would never run."""
-        for name in ("release-candidate.yml", "release-controller.yml", "release-pr.yml"):
+        for name in ("release-candidate.yml", "release-controller.yml"):
             text = (WORKFLOWS / name).read_text()
             with self.subTest(workflow=name):
-                assert "RELEASE_BOT_TOKEN" in text
-                assert "RELEASE_BOT_TOKEN || github.token" not in text
-
-        for name, job in (
-            ("release-candidate.yml", "commit-stable"),
-            ("release-controller.yml", "resolve"),
-        ):
-            steps = _steps(_workflow(name)["jobs"][job])
-            with self.subTest(workflow=name):
-                assert "RELEASE_BOT_TOKEN is not configured" in "\n".join(
-                    str(step.get("run", "")) for step in steps
-                )
+                assert "GITHUB_TOKEN" in text
+                assert "workflow events" in text
+                assert "|| github.token" not in text
 
     def test_controller_and_candidate_report_selection_to_operators(self):
         controller = _run_text(_workflow("release-controller.yml")["jobs"]["resolve"])

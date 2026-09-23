@@ -105,10 +105,18 @@ Manifest documents use `schema_version = 1` and identify each package index with
       "channel": "stable",
       "platform": "x86_64-unknown-linux-gnu",
       "ref": "indexes/stable-x86_64-unknown-linux-gnu.json"
+    },
+    {
+      "channel": "testing",
+      "platform": "x86_64-unknown-linux-gnu",
+      "ref": "indexes/testing-x86_64-unknown-linux-gnu.json"
     }
   ]
 }
 ```
+
+The `testing` entry is selected explicitly by its `channel` field; a client
+does not infer a channel from a package version or an index filename.
 
 Index references may be absolute HTTP(S) or `file://` URLs, root-relative or
 document-relative URLs for HTTP manifests, or paths relative to local manifest

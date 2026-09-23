@@ -1,0 +1,240 @@
+{
+  "schema_version": 1,
+  "indexes": [
+    {
+      "channel": "stable",
+      "platform": "x86_64-unknown-linux-musl",
+      "packages": [
+        {
+          "basename": "gel-cli",
+          "name": "gel-cli",
+          "version": "1.2.3",
+          "version_details": {
+            "major": 1,
+            "minor": 2,
+            "patch": 3,
+            "prerelease": [],
+            "metadata": {}
+          },
+          "version_key": "1.2.3",
+          "revision": "1",
+          "build_date": "2026-09-12T00:00:00+00:00",
+          "architecture": "x86_64",
+          "slot": "",
+          "installref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-x86_64-unknown-linux-musl.zst",
+          "installrefs": [
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-x86_64-unknown-linux-musl",
+              "type": "application/x-pie-executable",
+              "encoding": "identity",
+              "verification": {
+                "size": 1000,
+                "blake2b": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            },
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-x86_64-unknown-linux-musl.zst",
+              "type": "application/x-pie-executable",
+              "encoding": "zstd",
+              "verification": {
+                "size": 500,
+                "blake2b": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a",
+                "sha256": "000000000000000000000000000000000000000000000000000000000000000a"
+              }
+            }
+          ],
+          "tags": {}
+        }
+      ]
+    },
+    {
+      "channel": "stable",
+      "platform": "aarch64-unknown-linux-musl",
+      "packages": [
+        {
+          "basename": "gel-cli",
+          "name": "gel-cli",
+          "version": "1.2.3",
+          "version_details": {
+            "major": 1,
+            "minor": 2,
+            "patch": 3,
+            "prerelease": [],
+            "metadata": {}
+          },
+          "version_key": "1.2.3",
+          "revision": "1",
+          "build_date": "2026-09-12T00:00:00+00:00",
+          "architecture": "aarch64",
+          "slot": "",
+          "installref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-aarch64-unknown-linux-musl.zst",
+          "installrefs": [
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-aarch64-unknown-linux-musl",
+              "type": "application/x-pie-executable",
+              "encoding": "identity",
+              "verification": {
+                "size": 1001,
+                "blake2b": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000001"
+              }
+            },
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-aarch64-unknown-linux-musl.zst",
+              "type": "application/x-pie-executable",
+              "encoding": "zstd",
+              "verification": {
+                "size": 501,
+                "blake2b": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b",
+                "sha256": "000000000000000000000000000000000000000000000000000000000000000b"
+              }
+            }
+          ],
+          "tags": {}
+        }
+      ]
+    },
+    {
+      "channel": "stable",
+      "platform": "aarch64-apple-darwin",
+      "packages": [
+        {
+          "basename": "gel-cli",
+          "name": "gel-cli",
+          "version": "1.2.3",
+          "version_details": {
+            "major": 1,
+            "minor": 2,
+            "patch": 3,
+            "prerelease": [],
+            "metadata": {}
+          },
+          "version_key": "1.2.3",
+          "revision": "1",
+          "build_date": "2026-09-12T00:00:00+00:00",
+          "architecture": "aarch64",
+          "slot": "",
+          "installref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-aarch64-apple-darwin.zst",
+          "installrefs": [
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-aarch64-apple-darwin",
+              "type": "application/x-mach-binary",
+              "encoding": "identity",
+              "verification": {
+                "size": 1002,
+                "blake2b": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+              }
+            },
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-aarch64-apple-darwin.zst",
+              "type": "application/x-mach-binary",
+              "encoding": "zstd",
+              "verification": {
+                "size": 502,
+                "blake2b": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c",
+                "sha256": "000000000000000000000000000000000000000000000000000000000000000c"
+              }
+            }
+          ],
+          "tags": {}
+        }
+      ]
+    },
+    {
+      "channel": "stable",
+      "platform": "x86_64-pc-windows-msvc",
+      "packages": [
+        {
+          "basename": "gel-cli",
+          "name": "gel-cli",
+          "version": "1.2.3",
+          "version_details": {
+            "major": 1,
+            "minor": 2,
+            "patch": 3,
+            "prerelease": [],
+            "metadata": {}
+          },
+          "version_key": "1.2.3",
+          "revision": "1",
+          "build_date": "2026-09-12T00:00:00+00:00",
+          "architecture": "x86_64",
+          "slot": "",
+          "installref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-x86_64-pc-windows-msvc.exe.zst",
+          "installrefs": [
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-x86_64-pc-windows-msvc.exe",
+              "type": "application/x-dosexec",
+              "encoding": "identity",
+              "verification": {
+                "size": 1003,
+                "blake2b": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000003"
+              }
+            },
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-x86_64-pc-windows-msvc.exe.zst",
+              "type": "application/x-dosexec",
+              "encoding": "zstd",
+              "verification": {
+                "size": 503,
+                "blake2b": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000d",
+                "sha256": "000000000000000000000000000000000000000000000000000000000000000d"
+              }
+            }
+          ],
+          "tags": {}
+        }
+      ]
+    },
+    {
+      "channel": "stable",
+      "platform": "aarch64-pc-windows-msvc",
+      "packages": [
+        {
+          "basename": "gel-cli",
+          "name": "gel-cli",
+          "version": "1.2.3",
+          "version_details": {
+            "major": 1,
+            "minor": 2,
+            "patch": 3,
+            "prerelease": [],
+            "metadata": {}
+          },
+          "version_key": "1.2.3",
+          "revision": "1",
+          "build_date": "2026-09-12T00:00:00+00:00",
+          "architecture": "aarch64",
+          "slot": "",
+          "installref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-aarch64-pc-windows-msvc.exe.zst",
+          "installrefs": [
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-aarch64-pc-windows-msvc.exe",
+              "type": "application/x-dosexec",
+              "encoding": "identity",
+              "verification": {
+                "size": 1004,
+                "blake2b": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000004"
+              }
+            },
+            {
+              "ref": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-aarch64-pc-windows-msvc.exe.zst",
+              "type": "application/x-dosexec",
+              "encoding": "zstd",
+              "verification": {
+                "size": 504,
+                "blake2b": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e",
+                "sha256": "000000000000000000000000000000000000000000000000000000000000000e"
+              }
+            }
+          ],
+          "tags": {}
+        }
+      ]
+    }
+  ]
+}

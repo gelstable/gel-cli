@@ -11,11 +11,13 @@ repository-specific part. A release manager needs write access to the repo.
    target_commitish=<branch> --jq .body`. Edit that draft for users and copy it
    into the changelog before merging. Check that normal CI passes. Merge the PR.
 
-2. **Build.** In Actions, select **Release**, choose the branch containing that
-   merge, and click **Run workflow**. This repository reads `Cargo.toml`, builds
-   all targets, packages archives and native packages, tests the built binaries
-   and install managers, and creates a draft release. A run for an existing tag
-   or published release fails before building.
+2. **Build.** Merging the version-changing PR starts **Release** on that exact
+   merge commit. Changes to `Cargo.toml` that leave the version unchanged do
+   not start a build. This repository builds all targets, packages archives
+   and native packages, tests the built binaries and install managers, and
+   creates a draft release. A run for an existing tag or published release
+   fails before building. The **Run workflow** button is available for a
+   deliberate manual build or retry; select the branch you want to build.
 
 3. **Review.** Open the draft for `vX.Y.Z`. Check its target commit, asset list,
    checksums, prerelease setting, and generated notes. Edit the notes to match
@@ -34,6 +36,9 @@ repository-specific part. A release manager needs write access to the repo.
    `X.Y.Z-rc.1` in the Release PR; the workflow marks its draft as a prerelease.
    For an older major, cut `release/N.x` from the last suitable commit, cherry-pick
    fixes into PRs against that branch, then prepare and run the release there.
-   If a run fails, fix the cause on the branch and rerun. A rerun replaces an
-   unpublished draft for the same tag; delete a stale draft manually if needed.
+   If a run fails transiently, re-run that workflow run to use its original
+   commit. If fixing it needs a new commit without another version change,
+   run **Release** manually on the updated branch. A successful run replaces
+   an unpublished draft for the same tag; delete a stale draft manually if
+   needed.
    Once a release is published, choose a new version for any further changes.

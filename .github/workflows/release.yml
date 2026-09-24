@@ -2,6 +2,12 @@ name: Release
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - master
+      - 'release/*'
+    paths:
+      - Cargo.toml
 
 permissions:
   contents: read
@@ -21,6 +27,7 @@ jobs:
     name: validate release
     runs-on: ubuntu-24.04
     outputs:
+      release: ${{ steps.plan.outputs.release }}
       version: ${{ steps.plan.outputs.version }}
       channel: ${{ steps.plan.outputs.channel }}
       build_date: ${{ steps.plan.outputs.build_date }}
@@ -39,9 +46,29 @@ jobs:
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           version="$(uv run --frozen python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          {
+            echo "version=$version"
+            echo "build_matrix=$(PYTHONPATH=. uv run --frozen gel-release matrix build)"
+            echo "smoke_matrix=$(PYTHONPATH=. uv run --frozen gel-release matrix smoke)"
+          } >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "New branch; waiting for a version-changing PR"
+              exit 0
+            fi
+            previous="$(git show "$BEFORE_SHA:Cargo.toml" |
+              uv run --frozen python -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')"
+            if [[ "$version" == "$previous" ]]; then
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "Version remains $version; no release build needed"
+              exit 0
+            fi
+          fi
           locked_version="$(cargo metadata --locked --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
           test "$version" = "$locked_version"
           channel="$(PYTHONPATH=. uv run --frozen gel-release channel --version "$version")"
@@ -55,15 +82,14 @@ jobs:
             exit 1
           fi
           {
-            echo "version=$version"
+            echo "release=true"
             echo "channel=$channel"
             echo "build_date=$(git show -s --format=%cI "$GITHUB_SHA")"
-            echo "build_matrix=$(PYTHONPATH=. uv run --frozen gel-release matrix build)"
-            echo "smoke_matrix=$(PYTHONPATH=. uv run --frozen gel-release matrix smoke)"
           } >> "$GITHUB_OUTPUT"
 
   completions:
     needs: plan
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -95,6 +121,7 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     needs: [plan, completions]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -165,6 +192,7 @@ jobs:
   smoke:
     name: smoke (${{ matrix.target }})
     needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -196,6 +224,7 @@ jobs:
   install:
     name: install manager matrix
     needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
     uses: ./.github/workflows/release-install-e2e.yml
     with:
       version: ${{ needs.plan.outputs.version }}
@@ -204,6 +233,7 @@ jobs:
   draft:
     name: assemble and create draft
     needs: [plan, build, smoke, install]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write # GitHub requires write access to list and replace drafts.

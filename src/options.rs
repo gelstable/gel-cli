@@ -396,6 +396,23 @@ impl ConnectionOptions {
     }
 }
 
+fn has_explicit_target_env(is_set: impl Fn(&str) -> bool) -> bool {
+    [
+        "GEL_DSN",
+        "EDGEDB_DSN",
+        "GEL_INSTANCE",
+        "EDGEDB_INSTANCE",
+        "GEL_CREDENTIALS_FILE",
+        "EDGEDB_CREDENTIALS_FILE",
+        "GEL_HOST",
+        "EDGEDB_HOST",
+        "GEL_PORT",
+        "EDGEDB_PORT",
+    ]
+    .into_iter()
+    .any(is_set)
+}
+
 #[cfg(test)]
 mod connection_target_tests {
     use super::*;
@@ -455,6 +472,51 @@ mod connection_target_tests {
         options.tls_security = Some("strict".to_owned());
         options.tls_server_name = Some("localhost".to_owned());
         assert!(!options.has_explicit_target());
+    }
+
+    #[test]
+    fn environment_target_selectors() {
+        for key in [
+            "GEL_DSN",
+            "EDGEDB_DSN",
+            "GEL_INSTANCE",
+            "EDGEDB_INSTANCE",
+            "GEL_CREDENTIALS_FILE",
+            "EDGEDB_CREDENTIALS_FILE",
+            "GEL_HOST",
+            "EDGEDB_HOST",
+            "GEL_PORT",
+            "EDGEDB_PORT",
+        ] {
+            assert!(
+                has_explicit_target_env(|name| name == key),
+                "{key} must skip project hooks"
+            );
+        }
+        assert!(!has_explicit_target_env(|_| false));
+    }
+
+    #[test]
+    fn environment_connection_modifiers_do_not_select_a_target() {
+        for key in [
+            "GEL_USER",
+            "EDGEDB_USER",
+            "GEL_PASSWORD",
+            "EDGEDB_PASSWORD",
+            "GEL_BRANCH",
+            "EDGEDB_BRANCH",
+            "GEL_DATABASE",
+            "EDGEDB_DATABASE",
+            "GEL_SECRET_KEY",
+            "EDGEDB_SECRET_KEY",
+            "GEL_TLS_SECURITY",
+            "EDGEDB_TLS_SECURITY",
+        ] {
+            assert!(
+                !has_explicit_target_env(|name| name == key),
+                "{key} must keep project hooks enabled"
+            );
+        }
     }
 }
 
@@ -1054,7 +1116,9 @@ impl Options {
             );
         }
 
-        let mut skip_hooks = args.skip_hooks || args.conn.has_explicit_target();
+        let mut skip_hooks = args.skip_hooks
+            || args.conn.has_explicit_target()
+            || has_explicit_target_env(|name| env::var_os(name).is_some());
         if !skip_hooks && crate::cli::env::Env::skip_hooks()?.is_some_and(|x| x.0) {
             skip_hooks = true;
         }

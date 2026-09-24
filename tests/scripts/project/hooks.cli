@@ -208,6 +208,21 @@ $ gel --instance=hooks_external query 'select count(default::HooksExternal)'
 $ gel migration apply
 *
 
+# An instance selected through the environment also leaves project context.
+$ printf 'module default { type HooksEnvTarget; }\n' > database_schema/hooks_env_target.gel
+$ gel migration create --non-interactive
+*
+$ GEL_INSTANCE=hooks_external gel migration apply
+reject {
+    ! hook %{GREEDYDATA}
+}
+*
+$ gel --instance=hooks_external query 'select count(default::HooksEnvTarget)'
+! 0
+
+$ gel migration apply
+*
+
 # The global flag also works after the migration subcommand.
 $ printf 'module default { type HooksFlag; }\n' > database_schema/hooks_flag.gel
 $ gel migration create --non-interactive

@@ -374,6 +374,17 @@ impl InstanceOptionsLegacy {
 }
 
 impl ConnectionOptions {
+    fn has_explicit_target(&self) -> bool {
+        self.instance_opts.instance.is_some()
+            || self.instance_opts.docker
+            || self.instance_opts.container.is_some()
+            || self.dsn.is_some()
+            || self.credentials_file.is_some()
+            || self.host.is_some()
+            || self.port.is_some()
+            || self.unix_path.is_some()
+    }
+
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.database.is_some() {
             print::warn!("database connection argument is deprecated in favor of 'branch'");
@@ -382,6 +393,68 @@ impl ConnectionOptions {
             anyhow::bail!("Arguments --database={d} and --branch={b} are mutually exclusive");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod connection_target_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_target_selectors() {
+        assert!(!ConnectionOptions::default().has_explicit_target());
+
+        let mut selectors: Vec<(&str, ConnectionOptions)> = Vec::new();
+        let mut instance = ConnectionOptions::default();
+        instance.instance_opts.instance = Some(InstanceName::Local("other".to_owned()));
+        selectors.push(("instance", instance));
+
+        let mut docker = ConnectionOptions::default();
+        docker.instance_opts.docker = true;
+        selectors.push(("docker", docker));
+
+        let mut container = ConnectionOptions::default();
+        container.instance_opts.container = Some("other".to_owned());
+        selectors.push(("container", container));
+
+        let mut dsn = ConnectionOptions::default();
+        dsn.dsn = Some("gel://localhost".to_owned());
+        selectors.push(("dsn", dsn));
+
+        let mut credentials_file = ConnectionOptions::default();
+        credentials_file.credentials_file = Some(PathBuf::from("other.json"));
+        selectors.push(("credentials-file", credentials_file));
+
+        let mut host = ConnectionOptions::default();
+        host.host = Some("localhost".to_owned());
+        selectors.push(("host", host));
+
+        let mut port = ConnectionOptions::default();
+        port.port = Some(5656);
+        selectors.push(("port", port));
+
+        let mut unix_path = ConnectionOptions::default();
+        unix_path.unix_path = Some(PathBuf::from("/tmp/gel.sock"));
+        selectors.push(("unix-path", unix_path));
+
+        for (name, options) in selectors {
+            assert!(
+                options.has_explicit_target(),
+                "{name} must skip project hooks"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_modifiers_do_not_select_a_target() {
+        let mut options = ConnectionOptions::default();
+        options.user = Some("admin".to_owned());
+        options.password = true;
+        options.branch = Some("other".to_owned());
+        options.database = Some("other".to_owned());
+        options.tls_security = Some("strict".to_owned());
+        options.tls_server_name = Some("localhost".to_owned());
+        assert!(!options.has_explicit_target());
     }
 }
 
@@ -462,7 +535,7 @@ pub struct RawOptions {
     pub no_cli_update_check: bool,
 
     /// Do not run any command hooks defined in [MANIFEST_FILE_DISPLAY_NAME]
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub skip_hooks: bool,
 
     #[command(flatten)]
@@ -981,7 +1054,7 @@ impl Options {
             );
         }
 
-        let mut skip_hooks = args.skip_hooks;
+        let mut skip_hooks = args.skip_hooks || args.conn.has_explicit_target();
         if !skip_hooks && crate::cli::env::Env::skip_hooks()?.is_some_and(|x| x.0) {
             skip_hooks = true;
         }

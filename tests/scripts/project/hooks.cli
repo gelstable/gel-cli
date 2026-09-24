@@ -169,3 +169,79 @@ reject {
 }
 *
 ! Project is now in sync.
+
+# Apply a migration through the default project connection: all hooks run.
+$ printf 'module default { type HooksDefault; }\n' > database_schema/hooks_default.gel
+$ gel migration create --non-interactive
+*
+$ gel migration apply
+*
+! hook migration.apply.before: true
+*
+! hook schema.update.before: true
+*
+! hook migration.apply.after: true
+*
+! hook schema.update.after: true
+*
+$ gel query 'select count(default::HooksDefault)'
+! 0
+
+# An unlinked explicit instance applies the migration without project hooks.
+$ gel instance destroy -I hooks_external --force
+%EXIT any
+*
+$ gel instance create hooks_external --non-interactive
+*
+$ printf 'module default { type HooksExternal; }\n' > database_schema/hooks_external.gel
+$ gel migration create --non-interactive
+*
+$ gel --instance=hooks_external migration apply
+reject {
+    ! hook %{GREEDYDATA}
+}
+*
+$ gel --instance=hooks_external query 'select count(default::HooksExternal)'
+! 0
+
+# Keep the linked instance at the latest migration before creating another.
+$ gel migration apply
+*
+
+# The global flag also works after the migration subcommand.
+$ printf 'module default { type HooksFlag; }\n' > database_schema/hooks_flag.gel
+$ gel migration create --non-interactive
+*
+$ gel migration apply --skip-hooks
+reject {
+    ! hook %{GREEDYDATA}
+}
+*
+$ gel query 'select count(default::HooksFlag)'
+! 0
+
+# Both true values of the environment switch suppress before and after hooks.
+$ printf 'module default { type HooksEnvOne; }\n' > database_schema/hooks_env_one.gel
+$ gel migration create --non-interactive
+*
+$ GEL_SKIP_HOOKS=1 gel migration apply
+reject {
+    ! hook %{GREEDYDATA}
+}
+*
+$ gel query 'select count(default::HooksEnvOne)'
+! 0
+
+$ printf 'module default { type HooksEnvTrue; }\n' > database_schema/hooks_env_true.gel
+$ gel migration create --non-interactive
+*
+$ GEL_SKIP_HOOKS=true gel migration apply
+reject {
+    ! hook %{GREEDYDATA}
+}
+*
+$ gel query 'select count(default::HooksEnvTrue)'
+! 0
+
+$ gel instance destroy -I hooks_external --force
+*

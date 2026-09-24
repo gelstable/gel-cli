@@ -727,9 +727,11 @@ pub async fn apply_migrations(
             }
         }
     }?;
-    if let Some(project) = &ctx.project {
-        hooks::on_action("migration.apply.after", project).await?;
-        hooks::on_action("schema.update.after", project).await?;
+    if !ctx.skip_hooks {
+        if let Some(project) = &ctx.project {
+            hooks::on_action("migration.apply.after", project).await?;
+            hooks::on_action("schema.update.after", project).await?;
+        }
     }
     Ok(())
 }

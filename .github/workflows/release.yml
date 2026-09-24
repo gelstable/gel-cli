@@ -1,0 +1,306 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - 'release/*'
+    paths:
+      - Cargo.toml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-draft
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.88"
+  CARGO_INCREMENTAL: "0"
+  CARGO_DEB_VERSION: "3.7.0"
+  CARGO_GENERATE_RPM_VERSION: "0.21.0"
+
+jobs:
+  plan:
+    name: validate release
+    runs-on: ubuntu-24.04
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      channel: ${{ steps.plan.outputs.channel }}
+      build_date: ${{ steps.plan.outputs.build_date }}
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+      smoke_matrix: ${{ steps.plan.outputs.smoke_matrix }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.13"
+      - name: Read version and reject an existing publication
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          version="$(uv run --frozen python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          {
+            echo "version=$version"
+            echo "build_matrix=$(PYTHONPATH=. uv run --frozen gel-release matrix build)"
+            echo "smoke_matrix=$(PYTHONPATH=. uv run --frozen gel-release matrix smoke)"
+          } >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "New branch; waiting for a version-changing PR"
+              exit 0
+            fi
+            previous="$(git show "$BEFORE_SHA:Cargo.toml" |
+              uv run --frozen python -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')"
+            if [[ "$version" == "$previous" ]]; then
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "Version remains $version; no release build needed"
+              exit 0
+            fi
+          fi
+          locked_version="$(cargo metadata --locked --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "gel-cli") | .version')"
+          test "$version" = "$locked_version"
+          channel="$(PYTHONPATH=. uv run --frozen gel-release channel --version "$version")"
+          tag="v$version"
+          if gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists" >&2
+            exit 1
+          fi
+          if gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" >/dev/null 2>&1; then
+            echo "Published release $tag already exists" >&2
+            exit 1
+          fi
+          {
+            echo "release=true"
+            echo "channel=$channel"
+            echo "build_date=$(git show -s --format=%cI "$GITHUB_SHA")"
+          } >> "$GITHUB_OUTPUT"
+
+  completions:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Generate shell completions
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin gel
+          PYTHONPATH=. uv run --frozen gel-release completions \
+            --binary target/debug/gel --out-dir target/completions
+          for completion in gel.bash _gel gel.fish gel.ps1; do
+            test -s "target/completions/$completion"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: completions
+          path: target/completions
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [plan, completions]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # pinned master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install zstd
+        if: startsWith(matrix.runner, 'windows')
+        shell: pwsh
+        run: choco install zstandard --no-progress -y
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: completions
+          path: target/completions
+      - name: Build and package target
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin gel --target "$TARGET"
+          binary="target/$TARGET/release/gel"
+          if [[ -f "$binary.exe" ]]; then binary="$binary.exe"; fi
+          test -s "$binary"
+          PYTHONPATH=. uv run --frozen gel-release package-target \
+            --target "$TARGET" --version "$VERSION" --binary "$binary" \
+            --completions-dir target/completions --out-dir dist
+      - name: Install Linux packaging tools
+        if: matrix.linux_packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked --version "$CARGO_DEB_VERSION" cargo-deb
+          cargo install --locked --version "$CARGO_GENERATE_RPM_VERSION" cargo-generate-rpm
+      - name: Build Linux packages
+        if: matrix.linux_packages
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. uv run --frozen gel-release linux-packages \
+            --target "$TARGET" --version "$VERSION" \
+            --completions-dir target/completions --out-dir dist
+          test -z "$(git status --porcelain Cargo.toml)"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+  smoke:
+    name: smoke (${{ matrix.target }})
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.smoke_matrix) }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+      - name: Run archived binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stem="gel-v$VERSION-$TARGET"
+          mkdir smoke
+          if [[ -f "dist/$stem.tar.gz" ]]; then
+            tar -xzf "dist/$stem.tar.gz" -C smoke
+            binary="smoke/$stem/gel"
+          else
+            unzip -q "dist/$stem.zip" -d smoke
+            binary="smoke/$stem/gel.exe"
+          fi
+          test -s "$binary"
+          test "$("$binary" --version)" = "Gel CLI $VERSION"
+
+  install:
+    name: install manager matrix
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
+    uses: ./.github/workflows/release-install-e2e.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+      build_sha: ${{ github.sha }}
+
+  draft:
+    name: assemble and create draft
+    needs: [plan, build, smoke, install]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # GitHub requires write access to list and replace drafts.
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Assemble and check release inventory
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          BUILD_DATE: ${{ needs.plan.outputs.build_date }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. uv run --frozen gel-release assemble-stage \
+            --version "$VERSION" --build-date "$BUILD_DATE" --dist-dir dist
+          PYTHONPATH=. uv run --frozen python - "$VERSION" <<'PY'
+          import sys
+          from pathlib import Path
+          from gel_release import assets
+
+          expected = assets.expected_assets(sys.argv[1])
+          found = sorted(path.name for path in Path("dist").iterdir() if path.is_file())
+          if found != expected:
+              raise SystemExit(f"missing={sorted(set(expected) - set(found))} extra={sorted(set(found) - set(expected))}")
+          PY
+          for archive in dist/*.tar.gz; do
+            tar -tzf "$archive" | grep -E '/gel$' >/dev/null
+            tar -tzf "$archive" | grep '/completions/gel.bash$' >/dev/null
+          done
+          for archive in dist/*.zip; do
+            unzip -Z1 "$archive" | grep '/gel.exe$' >/dev/null
+            unzip -Z1 "$archive" | grep '/completions/gel.ps1$' >/dev/null
+          done
+      - name: Replace unpublished draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists" >&2
+            exit 1
+          fi
+          releases="$(gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/releases?per_page=100" | jq 'add // []')"
+          if jq -e --arg tag "$tag" 'any(.[]; .tag_name == $tag and .draft == false)' <<< "$releases" >/dev/null; then
+            echo "Published release $tag already exists" >&2
+            exit 1
+          fi
+          old_id="$(jq -r --arg tag "$tag" '[.[] | select(.tag_name == $tag and .draft == true) | .id] | first // empty' <<< "$releases")"
+          if [[ -n "$old_id" ]]; then
+            gh api -X DELETE "/repos/$GITHUB_REPOSITORY/releases/$old_id"
+          fi
+          prerelease=false
+          if [[ "$CHANNEL" == testing ]]; then prerelease=true; fi
+          id="$(gh api -X POST "/repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$tag" -f name="$tag" -f target_commitish="$GITHUB_SHA" \
+            -F draft=true -F prerelease="$prerelease" -F generate_release_notes=true \
+            --jq '.id')"
+          gh release upload "$tag" dist/*
+          echo "Draft release $tag (ID $id): https://github.com/$GITHUB_REPOSITORY/releases" >> "$GITHUB_STEP_SUMMARY"

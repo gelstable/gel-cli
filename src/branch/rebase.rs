@@ -92,7 +92,7 @@ async fn rebase(
 
     migrations.print_status();
 
-    let migration_context = migrations::Context::for_project(project, cli_opts.skip_hooks)?;
+    let migration_context = migrations::Context::for_project(project, cli_opts.hooks())?;
     do_rebase(&mut migrations, &migration_context).await?;
 
     if apply_migrations {

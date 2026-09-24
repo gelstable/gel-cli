@@ -93,7 +93,7 @@ pub async fn run_command(
     conn: &mut Connection,
     options: &Options,
 ) -> anyhow::Result<String> {
-    let ctx = Context::for_migration_config(&cmd.cfg, false, options.skip_hooks, true).await?;
+    let ctx = Context::for_migration_config(&cmd.cfg, false, options.hooks(), true).await?;
     run_inner(&ctx, cmd, conn).await
 }
 

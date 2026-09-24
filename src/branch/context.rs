@@ -4,6 +4,7 @@ use log::warn;
 
 use crate::connect::Connection;
 use crate::credentials;
+use crate::hooks::{self, Hooks};
 use crate::locking::{InstanceLock, LockManager};
 use crate::platform::tmp_file_path;
 use crate::project;
@@ -15,8 +16,8 @@ pub struct Context {
     /// Instance name provided either with --instance or inferred from the project.
     instance_name: Option<InstanceName>,
 
-    /// Project location if --instance was not specified and
-    /// current directory is within a project.
+    /// Project location if current directory is within a project and
+    /// --instance was either not specified or names the linked instance.
     project: Option<project::Location>,
 
     /// None means that the current branch is unknown because:
@@ -34,7 +35,8 @@ pub struct Context {
     /// Project manifest cache
     project_ctx_cache: Mutex<Option<project::Context>>,
 
-    skip_hooks: bool,
+    /// Whether the project's hooks apply to the connection target.
+    run_hooks: bool,
 
     instance_lock: Option<InstanceLock>,
 }
@@ -42,7 +44,7 @@ pub struct Context {
 impl Context {
     pub async fn new(
         instance_arg: Option<&InstanceName>,
-        skip_hooks: bool,
+        hooks: Hooks,
         read_only: bool,
     ) -> anyhow::Result<Context> {
         let mut ctx = Context {
@@ -50,7 +52,7 @@ impl Context {
             current_branch: DatabaseBranch::Default,
             project: None,
             project_ctx_cache: Mutex::new(None),
-            skip_hooks,
+            run_hooks: false,
             instance_lock: None,
         };
 
@@ -83,6 +85,14 @@ impl Context {
                 }
             }
 
+            // keep the project if --instance names its linked instance
+            ctx.project = project::find_project_async(None)
+                .await?
+                .filter(|location| project::is_linked_to(location, instance_name));
+            ctx.run_hooks = ctx
+                .project
+                .as_ref()
+                .is_some_and(|location| hooks.applies_to(location));
             return Ok(ctx);
         }
 
@@ -98,13 +108,21 @@ impl Context {
             }
             ctx.current_branch =
                 project::database_name(&stash_dir).unwrap_or(DatabaseBranch::Default);
+            ctx.run_hooks = hooks.applies_to(location);
         }
 
         Ok(ctx)
     }
 
-    pub fn skip_hooks(&self) -> bool {
-        self.skip_hooks
+    /// Runs project hooks of the given action, if they apply.
+    pub async fn run_hooks(&self, action: &'static str) -> anyhow::Result<()> {
+        if !self.run_hooks {
+            return Ok(());
+        }
+        if let Some(project) = self.get_project().await? {
+            hooks::on_action(action, &project).await?;
+        }
+        Ok(())
     }
 
     /// Returns the "current" branch or branch of the connection.

@@ -22,7 +22,6 @@ use crate::commands::ExitCode;
 use crate::commands::Options;
 use crate::connect::{Connection, ResponseStream};
 use crate::hint::HintExt;
-use crate::hooks;
 use crate::migrations;
 use crate::migrations::context::Context;
 use crate::migrations::db_migration;
@@ -93,7 +92,7 @@ pub async fn run(
     skip_auto_backup: bool,
 ) -> Result<(), anyhow::Error> {
     // migrate apply needs to be able to run during gel watch.
-    let ctx = Context::for_migration_config(&cmd.cfg, cmd.quiet, options.skip_hooks, true).await?;
+    let ctx = Context::for_migration_config(&cmd.cfg, cmd.quiet, options.hooks(), true).await?;
     let instance_name = options.conn_params.instance_name()?;
     run_inner(&ctx, cmd, conn, instance_name, skip_auto_backup).await
 }
@@ -694,12 +693,8 @@ pub async fn apply_migrations(
     ctx: &Context,
     single_transaction: bool,
 ) -> anyhow::Result<()> {
-    if !ctx.skip_hooks {
-        if let Some(project) = &ctx.project {
-            hooks::on_action("migration.apply.before", project).await?;
-            hooks::on_action("schema.update.before", project).await?;
-        }
-    }
+    ctx.run_hooks("migration.apply.before").await?;
+    ctx.run_hooks("schema.update.before").await?;
 
     let old_timeout = timeout::inhibit_for_transaction(conn).await?;
     {
@@ -727,12 +722,8 @@ pub async fn apply_migrations(
             }
         }
     }?;
-    if !ctx.skip_hooks {
-        if let Some(project) = &ctx.project {
-            hooks::on_action("migration.apply.after", project).await?;
-            hooks::on_action("schema.update.after", project).await?;
-        }
-    }
+    ctx.run_hooks("migration.apply.after").await?;
+    ctx.run_hooks("schema.update.after").await?;
     Ok(())
 }
 

@@ -11,6 +11,7 @@ use crate::async_try;
 use crate::branding::{BRANDING_CLI_CMD, QUERY_TAG};
 use crate::commands::{ExitCode, Options};
 use crate::connect::Connection;
+use crate::hooks::Hooks;
 use crate::migrations::apply::{ApplyMigrationError, apply_migration};
 use crate::migrations::context::Context;
 use crate::migrations::create::{SchemaFileError, execute_start_migration};
@@ -59,7 +60,7 @@ pub fn upgrade_check(_options: &Options, options: &UpgradeCheck) -> anyhow::Resu
                     break;
                 }
             }
-            let ctx = Context::for_migration_config(&options.cfg, false, true, true).await?;
+            let ctx = Context::for_migration_config(&options.cfg, false, Hooks::Skip, true).await?;
 
             Box::pin(do_check(
                 &ctx,
@@ -113,7 +114,7 @@ pub fn upgrade_check(_options: &Options, options: &UpgradeCheck) -> anyhow::Resu
     let ctx = runtime.block_on(Context::for_migration_config(
         &options.cfg,
         false,
-        true,
+        Hooks::Skip,
         true,
     ))?;
 
@@ -136,7 +137,7 @@ pub fn to_version(pkg: &ServerPackage, project: &project::Context) -> anyhow::Re
     use crate::branding::BRANDING;
 
     let info = install::package(pkg).context(concatcp!("error installing ", BRANDING))?;
-    let ctx = Context::for_project(project.clone(), true)?;
+    let ctx = Context::for_project(project.clone(), Hooks::Skip)?;
     spawn_and_check(&info, ctx, false, WatchOptions::default())
 }
 

@@ -134,7 +134,7 @@ pub async fn common(
                 commands::database::drop(conn, d, options).await?;
             }
             DatabaseCmd::Wipe(w) => {
-                commands::database::wipe(conn, w, options.skip_hooks).await?;
+                commands::database::wipe(conn, w, options.hooks()).await?;
             }
         },
         Branch(_) => unreachable!(),

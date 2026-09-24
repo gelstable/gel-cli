@@ -121,21 +121,27 @@ $ cat branch.log
 ! another
 ! default-branch-name
 
-# Test branch switch with --instance flag (should not trigger hooks)
+# Branch switch with --instance naming the linked instance runs hooks
 $ gel --instance=inst2 branch switch another
-reject {
-    ! hook %{GREEDYDATA}
-}
+*
+! hook branch.switch.before: true
+*
+! hook branch.switch.after: gel branch current --plain >> branch.log
 *
 
 # Test branch switch with --skip-hooks flag
-$ gel --skip-hooks branch switch another
+$ gel --skip-hooks branch switch default-branch-name
 reject {
     ! hook %{GREEDYDATA}
 }
 *
 
 # Test branch switch with GEL_SKIP_HOOKS environment variable
+$ GEL_SKIP_HOOKS=1 gel branch switch another
+reject {
+    ! hook %{GREEDYDATA}
+}
+*
 $ GEL_SKIP_HOOKS=1 gel branch switch default-branch-name
 reject {
     ! hook %{GREEDYDATA}
@@ -206,6 +212,33 @@ $ gel --instance=hooks_external query 'select count(default::HooksExternal)'
 
 # Keep the linked instance at the latest migration before creating another.
 $ gel migration apply
+*
+
+# Naming the linked instance explicitly still runs project hooks.
+$ printf 'module default { type HooksLinkedArg; }\n' > database_schema/hooks_linked_arg.gel
+$ gel migration create --non-interactive
+*
+$ gel --instance=inst2 migration apply
+*
+! hook migration.apply.before: true
+*
+! hook migration.apply.after: true
+*
+
+$ printf 'module default { type HooksLinkedEnv; }\n' > database_schema/hooks_linked_env.gel
+$ gel migration create --non-interactive
+*
+$ GEL_INSTANCE=inst2 gel migration apply
+*
+! hook migration.apply.before: true
+*
+! hook migration.apply.after: true
+*
+
+# Commands that always use the linked instance keep their hooks.
+$ GEL_INSTANCE=hooks_external gel sync
+*
+! hook config.update.before: true
 *
 
 # An instance selected through the environment also leaves project context.

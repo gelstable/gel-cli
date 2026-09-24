@@ -1,7 +1,39 @@
 use std::path;
 
+use gel_tokio::InstanceName;
+
 use crate::print::{self, Highlight};
 use crate::project;
+
+/// Decides whether project hooks apply to a command.
+///
+/// Hooks belong to the project, so they only run when the command targets
+/// the instance linked to that project.
+#[derive(Debug, Clone)]
+pub enum Hooks {
+    /// Hooks were disabled with --skip-hooks or GEL_SKIP_HOOKS.
+    Skip,
+    /// The command connects to this instance (None for DSN, host, etc).
+    Target(Option<InstanceName>),
+}
+
+impl Hooks {
+    pub fn new(skip_hooks: bool, target: Option<InstanceName>) -> Hooks {
+        if skip_hooks {
+            Hooks::Skip
+        } else {
+            Hooks::Target(target)
+        }
+    }
+
+    /// Returns true if hooks of the project at `location` should run.
+    pub fn applies_to(&self, location: &project::Location) -> bool {
+        match self {
+            Hooks::Target(Some(target)) => project::is_linked_to(location, target),
+            _ => false,
+        }
+    }
+}
 
 /// Runs project hooks of the given action.
 /// Must not be called if --skip-hooks or GEL_SKIP_HOOKS is set.

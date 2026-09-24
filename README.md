@@ -3,6 +3,8 @@ Gel Command-line Tools
 
 This repository contains the implementation of `gel` command-line tool.
 
+Maintainers: see [RELEASING.md](RELEASING.md) for the release steps.
+
 
 Install
 =======

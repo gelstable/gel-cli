@@ -1,6 +1,6 @@
 # Releasing
 
-This process is shared by Gel repositories. The **Build** step is the only
+This process is shared by gelstable repositories. The **Build** step is the only
 repository-specific part. A release manager needs write access to the repo.
 
 1. **Prepare.** Open a normal PR titled `Release X.Y.Z` against `master` (or
@@ -29,7 +29,7 @@ repository-specific part. A release manager needs write access to the repo.
 
 4. **Publish.** In the GitHub release editor, choose **Set as latest** as
    appropriate and click **Publish release**. GitHub creates the `vX.Y.Z` tag
-   at the built commit then. The separate Gel registry app picks up published
+   at the built commit then. The separate gelstable registry app picks up published
    releases containing `gel-registry.json`; there is no registry step here.
 
 5. **Handle variants and failures.** For a prerelease, use a version such as

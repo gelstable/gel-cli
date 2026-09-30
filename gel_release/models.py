@@ -96,6 +96,23 @@ class ReleaseManifest(StrictModel):
     indexes: Annotated[list[ManifestIndex], Field(min_length=1)]
 
 
+class NativePackage(StrictModel):
+    url: HttpUrl
+    sha256: Sha256
+    size: PositiveInt
+
+
+class NativeSection(StrictModel):
+    channel: Literal["stable", "testing"]
+    packages: Annotated[list[NativePackage], Field(min_length=1)]
+
+
+class NativeReleaseManifest(StrictModel):
+    schema_version: Literal[2]
+    indexes: Annotated[list[ManifestIndex], Field(min_length=1)]
+    native: NativeSection
+
+
 class LegacyReplacementsManifest(StrictModel):
     """A published v7.10.x manifest, kept readable exactly as shipped.
 

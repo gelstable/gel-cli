@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal, get_type_hints
 
 import jsonschema
+import pytest
 from pydantic import ValidationError
 
 from gel_release import assets, digests, models, registry_manifest
@@ -23,6 +24,10 @@ def _entries(version: str) -> dict[str, digests.FileDigest]:
         out[compressed] = digests.FileDigest(
             size=500 + index, sha256=f"{index + 10:064x}", blake2b512=f"{index + 10:0128x}"
         )
+    for target in assets.TARGETS:
+        if target.deb_arch is not None:
+            for name in (assets.deb_name(version, target), assets.rpm_name(version, target)):
+                out[name] = digests.FileDigest(size=123, sha256="f" * 64, blake2b512="f" * 128)
     return out
 
 
@@ -36,7 +41,7 @@ class ManifestShapeTests(unittest.TestCase):
         registry_manifest.validate_manifest(self.manifest)
 
     def test_one_stable_fragment_per_registry_target(self):
-        self.assertEqual(self.manifest["schema_version"], 1)
+        self.assertEqual(self.manifest["schema_version"], 2)
         self.assertEqual(len(self.manifest["indexes"]), 5)
         self.assertEqual(
             [fragment["platform"] for fragment in self.manifest["indexes"]],
@@ -187,8 +192,28 @@ class IsolationTests(unittest.TestCase):
                 "1.2.3", "2026-09-12T00:00:00+00:00", _entries("1.2.3")
             )
         ).decode()
-        for suffix in (".tar.gz", ".zip", ".deb", ".rpm", "SHA256SUMS", "BLAKE2B512SUMS"):
+        for suffix in (".tar.gz", ".zip", "SHA256SUMS", "BLAKE2B512SUMS"):
             self.assertNotIn(suffix, rendered)
+
+
+def test_native_manifest_urls_and_channel():
+    manifest = registry_manifest.build_manifest("1.2.3-rc.1", "2026-09-12", _entries("1.2.3-rc.1"))
+    registry_manifest.validate_manifest(manifest)
+    assert manifest["native"]["channel"] == "testing"
+    assert len(manifest["native"]["packages"]) == 4
+    for package in manifest["native"]["packages"]:
+        assert package["url"].startswith(
+            "https://github.com/gelstable/gel-cli/releases/download/v1.2.3-rc.1/gel-cli-1.2.3-rc.1-1-"
+        )
+    for url in (
+        "https://github.com/other/repo/releases/download/v1.2.3/a.deb",
+        "https://github.com/gelstable/gel-cli/releases/download/v1.2.3-rc.1/a~b.rpm",
+        "https://github.com/gelstable/gel-cli/releases/download/v1.2.3-rc.1/a.zip",
+    ):
+        bad = copy.deepcopy(manifest)
+        bad["native"]["packages"][0]["url"] = url
+        with pytest.raises(ValueError):
+            registry_manifest.validate_manifest(bad)
 
 
 # The gel-registry.json asset published on the gelstable/gel-cli v7.10.2 release,
@@ -355,6 +380,27 @@ class GoldenFixtureTests(unittest.TestCase):
 
     def test_fixture_validates(self):
         registry_manifest.validate_manifest(json.loads(FIXTURE.read_bytes()))
+
+
+def test_assembly_digests_final_native_bytes(tmp_path):
+    from hashlib import sha256
+
+    version = "1.2.3"
+    for name in assets.expected_assets(version):
+        if name not in (
+            assets.REGISTRY_MANIFEST_NAME,
+            assets.SHA256SUMS_NAME,
+            assets.BLAKE2B_SUMS_NAME,
+        ):
+            (tmp_path / name).write_bytes(b"portable or unsigned package")
+    rpm = tmp_path / assets.rpm_name(version, assets.TARGETS[0])
+    rpm.write_bytes(b"final signed RPM bytes")
+    registry_manifest.assemble_stage(version, "2026-09-30", tmp_path)
+    manifest = json.loads((tmp_path / assets.REGISTRY_MANIFEST_NAME).read_bytes())
+    package = next(p for p in manifest["native"]["packages"] if p["url"].endswith(rpm.name))
+    assert package["sha256"] == sha256(rpm.read_bytes()).hexdigest()
+    assert package["size"] == rpm.stat().st_size
+    assert package["sha256"] in (tmp_path / assets.SHA256SUMS_NAME).read_text()
 
 
 if __name__ == "__main__":

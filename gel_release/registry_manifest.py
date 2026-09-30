@@ -1,10 +1,7 @@
 """Generate the gel-registry.json release manifest.
 
-The manifest is the only contract between a gel-cli release and
-gelstable/gel-registry. It references exactly the ten bare and zstd registry
-executables. Distribution archives, Linux packages, and digest manifests are
-deliberately absent: gel-registry checks that every URL in this document exists
-on the release and ignores every other asset.
+The manifest binds portable executables and native packages to the same release.
+Native digests are collected after RPM signing.
 """
 
 from __future__ import annotations
@@ -18,7 +15,7 @@ import jsonschema
 from pydantic import BaseModel
 
 from . import assets, digests
-from .models import LegacyReplacementsManifest, ReleaseManifest
+from .models import LegacyReplacementsManifest, NativeReleaseManifest, ReleaseManifest
 
 SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent / "packaging" / "schema" / "release-manifest.schema.json"
@@ -79,10 +76,18 @@ def build_manifest(version: str, build_date: str, entries: dict[str, digests.Fil
         permitted.add(assets.registry_identity_name(target))
         permitted.add(assets.registry_zstd_name(target))
 
+    native_names = []
+    for target in assets.TARGETS:
+        if target.deb_arch is not None:
+            native_names.extend(
+                [assets.deb_name(version, target), assets.rpm_name(version, target)]
+            )
+    permitted.update(native_names)
+
     unexpected = sorted(set(entries) - permitted)
     if unexpected:
         raise ValueError(
-            "gel-registry.json may only reference registry executables; refused: "
+            "gel-registry.json may only reference executables and native packages; refused: "
             + ", ".join(unexpected)
         )
 
@@ -121,15 +126,29 @@ def build_manifest(version: str, build_date: str, entries: dict[str, digests.Fil
                 ],
             }
         )
-    return {"schema_version": 1, "indexes": indexes}
+    return {
+        "schema_version": 2,
+        "indexes": indexes,
+        "native": {
+            "channel": channel,
+            "packages": [
+                {
+                    "url": assets.release_download_url(version, name),
+                    "sha256": entries[name].sha256,
+                    "size": entries[name].size,
+                }
+                for name in native_names
+            ],
+        },
+    }
 
 
 def _manifest_model(manifest: dict) -> type[BaseModel]:
     """Pick the document model for one manifest.
 
     Two unrelated documents share ``schema_version: 1``: the ``replacements``
-    form published for v7.10.x, and the ``indexes`` form this pipeline
-    generates. What tells them apart is the presence of a non-empty
+    form published for v7.10.x, and the historical ``indexes`` form. Version 2 is dispatched
+    separately before either legacy shape. What tells them apart is the presence of a non-empty
     ``replacements`` array rather than the value of any single field, so
     Pydantic's discriminated union cannot express the choice. A plain
     (non-discriminated) union would be worse than an explicit dispatch: a
@@ -137,6 +156,8 @@ def _manifest_model(manifest: dict) -> type[BaseModel]:
     the permissive legacy branch and be reported as failing both arms, which
     is exactly the loss of strictness this split exists to prevent.
     """
+    if manifest.get("schema_version") == 2:
+        return NativeReleaseManifest
     if manifest.get("replacements"):
         return LegacyReplacementsManifest
     if manifest.get("indexes"):
@@ -146,6 +167,18 @@ def _manifest_model(manifest: dict) -> type[BaseModel]:
 
 def validate_manifest(manifest: dict) -> None:
     _manifest_model(manifest).model_validate(manifest)
+    if manifest.get("schema_version") == 2:
+        prefix = assets.release_download_url(manifest["indexes"][0]["packages"][0]["version"], "")
+        tag = prefix.split("/download/", 1)[1].split("/", 1)[0]
+        if re.fullmatch(r"[A-Za-z0-9._-]+", tag) is None:
+            raise ValueError("unsafe native release tag")
+        for package in manifest["native"]["packages"]:
+            name = package["url"].removeprefix(prefix)
+            if (
+                not package["url"].startswith(prefix)
+                or re.fullmatch(r"[A-Za-z0-9._-]+\.(deb|rpm)", name) is None
+            ):
+                raise ValueError("native URL must name a safe asset on the declaring release")
     schema = json.loads(SCHEMA_PATH.read_bytes())
     jsonschema.validate(instance=manifest, schema=schema)
 
@@ -158,6 +191,10 @@ def assemble_stage(version: str, build_date: str, dist_dir: Path) -> None:
             if not path.is_file():
                 raise ValueError(f"missing registry asset {name}")
             entries[name] = digests.digest_file(path)
+    for target in assets.TARGETS:
+        if target.deb_arch is not None:
+            for name in (assets.deb_name(version, target), assets.rpm_name(version, target)):
+                entries[name] = digests.digest_file(dist_dir / name)
     manifest = build_manifest(version, build_date, entries)
     validate_manifest(manifest)
     (dist_dir / assets.REGISTRY_MANIFEST_NAME).write_bytes(dump(manifest))
@@ -177,6 +214,10 @@ def write_manifest(version: str, build_date: str, dist_dir: Path, out: Path) -> 
     for target in assets.REGISTRY_TARGETS:
         for name in (assets.registry_identity_name(target), assets.registry_zstd_name(target)):
             entries[name] = digests.digest_file(dist_dir / name)
+    for target in assets.TARGETS:
+        if target.deb_arch is not None:
+            for name in (assets.deb_name(version, target), assets.rpm_name(version, target)):
+                entries[name] = digests.digest_file(dist_dir / name)
     manifest = build_manifest(version, build_date, entries)
     validate_manifest(manifest)
     out.write_bytes(dump(manifest))

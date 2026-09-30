@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "indexes": [
     {
       "channel": "stable",
@@ -236,5 +236,30 @@
         }
       ]
     }
-  ]
+  ],
+  "native": {
+    "channel": "stable",
+    "packages": [
+      {
+        "url": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-1.2.3-1-amd64.deb",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "size": 123
+      },
+      {
+        "url": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-1.2.3-1-x86_64.rpm",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "size": 123
+      },
+      {
+        "url": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-1.2.3-1-arm64.deb",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "size": 123
+      },
+      {
+        "url": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-1.2.3-1-aarch64.rpm",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "size": 123
+      }
+    ]
+  }
 }

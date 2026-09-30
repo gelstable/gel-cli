@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scenario::{self, Scenario};
 
-use super::unix_package::{self, PACKAGE, PackageQuery, Privilege};
+use super::unix_package::{self, NATIVE_PACKAGE as PACKAGE, PackageQuery, Privilege};
 
 /// `%global debug_package %{nil}` and `%define __os_install_post %{nil}` between
 /// them switch off the whole `brp-*` post-install pipeline. Those scripts strip
@@ -200,7 +200,7 @@ impl Scenario for DnfScenario {
         }
         scenario::report_cleanup(
             self.privilege.command("rpm").arg("-e").arg(PACKAGE),
-            "`rpm -e gel`",
+            "`rpm -e gel-cli`",
         );
     }
 }

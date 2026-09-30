@@ -19,8 +19,7 @@ concurrency:
 env:
   RUST_VERSION: "1.88"
   CARGO_INCREMENTAL: "0"
-  CARGO_DEB_VERSION: "3.7.0"
-  CARGO_GENERATE_RPM_VERSION: "0.21.0"
+  NFPM_VERSION: "2.47.0"
 
 jobs:
   plan:
@@ -168,12 +167,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo install --locked --version "$CARGO_DEB_VERSION" cargo-deb
-          cargo install --locked --version "$CARGO_GENERATE_RPM_VERSION" cargo-generate-rpm
+          case "$(uname -m)" in
+            x86_64) arch=x86_64; sha=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783 ;;
+            aarch64) arch=arm64; sha=1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c ;;
+            *) exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/nfpm.tar.gz"
+          curl --fail --location --proto =https --tlsv1.2 \
+            "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_${arch}.tar.gz" -o "$archive"
+          echo "$sha  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" nfpm
+          sudo install -m 0755 "$RUNNER_TEMP/nfpm" /usr/local/bin/nfpm
       - name: Build Linux packages
         if: matrix.linux_packages
         shell: bash
         env:
+          BUILD_VERSION: ${{ needs.plan.outputs.version }}+${{ github.sha }}
           VERSION: ${{ needs.plan.outputs.version }}
           TARGET: ${{ matrix.target }}
         run: |
@@ -182,6 +191,17 @@ jobs:
             --target "$TARGET" --version "$VERSION" \
             --completions-dir target/completions --out-dir dist
           test -z "$(git status --porcelain Cargo.toml)"
+      - name: Install native packages in clean containers
+        if: matrix.linux_packages
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/dist:/packages:ro" -e VERSION debian:12 \
+            bash -ceu 'dpkg -i /packages/*.deb; test "$(/usr/bin/gel --version)" = "Gel CLI $VERSION"; test ! -e /usr/bin/edgedb'
+          docker run --rm -v "$PWD/dist:/packages:ro" -e VERSION rockylinux:9 \
+            bash -ceu 'rpm -i /packages/*.rpm; test "$(/usr/bin/gel --version)" = "Gel CLI $VERSION"; test ! -e /usr/bin/edgedb'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: dist-${{ matrix.target }}
@@ -230,10 +250,39 @@ jobs:
       version: ${{ needs.plan.outputs.version }}
       build_sha: ${{ github.sha }}
 
+  sign:
+    name: sign native RPMs
+    needs: [plan, build, smoke, install]
+    if: needs.plan.outputs.release == 'true' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    environment: package-signing
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Install RPM signing tools
+        run: sudo apt-get update && sudo apt-get install -y rpm gnupg
+      - name: Sign and verify RPMs
+        env:
+          PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
+          PACKAGE_SIGNING_FPR: ${{ secrets.PACKAGE_SIGNING_FPR }}
+        run: bash packaging/native/sign-rpms.sh dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: signed-native-rpms
+          path: dist/*.rpm
+          if-no-files-found: error
+          retention-days: 1
+
   draft:
     name: assemble and create draft
-    needs: [plan, build, smoke, install]
-    if: needs.plan.outputs.release == 'true'
+    needs: [plan, build, smoke, install, sign]
+    if: needs.plan.outputs.release == 'true' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     permissions:
       contents: write # GitHub requires write access to list and replace drafts.
@@ -248,6 +297,10 @@ jobs:
         with:
           pattern: dist-*
           merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed-native-rpms
           path: dist
       - name: Assemble and check release inventory
         env:

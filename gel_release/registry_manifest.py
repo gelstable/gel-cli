@@ -11,15 +11,11 @@ import re
 from pathlib import Path
 from typing import Literal
 
-import jsonschema
 from pydantic import BaseModel
 
 from . import assets, digests
 from .models import LegacyReplacementsManifest, NativeReleaseManifest, ReleaseManifest
 
-SCHEMA_PATH = (
-    Path(__file__).resolve().parent.parent / "packaging" / "schema" / "release-manifest.schema.json"
-)
 REVISION = "1"
 VERSION_PATTERN = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
@@ -130,7 +126,6 @@ def build_manifest(version: str, build_date: str, entries: dict[str, digests.Fil
         "schema_version": 2,
         "indexes": indexes,
         "native": {
-            "channel": channel,
             "packages": [
                 {
                     "url": assets.release_download_url(version, name),
@@ -179,8 +174,6 @@ def validate_manifest(manifest: dict) -> None:
                 or re.fullmatch(r"[A-Za-z0-9._-]+\.(deb|rpm)", name) is None
             ):
                 raise ValueError("native URL must name a safe asset on the declaring release")
-    schema = json.loads(SCHEMA_PATH.read_bytes())
-    jsonschema.validate(instance=manifest, schema=schema)
 
 
 def assemble_stage(version: str, build_date: str, dist_dir: Path) -> None:

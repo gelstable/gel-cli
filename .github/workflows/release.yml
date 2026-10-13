@@ -19,7 +19,6 @@ concurrency:
 env:
   RUST_VERSION: "1.88"
   CARGO_INCREMENTAL: "0"
-  NFPM_VERSION: "2.47.0"
 
 jobs:
   plan:
@@ -164,20 +163,7 @@ jobs:
             --completions-dir target/completions --out-dir dist
       - name: Install Linux packaging tools
         if: matrix.linux_packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -m)" in
-            x86_64) arch=x86_64; sha=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783 ;;
-            aarch64) arch=arm64; sha=1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c ;;
-            *) exit 1 ;;
-          esac
-          archive="$RUNNER_TEMP/nfpm.tar.gz"
-          curl --fail --location --proto =https --tlsv1.2 \
-            "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_${arch}.tar.gz" -o "$archive"
-          echo "$sha  $archive" | sha256sum --check --strict
-          tar -xzf "$archive" -C "$RUNNER_TEMP" nfpm
-          sudo install -m 0755 "$RUNNER_TEMP/nfpm" /usr/local/bin/nfpm
+        uses: gelstable/gel-registry/.github/actions/setup-nfpm@6a8bacba9b8ace0b44f150587be7c214569e903b # shared publisher actions
       - name: Build Linux packages
         if: matrix.linux_packages
         shell: bash
@@ -253,7 +239,7 @@ jobs:
   sign:
     name: sign native RPMs
     needs: [plan, build, smoke, install]
-    if: needs.plan.outputs.release == 'true' && github.ref == 'refs/heads/master'
+    if: needs.plan.outputs.release == 'true' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-24.04
     environment: package-signing
     steps:
@@ -268,10 +254,12 @@ jobs:
       - name: Install RPM signing tools
         run: sudo apt-get update && sudo apt-get install -y rpm gnupg
       - name: Sign and verify RPMs
+        uses: gelstable/gel-registry/.github/actions/sign-rpms@6a8bacba9b8ace0b44f150587be7c214569e903b # shared publisher actions
+        with:
+          directory: dist
         env:
           PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
           PACKAGE_SIGNING_FPR: ${{ secrets.PACKAGE_SIGNING_FPR }}
-        run: bash packaging/native/sign-rpms.sh dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: signed-native-rpms
@@ -282,7 +270,7 @@ jobs:
   draft:
     name: assemble and create draft
     needs: [plan, build, smoke, install, sign]
-    if: needs.plan.outputs.release == 'true' && github.ref == 'refs/heads/master'
+    if: needs.plan.outputs.release == 'true' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-24.04
     permissions:
       contents: write # GitHub requires write access to list and replace drafts.
@@ -328,6 +316,10 @@ jobs:
             unzip -Z1 "$archive" | grep '/gel.exe$' >/dev/null
             unzip -Z1 "$archive" | grep '/completions/gel.ps1$' >/dev/null
           done
+      - name: Validate manifest with the registry contract
+        uses: gelstable/gel-registry/.github/actions/check-manifest@6a8bacba9b8ace0b44f150587be7c214569e903b # shared publisher actions
+        with:
+          file: dist/gel-registry.json
       - name: Replace unpublished draft
         env:
           GH_TOKEN: ${{ github.token }}

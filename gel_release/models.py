@@ -18,12 +18,8 @@ class StrictModel(BaseModel):
 class ManifestVerification(StrictModel):
     """Byte verification for an install ref this pipeline generates.
 
-    Deliberately stricter than ``Verification`` in the vendored JSON schema,
-    which leaves ``sha256`` nullable and permits ``size: 0`` so that the
-    registry can still read historical documents. Nothing this pipeline emits
-    may omit a digest or describe a zero-byte artifact, so the model refuses
-    what the schema tolerates. ``validate_manifest`` runs both checks; the
-    model is the binding one for generated manifests.
+    Generated artifacts must include both digests and have positive sizes.
+    The shared registry action also validates the final release manifest.
     """
 
     size: PositiveInt
@@ -35,8 +31,7 @@ class ManifestInstallRef(StrictModel):
     ref: HttpUrl
     type: Annotated[str, Field(min_length=1)]
     # ``build_manifest`` emits exactly these two encodings, one bare executable
-    # and one zstd-compressed. The vendored schema allows any string; this
-    # pipeline does not, so an unknown encoding is a generator bug, not input.
+    # and one zstd-compressed. An unknown encoding is a generator bug.
     encoding: Literal["identity", "zstd"]
     verification: ManifestVerification
 
@@ -103,7 +98,6 @@ class NativePackage(StrictModel):
 
 
 class NativeSection(StrictModel):
-    channel: Literal["stable", "testing"]
     packages: Annotated[list[NativePackage], Field(min_length=1)]
 
 

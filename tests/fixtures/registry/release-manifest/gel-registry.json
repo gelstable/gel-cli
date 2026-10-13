@@ -238,7 +238,6 @@
     }
   ],
   "native": {
-    "channel": "stable",
     "packages": [
       {
         "url": "https://github.com/gelstable/gel-cli/releases/download/v1.2.3/gel-cli-1.2.3-1-amd64.deb",

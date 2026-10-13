@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 from typing import Literal, get_type_hints
 
-import jsonschema
 import pytest
 from pydantic import ValidationError
 
@@ -37,7 +36,7 @@ class ManifestShapeTests(unittest.TestCase):
             "1.2.3", "2026-09-12T00:00:00+00:00", _entries("1.2.3")
         )
 
-    def test_validates_against_vendored_schema(self):
+    def test_validates_with_strict_models(self):
         registry_manifest.validate_manifest(self.manifest)
 
     def test_one_stable_fragment_per_registry_target(self):
@@ -196,10 +195,11 @@ class IsolationTests(unittest.TestCase):
             self.assertNotIn(suffix, rendered)
 
 
-def test_native_manifest_urls_and_channel():
+def test_native_manifest_urls_and_version_derived_channel():
     manifest = registry_manifest.build_manifest("1.2.3-rc.1", "2026-09-12", _entries("1.2.3-rc.1"))
     registry_manifest.validate_manifest(manifest)
-    assert manifest["native"]["channel"] == "testing"
+    assert set(manifest["native"]) == {"packages"}
+    assert manifest["indexes"][0]["channel"] == "testing"
     assert len(manifest["native"]["packages"]) == 4
     for package in manifest["native"]["packages"]:
         assert package["url"].startswith(
@@ -293,11 +293,7 @@ class LegacyReplacementsTests(unittest.TestCase):
 class GeneratedManifestStrictnessTests(unittest.TestCase):
     """The indexes shape this pipeline generates is held to its own rules.
 
-    The vendored JSON schema tolerates a null sha256, a zero size, and any
-    encoding string so the registry can still read historical documents.
-    Nothing this pipeline generates may look like that, so the model is
-    deliberately stricter than the schema and these cases are rejected by
-    ``validate_manifest`` even though ``jsonschema`` alone would pass them.
+    Generated artifacts need complete digests, positive sizes, and supported encodings.
     """
 
     def manifest(self) -> dict:
@@ -321,7 +317,6 @@ class GeneratedManifestStrictnessTests(unittest.TestCase):
     def test_missing_sha256_is_rejected(self):
         manifest = self.manifest()
         del self.install_ref(manifest)["verification"]["sha256"]
-        self.assertIsNone(jsonschema.validate(instance=manifest, schema=self.schema()))
         with self.assertRaises(ValidationError):
             registry_manifest.validate_manifest(manifest)
 
@@ -334,7 +329,6 @@ class GeneratedManifestStrictnessTests(unittest.TestCase):
     def test_bogus_encoding_is_rejected(self):
         manifest = self.manifest()
         self.install_ref(manifest)["encoding"] = "brotli"
-        self.assertIsNone(jsonschema.validate(instance=manifest, schema=self.schema()))
         with self.assertRaises(ValidationError):
             registry_manifest.validate_manifest(manifest)
 
@@ -347,7 +341,6 @@ class GeneratedManifestStrictnessTests(unittest.TestCase):
     def test_zero_size_is_rejected(self):
         manifest = self.manifest()
         self.install_ref(manifest)["verification"]["size"] = 0
-        self.assertIsNone(jsonschema.validate(instance=manifest, schema=self.schema()))
         with self.assertRaises(ValidationError):
             registry_manifest.validate_manifest(manifest)
 
@@ -360,9 +353,6 @@ class GeneratedManifestStrictnessTests(unittest.TestCase):
     def test_generated_manifest_needs_at_least_one_index(self):
         with self.assertRaises(ValidationError):
             models.ReleaseManifest.model_validate({"schema_version": 1, "indexes": []})
-
-    def schema(self) -> dict:
-        return json.loads(registry_manifest.SCHEMA_PATH.read_bytes())
 
 
 class GoldenFixtureTests(unittest.TestCase):
@@ -401,6 +391,13 @@ def test_assembly_digests_final_native_bytes(tmp_path):
     assert package["sha256"] == sha256(rpm.read_bytes()).hexdigest()
     assert package["size"] == rpm.stat().st_size
     assert package["sha256"] in (tmp_path / assets.SHA256SUMS_NAME).read_text()
+
+
+def test_native_channel_is_rejected_as_an_obsolete_field():
+    manifest = registry_manifest.build_manifest("1.2.3", "2026-09-12", _entries("1.2.3"))
+    manifest["native"]["channel"] = "stable"
+    with pytest.raises(ValidationError):
+        registry_manifest.validate_manifest(manifest)
 
 
 if __name__ == "__main__":

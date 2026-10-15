@@ -163,7 +163,7 @@ jobs:
             --completions-dir target/completions --out-dir dist
       - name: Install Linux packaging tools
         if: matrix.linux_packages
-        uses: gelstable/gel-registry/.github/actions/setup-nfpm@6a8bacba9b8ace0b44f150587be7c214569e903b # shared publisher actions
+        uses: gelstable/gel-registry/.github/actions/setup-nfpm@6d3215a7bf494fed5ea0ccd670f7e765a2b70aac # shared publisher actions
       - name: Build Linux packages
         if: matrix.linux_packages
         shell: bash
@@ -254,7 +254,7 @@ jobs:
       - name: Install RPM signing tools
         run: sudo apt-get update && sudo apt-get install -y rpm gnupg
       - name: Sign and verify RPMs
-        uses: gelstable/gel-registry/.github/actions/sign-rpms@6a8bacba9b8ace0b44f150587be7c214569e903b # shared publisher actions
+        uses: gelstable/gel-registry/.github/actions/sign-rpms@6d3215a7bf494fed5ea0ccd670f7e765a2b70aac # shared publisher actions
         with:
           directory: dist
         env:
@@ -317,7 +317,7 @@ jobs:
             unzip -Z1 "$archive" | grep '/completions/gel.ps1$' >/dev/null
           done
       - name: Validate manifest with the registry contract
-        uses: gelstable/gel-registry/.github/actions/check-manifest@6a8bacba9b8ace0b44f150587be7c214569e903b # shared publisher actions
+        uses: gelstable/gel-registry/.github/actions/check-manifest@6d3215a7bf494fed5ea0ccd670f7e765a2b70aac # shared publisher actions
         with:
           file: dist/gel-registry.json
       - name: Replace unpublished draft

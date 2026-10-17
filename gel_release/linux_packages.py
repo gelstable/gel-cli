@@ -11,12 +11,6 @@ from . import assets, registry_manifest
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "packaging/native/gel-cli.nfpm.yaml"
 
 
-def package_manager_version(version: str) -> str:
-    """Full native version, with an epoch that upgrades every legacy build."""
-    registry_manifest.release_channel(version)
-    return f"1:{version.replace('-', '~', 1)}-1"
-
-
 def build(target: assets.Target, version: str, completions_dir: Path, out_dir: Path) -> list[Path]:
     if target.deb_arch is None or target.rpm_arch is None:
         raise ValueError(f"{target.triple} does not produce Linux packages")

@@ -27,13 +27,14 @@ def test_native_config_layout_and_relationships():
     assert "/usr/share/fish/vendor_completions.d/gel.fish" in destinations
 
 
-def test_native_versions_and_names():
-    assert linux_packages.package_manager_version("7.10.3") == "1:7.10.3-1"
-    assert linux_packages.package_manager_version("7.11.0-rc.1") == "1:7.11.0~rc.1-1"
+def test_native_names():
     assert assets.deb_name("7.11.0-rc.1", AMD64) == "gel-cli-7.11.0-rc.1-1-amd64.deb"
     assert assets.rpm_name("7.11.0-rc.1", ARM64) == "gel-cli-7.11.0-rc.1-1-aarch64.rpm"
+
+
+def test_build_rejects_unsupported_version(tmp_path):
     with pytest.raises(ValueError):
-        linux_packages.package_manager_version("7.11.0-dev.1")
+        linux_packages.build(AMD64, "7.11.0-dev.1", tmp_path, tmp_path)
 
 
 def test_epoch_upgrades_legacy_packages():

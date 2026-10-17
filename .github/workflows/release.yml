@@ -19,8 +19,6 @@ concurrency:
 env:
   RUST_VERSION: "1.88"
   CARGO_INCREMENTAL: "0"
-  CARGO_DEB_VERSION: "3.7.0"
-  CARGO_GENERATE_RPM_VERSION: "0.21.0"
 
 jobs:
   plan:
@@ -165,15 +163,12 @@ jobs:
             --completions-dir target/completions --out-dir dist
       - name: Install Linux packaging tools
         if: matrix.linux_packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo install --locked --version "$CARGO_DEB_VERSION" cargo-deb
-          cargo install --locked --version "$CARGO_GENERATE_RPM_VERSION" cargo-generate-rpm
+        uses: gelstable/gel-registry/.github/actions/setup-nfpm@6d3215a7bf494fed5ea0ccd670f7e765a2b70aac # shared publisher actions
       - name: Build Linux packages
         if: matrix.linux_packages
         shell: bash
         env:
+          BUILD_VERSION: ${{ needs.plan.outputs.version }}+${{ github.sha }}
           VERSION: ${{ needs.plan.outputs.version }}
           TARGET: ${{ matrix.target }}
         run: |
@@ -181,7 +176,17 @@ jobs:
           PYTHONPATH=. uv run --frozen gel-release linux-packages \
             --target "$TARGET" --version "$VERSION" \
             --completions-dir target/completions --out-dir dist
-          test -z "$(git status --porcelain Cargo.toml)"
+      - name: Install native packages in clean containers
+        if: matrix.linux_packages
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/dist:/packages:ro" -e VERSION debian:12 \
+            bash -ceu 'dpkg -i /packages/*.deb; test "$(/usr/bin/gel --version)" = "Gel CLI $VERSION"; test ! -e /usr/bin/edgedb'
+          docker run --rm -v "$PWD/dist:/packages:ro" -e VERSION rockylinux:9 \
+            bash -ceu 'rpm -i /packages/*.rpm; test "$(/usr/bin/gel --version)" = "Gel CLI $VERSION"; test ! -e /usr/bin/edgedb'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: dist-${{ matrix.target }}
@@ -230,10 +235,41 @@ jobs:
       version: ${{ needs.plan.outputs.version }}
       build_sha: ${{ github.sha }}
 
+  sign:
+    name: sign native RPMs
+    needs: [plan, build, smoke, install]
+    if: needs.plan.outputs.release == 'true' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-24.04
+    environment: package-signing
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Install RPM signing tools
+        run: sudo apt-get update && sudo apt-get install -y rpm gnupg
+      - name: Sign and verify RPMs
+        uses: gelstable/gel-registry/.github/actions/sign-rpms@6d3215a7bf494fed5ea0ccd670f7e765a2b70aac # shared publisher actions
+        with:
+          directory: dist
+        env:
+          PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
+          PACKAGE_SIGNING_FPR: ${{ secrets.PACKAGE_SIGNING_FPR }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: signed-native-rpms
+          path: dist/*.rpm
+          if-no-files-found: error
+          retention-days: 1
+
   draft:
     name: assemble and create draft
-    needs: [plan, build, smoke, install]
-    if: needs.plan.outputs.release == 'true'
+    needs: [plan, build, smoke, install, sign]
+    if: needs.plan.outputs.release == 'true' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-24.04
     permissions:
       contents: write # GitHub requires write access to list and replace drafts.
@@ -248,6 +284,10 @@ jobs:
         with:
           pattern: dist-*
           merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed-native-rpms
           path: dist
       - name: Assemble and check release inventory
         env:
@@ -275,6 +315,10 @@ jobs:
             unzip -Z1 "$archive" | grep '/gel.exe$' >/dev/null
             unzip -Z1 "$archive" | grep '/completions/gel.ps1$' >/dev/null
           done
+      - name: Validate manifest with the registry contract
+        uses: gelstable/gel-registry/.github/actions/check-manifest@6d3215a7bf494fed5ea0ccd670f7e765a2b70aac # shared publisher actions
+        with:
+          file: dist/gel-registry.json
       - name: Replace unpublished draft
         env:
           GH_TOKEN: ${{ github.token }}

@@ -127,13 +127,13 @@ def archive_name(version: str, target: Target) -> str:
 def deb_name(version: str, target: Target) -> str:
     if target.deb_arch is None:
         raise ValueError(f"{target.triple} does not produce a .deb")
-    return f"{DIST_BASENAME}_{version}_{target.deb_arch}.deb"
+    return f"{REGISTRY_BASENAME}-{version}-1-{target.deb_arch}.deb"
 
 
 def rpm_name(version: str, target: Target) -> str:
     if target.rpm_arch is None:
         raise ValueError(f"{target.triple} does not produce an .rpm")
-    return f"{DIST_BASENAME}-{version}-1.{target.rpm_arch}.rpm"
+    return f"{REGISTRY_BASENAME}-{version}-1-{target.rpm_arch}.rpm"
 
 
 def expected_assets(version: str) -> list[str]:

@@ -1,0 +1,38 @@
+name: gel-cli
+arch: ${NATIVE_ARCH}
+platform: linux
+version_schema: none
+epoch: "1"
+version: ${NATIVE_VERSION}
+release: "1"
+maintainer: Gelstable contributors <https://github.com/gelstable/gel-cli>
+description: "Command-line interface for Gel (formerly EdgeDB). Build: ${BUILD_VERSION}"
+homepage: https://github.com/gelstable/gel-cli
+license: Apache-2.0 OR MIT
+section: database
+priority: optional
+replaces:
+  - edgedb-cli
+conflicts:
+  - edgedb-cli
+contents:
+  - expand: true
+    src: ${NATIVE_BINARY}
+    dst: /usr/bin/gel
+    file_info:
+      mode: 0755
+  - expand: true
+    src: ${COMPLETIONS_DIR}/gel.bash
+    dst: /usr/share/bash-completion/completions/gel
+  - expand: true
+    src: ${COMPLETIONS_DIR}/_gel
+    dst: /usr/share/zsh/site-functions/_gel
+  - expand: true
+    src: ${COMPLETIONS_DIR}/gel.fish
+    dst: /usr/share/fish/vendor_completions.d/gel.fish
+  - src: LICENSE-APACHE
+    dst: /usr/share/doc/gel-cli/LICENSE-APACHE
+  - src: LICENSE-MIT
+    dst: /usr/share/doc/gel-cli/LICENSE-MIT
+  - src: README.md
+    dst: /usr/share/doc/gel-cli/README.md

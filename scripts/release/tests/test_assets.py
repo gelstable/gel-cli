@@ -99,7 +99,13 @@ class ExpectedInventoryTests(unittest.TestCase):
     def test_inventory_contents(self):
         names = set(assets.expected_assets("7.11.0"))
         self.assertEqual(
-            len([n for n in names if n.startswith("gel-cli-") and not n.endswith(".zst")]),
+            len(
+                [
+                    n
+                    for n in names
+                    if n.startswith("gel-cli-") and not n.endswith((".zst", ".deb", ".rpm"))
+                ]
+            ),
             5,
         )
         self.assertEqual(len([n for n in names if n.endswith(".zst")]), 5)

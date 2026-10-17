@@ -21,9 +21,11 @@ use crate::scenario;
 /// real distro packages do.
 pub const SYSTEM_BIN: &str = "/usr/bin/gel";
 
-/// The package name every distro scenario builds, and the argument its cleanup
-/// passes to `dpkg -r` / `rpm -e` / `pacman -R`.
+/// The package name the standalone pacman fixture builds and removes.
 pub const PACKAGE: &str = "gel";
+
+/// Native APT/RPM package name; pacman keeps its standalone fixture name.
+pub const NATIVE_PACKAGE: &str = "gel-cli";
 
 /// How a scenario runs a command that has to write outside its tempdir.
 #[derive(Clone, Copy, Debug)]
@@ -98,14 +100,14 @@ impl PackageQuery {
                     Command::new("dpkg-query")
                         .arg("-W")
                         .arg("-f=${Status}")
-                        .arg(PACKAGE),
+                        .arg(NATIVE_PACKAGE),
                 );
                 queried.is_some_and(|out| {
                     out.success
                         && out.stdout_trimmed().split_whitespace().next_back() == Some("installed")
                 })
             }
-            PackageQuery::Rpm => answers("rpm", &["-q", PACKAGE]),
+            PackageQuery::Rpm => answers("rpm", &["-q", NATIVE_PACKAGE]),
             PackageQuery::Pacman => answers("pacman", &["-Qi", PACKAGE]),
         }
     }
@@ -144,8 +146,12 @@ pub fn precheck(tools: &[&str], query: PackageQuery) -> Result<Privilege, String
         ));
     }
     if query.is_installed() {
+        let package = match query {
+            PackageQuery::Dpkg | PackageQuery::Rpm => NATIVE_PACKAGE,
+            PackageQuery::Pacman => PACKAGE,
+        };
         return Err(format!(
-            "a `{PACKAGE}` package is already installed on this host; refusing to \
+            "a `{package}` package is already installed on this host; refusing to \
              replace a package this test did not create, because cleanup would \
              then uninstall it"
         ));

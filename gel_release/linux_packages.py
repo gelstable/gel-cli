@@ -20,7 +20,8 @@ def package_manager_version(version: str) -> str:
 def build(target: assets.Target, version: str, completions_dir: Path, out_dir: Path) -> list[Path]:
     if target.deb_arch is None or target.rpm_arch is None:
         raise ValueError(f"{target.triple} does not produce Linux packages")
-    native_version = package_manager_version(version).removeprefix("1:").removesuffix("-1")
+    registry_manifest.release_channel(version)
+    native_version = version.replace("-", "~", 1)
     env = dict(
         os.environ,
         NATIVE_VERSION=native_version,

@@ -462,7 +462,7 @@ pub struct RawOptions {
     pub no_cli_update_check: bool,
 
     /// Do not run any command hooks defined in [MANIFEST_FILE_DISPLAY_NAME]
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub skip_hooks: bool,
 
     #[command(flatten)]

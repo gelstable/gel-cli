@@ -2,7 +2,7 @@ use crate::branch::connections::connect_if_branch_exists;
 use crate::branch::context::Context;
 use crate::branch::create::create_branch;
 use crate::connect::Connector;
-use crate::{branch, hooks, print};
+use crate::{branch, print};
 
 pub async fn run(
     options: &Command,
@@ -15,12 +15,8 @@ pub async fn run(
         anyhow::bail!("");
     }
 
-    if !context.skip_hooks() {
-        if let Some(project) = &context.get_project().await? {
-            hooks::on_action("branch.switch.before", project).await?;
-            hooks::on_action("schema.update.before", project).await?;
-        }
-    }
+    context.run_hooks("branch.switch.before").await?;
+    context.run_hooks("schema.update.before").await?;
 
     let current_branch = if let Some(mut connection) = connect_if_branch_exists(connector).await? {
         let current_branch = context.get_current_branch(&mut connection).await?;
@@ -77,12 +73,8 @@ pub async fn run(
         .update_current_branch(&options.target_branch)
         .await?;
 
-    if !context.skip_hooks() {
-        if let Some(project) = &context.get_project().await? {
-            hooks::on_action("branch.switch.after", project).await?;
-            hooks::on_action("schema.update.after", project).await?;
-        }
-    }
+    context.run_hooks("branch.switch.after").await?;
+    context.run_hooks("schema.update.after").await?;
 
     Ok(branch::CommandResult {
         new_branch: Some(options.target_branch.clone()),

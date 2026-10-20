@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::branding::BRANDING_CLI_CMD;
 use crate::connect::Connector;
+use crate::hooks::Hooks;
 use crate::migrations::apply::AutoBackup;
 use crate::migrations::{self, dev_mode};
 use crate::{git, msg, print};
@@ -29,12 +30,10 @@ impl Migrator {
 
         let connector = ctx.options.create_connector().await?;
         let auto_backup = AutoBackup::init(connector.instance_name()?, false)?;
+        let hooks = Hooks::new(ctx.options.skip_hooks, connector.instance_name()?);
         Ok(Migrator {
-            migration_ctx: migrations::Context::for_project(
-                ctx.project.clone(),
-                ctx.options.skip_hooks,
-            )?
-            .with_auto_backup(auto_backup),
+            migration_ctx: migrations::Context::for_project(ctx.project.clone(), hooks)?
+                .with_auto_backup(auto_backup),
             git_branch,
             ctx,
             connector,

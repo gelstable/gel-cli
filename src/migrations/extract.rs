@@ -47,8 +47,7 @@ pub async fn extract(
     opts: &Options,
 ) -> anyhow::Result<()> {
     let src_ctx =
-        Context::for_migration_config(&cmd.cfg, cmd.non_interactive, opts.skip_hooks, false)
-            .await?;
+        Context::for_migration_config(&cmd.cfg, cmd.non_interactive, opts.hooks(), false).await?;
     let current = migration::read_all(&src_ctx, false).await?;
     let mut disk_iter = current.into_iter();
 

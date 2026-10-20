@@ -105,7 +105,7 @@ async fn sync(
     let mig_ctx = migrations::context::Context {
         schema_dir: inst.project_dir.join(&inst.schema_dir),
         quiet: true,
-        skip_hooks,
+        hooks_enabled: !skip_hooks,
         project: Some(project.clone()),
         auto_backup: None,
     };

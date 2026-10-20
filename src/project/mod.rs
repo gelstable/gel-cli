@@ -384,6 +384,13 @@ pub fn instance_name(stash_dir: &Path) -> anyhow::Result<InstanceName> {
     Ok(InstanceName::from_str(inst.trim())?)
 }
 
+/// Returns true if the project at `location` is linked to `instance`.
+pub fn is_linked_to(location: &Location, instance: &InstanceName) -> bool {
+    get_stash_path(&location.root)
+        .and_then(|stash_dir| instance_name(&stash_dir))
+        .is_ok_and(|linked| &linked == instance)
+}
+
 #[context("cannot read database name of {:?}", stash_dir)]
 pub fn database_name(stash_dir: &Path) -> anyhow::Result<DatabaseBranch> {
     let inst = match fs::read_to_string(stash_dir.join("database")) {

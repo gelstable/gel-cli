@@ -10,7 +10,6 @@ use std::sync::LazyLock;
 use crate::async_try;
 use crate::branding::BRANDING;
 use crate::bug;
-use crate::hooks;
 use crate::migrations::apply::{apply_migrations, apply_migrations_inner};
 use crate::migrations::context::Context;
 use crate::migrations::create;
@@ -212,14 +211,10 @@ async fn migrate_to_schema(
                         if migs.is_empty() {
                             Ok(false)
                         } else {
-                            if !ctx.skip_hooks {
-                                // It's okay to run hooks here in a transaction, because
-                                // _populate_migration() shouldn't lock anything
-                                if let Some(project) = &ctx.project {
-                                    hooks::on_action("migration.apply.before", project).await?;
-                                    hooks::on_action("schema.update.before", project).await?;
-                                }
-                            }
+                            // It's okay to run hooks here in a transaction, because
+                            // _populate_migration() shouldn't lock anything
+                            ctx.run_hooks("migration.apply.before").await?;
+                            ctx.run_hooks("schema.update.before").await?;
 
                             if let Some(auto_backup) = &ctx.auto_backup {
                                 let backup_bar = BackupProgressBar { bar: bar.clone() };
@@ -243,12 +238,10 @@ async fn migrate_to_schema(
             }
         }?;
 
-        if rv && !ctx.skip_hooks {
+        if rv {
             // Hooks must be run after commit, because they may deadlock with the transaction
-            if let Some(project) = &ctx.project {
-                hooks::on_action("migration.apply.after", project).await?;
-                hooks::on_action("schema.update.after", project).await?;
-            }
+            ctx.run_hooks("migration.apply.after").await?;
+            ctx.run_hooks("schema.update.after").await?;
         }
 
         Ok(rv)

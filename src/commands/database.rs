@@ -5,6 +5,7 @@ use crate::commands::parser::{CreateDatabase, DropDatabase, WipeDatabase};
 use crate::commands::{ExitCode, Options};
 use crate::connect::Connection;
 use crate::hint::HintExt;
+use crate::hooks::Hooks;
 use crate::portable::exit_codes;
 use crate::print;
 use crate::question;
@@ -60,7 +61,7 @@ pub async fn drop(
 pub async fn wipe(
     connection: &mut Connection,
     cmd: &WipeDatabase,
-    skip_hooks: bool,
+    hooks: Hooks,
 ) -> Result<(), anyhow::Error> {
     if connection.get_version().await?.specific().major >= 5 {
         print::warn!("'database wipe' is deprecated in {BRANDING} 5+. Please use 'branch wipe'");
@@ -87,7 +88,7 @@ pub async fn wipe(
 
     let context = crate::branch::context::Context::new(
         cmd.instance_opts.maybe_instance().as_ref(),
-        skip_hooks,
+        hooks,
         false,
     )
     .await?;

@@ -3,7 +3,7 @@ use crate::branch::context::Context;
 use crate::commands::ExitCode;
 use crate::connect::Connector;
 use crate::portable::exit_codes;
-use crate::{hooks, print, question};
+use crate::{print, question};
 
 pub async fn main(
     cmd: &Command,
@@ -38,22 +38,14 @@ pub async fn do_wipe(
     connection: &mut crate::connect::Connection,
     context: &Context,
 ) -> Result<(), anyhow::Error> {
-    if !context.skip_hooks() {
-        if let Some(project) = context.get_project().await? {
-            hooks::on_action("branch.wipe.before", &project).await?;
-            hooks::on_action("schema.update.before", &project).await?;
-        }
-    }
+    context.run_hooks("branch.wipe.before").await?;
+    context.run_hooks("schema.update.before").await?;
 
     let (status, _warnings) = connection.execute("RESET SCHEMA TO initial", &()).await?;
     print::completion(status);
 
-    if !context.skip_hooks() {
-        if let Some(project) = context.get_project().await? {
-            hooks::on_action("branch.wipe.after", &project).await?;
-            hooks::on_action("schema.update.after", &project).await?;
-        }
-    }
+    context.run_hooks("branch.wipe.after").await?;
+    context.run_hooks("schema.update.after").await?;
     Ok(())
 }
 

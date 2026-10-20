@@ -15,4 +15,12 @@ impl Options {
         self.instance_name = self.conn_params.instance_name()?;
         Ok(())
     }
+
+    /// Hook policy for the connection target of this command.
+    pub fn hooks(&self) -> crate::hooks::Hooks {
+        crate::hooks::Hooks::new(
+            self.skip_hooks,
+            self.conn_params.instance_name().ok().flatten(),
+        )
+    }
 }

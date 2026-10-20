@@ -42,3 +42,13 @@ repository-specific part. A release manager needs write access to the repo.
    an unpublished draft for the same tag; delete a stale draft manually if
    needed.
    Once a release is published, choose a new version for any further changes.
+
+Native RPM signing uses the protected `package-signing` GitHub Environment.
+Its deployment branches must allow `master` and `release/*` so backport
+releases can sign packages and create their drafts. Other branches build and
+test without access to signing secrets.
+
+Shared packaging and manifest actions are pinned to a Gel registry commit.
+When updating the pin, keep all three actions on the same reviewed commit.
+Before merging, use the corresponding commit on the registry's `main` branch.
+Native package revision stays at `1`; repackaging requires a new CLI patch release.

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scenario::{self, Scenario};
 
-use super::unix_package::{self, PACKAGE, PackageQuery, Privilege};
+use super::unix_package::{self, NATIVE_PACKAGE as PACKAGE, PackageQuery, Privilege};
 
 /// The five fields `dpkg-deb` insists on. `Architecture: all` rather than the
 /// host's: the package carries one prebuilt binary that is only ever installed
@@ -19,7 +19,7 @@ use super::unix_package::{self, PACKAGE, PackageQuery, Privilege};
 /// constraint with nothing to check and one more way for the scenario to fail
 /// for reasons unrelated to install-manager detection.
 const CONTROL: &str = "\
-Package: gel
+Package: gel-cli
 Version: 0.0.0
 Architecture: all
 Maintainer: gel-cli install-manager e2e <e2e@example.invalid>
@@ -53,7 +53,7 @@ pub struct AptScenario {
     package: Option<PathBuf>,
     /// Set immediately before `dpkg -i` runs, so cleanup can tell "the install
     /// never got that far" from "the install ran". Without it, every failure
-    /// while *building* the package would also print a confusing `dpkg -r gel`
+    /// while *building* the package would also print a confusing `dpkg -r gel-cli`
     /// error about a package that was never installed.
     ///
     /// Immediately *before* rather than after, because a `dpkg -i` that fails
@@ -129,7 +129,7 @@ impl Scenario for AptScenario {
         }
         scenario::report_cleanup(
             self.privilege.command("dpkg").arg("-r").arg(PACKAGE),
-            "`dpkg -r gel`",
+            "`dpkg -r gel-cli`",
         );
     }
 }

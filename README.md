@@ -22,6 +22,14 @@ $ curl --proto '=https' --tlsv1.2 -sSfL https://geldata.com/sh | sh -s -- --nigh
 ```
 
 
+### Linux packages
+
+Install the `gel-cli` package from the Gelstable APT or RPM repository. Follow
+[the repository setup instructions](https://github.com/gelstable/gel-registry/blob/main/docs/native-packages.md),
+then run `sudo apt install gel-cli` or `sudo dnf install gel-cli`. The package
+installs the `gel` command and shell completions.
+
+
 Upgrading
 =========
 
